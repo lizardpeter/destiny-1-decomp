@@ -1,0 +1,58 @@
+2026-11-24 00:20:41 INFO  (LoggingInitialization) Using log config file: jar:file:/opt/ghidra/Ghidra/Framework/Generic/lib/Generic.jar!/generic.log4j.xml  
+2026-11-24 00:20:41 INFO  (LoggingInitialization) Using log file: /tmp/out/decompile-2.log  
+2026-11-24 00:20:41 DEBUG (GhidraObjectInputFilter) Including serial input filter: FileSystem/data/client.rmi.serial.filter  
+2026-11-24 00:20:41 INFO  (Preferences) Loading user preferences: /home/runner/.config/ghidra/ghidra_12.1.4_PUBLIC/preferences  
+2026-11-24 00:20:41 INFO  (ClassSearcher) Searching for classes...  
+2026-11-24 00:20:42 INFO  (ClassSearcher) Class search complete (1077 ms)  
+2026-11-24 00:20:43 INFO  (DefaultSSLContextInitializer) Initializing SSL Context  
+2026-11-24 00:20:43 INFO  (SecureRandomFactory) Initializing Random Number Generator...  
+2026-11-24 00:20:43 INFO  (SecureRandomFactory) Random Number Generator initialization complete: NativePRNGNonBlocking  
+2026-11-24 00:20:43 INFO  (DefaultTrustManagerFactory) Trust manager disabled, cacerts have not been set  
+2026-11-24 00:20:43 INFO  (FileCacheMaintenanceDaemon) Starting cache cleanup: /var/tmp/runner-ghidra/fscache2  
+2026-11-24 00:20:43 INFO  (FileCacheMaintenanceDaemon) Finished cache cleanup, estimated storage used: 0  
+2026-11-24 00:20:43 INFO  (AnalyzeHeadless) Headless startup complete (3009 ms)  
+2026-11-24 00:20:43 INFO  (ClassSearcher) Class searcher loaded 59 extension points (20 false positives)  
+2026-11-24 00:20:44 INFO  (HeadlessAnalyzer) HEADLESS Script Paths:
+    /opt/ghidra/Ghidra/Features/SystemEmulation/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/GnuDemangler/ghidra_scripts
+    /home/runner/work/destiny-1-decomp/destiny-1-decomp/tools/ghidra
+    /opt/ghidra/Ghidra/Features/WildcardAssembler/ghidra_scripts
+    /opt/ghidra/Ghidra/Processors/DATA/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/DecompilerDependent/ghidra_scripts
+    /opt/ghidra/Ghidra/Processors/JVM/ghidra_scripts
+    /opt/ghidra/Ghidra/Debug/Debugger-rmi-trace/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/MicrosoftCodeAnalyzer/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/VersionTracking/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/PyGhidra/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/SwiftDemangler/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/Base/ghidra_scripts
+    /opt/ghidra/Ghidra/Processors/Atmel/ghidra_scripts
+    /opt/ghidra/Ghidra/Debug/Debugger/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/Decompiler/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/FunctionID/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/PDB/ghidra_scripts
+    /opt/ghidra/Ghidra/Processors/8051/ghidra_scripts
+    /opt/ghidra/Ghidra/Processors/PIC/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/FileFormats/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/BSim/ghidra_scripts
+    /opt/ghidra/Ghidra/Features/BytePatterns/ghidra_scripts  
+2026-11-24 00:20:44 INFO  (HeadlessAnalyzer) HEADLESS: execution starts  
+2026-11-24 00:20:44 INFO  (HeadlessAnalyzer) Opening existing project: /tmp/proj/d1  
+2026-11-24 00:20:44 DEBUG (DefaultProjectManager) No tools found; Installing default tools  
+2026-11-24 00:20:44 DEBUG (DefaultProjectManager) 	no recent project directories found  
+2026-11-24 00:20:44 INFO  (HeadlessProject) Opening project: /tmp/proj/d1  
+2026-11-24 00:20:46 INFO  (HeadlessAnalyzer) REPORT: Processing read-only project file: /ps4-0133.elf  
+2026-11-24 00:20:46 INFO  (HeadlessAnalyzer) REPORT: Execute script: Decompile.java '/tmp/out/decomp-2.jsonl' '2' '6' '90'   
+2026-11-24 00:20:47 INFO  (HeadlessAnalyzer) SCRIPT: /home/runner/work/destiny-1-decomp/destiny-1-decomp/tools/ghidra/Decompile.java  
+2026-11-24 00:21:03 INFO  (GhidraScript) Decompile.java> shard 2: 1000 ok, 0 failed, 15s  
+2026-11-24 00:21:11 WARN  (DecompileCallback) Decompiling 002cb240: Unable to read bytes at ram:801912090  
+2026-11-24 00:21:16 INFO  (GhidraScript) Decompile.java> shard 2: 2000 ok, 0 failed, 27s  
+2026-11-24 00:21:35 INFO  (GhidraScript) Decompile.java> shard 2: 3000 ok, 0 failed, 47s  
+2026-11-24 00:21:47 INFO  (GhidraScript) Decompile.java> shard 2: 4000 ok, 0 failed, 59s  
+2026-11-24 00:22:06 INFO  (GhidraScript) Decompile.java> shard 2: 5000 ok, 0 failed, 78s  
+2026-11-24 00:22:57 INFO  (GhidraScript) Decompile.java> shard 2: 6000 ok, 0 failed, 129s  
+2026-11-24 00:24:15 INFO  (GhidraScript) Decompile.java> shard 2: 7000 ok, 0 failed, 207s  
+2026-11-24 00:24:19 WARN  (DecompileCallback) Decompiling 0102ee30: Unable to read bytes at ram:801913440  
+2026-11-24 00:24:25 INFO  (GhidraScript) Decompile.java> shard 2: 8000 ok, 0 failed, 217s  
+2026-11-24 00:24:34 INFO  (GhidraScript) Decompile.java> shard 2: 9000 ok, 0 failed, 225s  
+2026-11-24 00:24:34 INFO  (GhidraScript) Decompile.java> shard 2 done: 9099 ok, 0 failed  
