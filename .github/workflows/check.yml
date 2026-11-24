@@ -1,0 +1,14 @@
+# Records must agree with analysis, and STATUS.md must be what tools/status.py generates from them.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  records:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/status.py --check
