@@ -2,20 +2,24 @@
 
 ## Renderer (native/gfx)
 
-The draw path was rewritten to a bindless table, memoised pipelines and state diffing. Measured in Earth
-patrol on an Intel Arc laptop: 1,740 ns of CPU per draw, about 16 ms of renderer CPU per frame at 7,000
-draws, 36-52 fps. Open, in priority order:
+The draw path was rewritten to a bindless table, memoised pipelines and state diffing, then streamed
+textures were given one persistent image and pipelines a saved list. Measured in Earth patrol on an
+RTX 5090 at 1080p: 730 ns of CPU per draw, about 5 ms of renderer CPU per frame, 49 pipelines created during
+play, 508 textures dropped of 49,763. The frame rate is still 39-65 fps: the game frame is 22.8 ms, of which
+recording draws is 9 ms. Open, in priority order:
 
-1. Sky, trees and textures visibly jump. Streamed textures are dropped and recreated (22,702 dropped of
-   31,330 created in one session). A streamed texture must keep one image for its lifetime.
-2. Pipelines are created during play (4,926 in one session), each a hitch. Build them when the shader is
-   loaded and persist the list.
-3. Recording still waits on a shared lock (6 ms per frame) and does not run in parallel.
-4. Renderer CPU target: under 3 ms per frame and under 400 ns per draw.
-5. Field of view: the hook is in and `fov` is read from the settings; it has only been run at the default.
-6. The census of CPU writes into GPU-read memory (docs/gpu-memory-census.md) is unfinished: Tower,
+1. **Colour regression on main.** Since the streaming and pipeline change the world is tinted on the RTX
+   5090 and pure blue on lavapipe (HUD correct). The change before it rendered correctly.
+2. Find where the other 14 ms of the game frame goes (per-thread run and wait times); the game falls behind
+   real time.
+3. Recording still waits on the renderer lock (6.6 ms per frame).
+4. Draws are skipped: about 2,000 per session for a null vertex buffer, some because the upload ring is full.
+5. Textures are re-uploaded in place about 45,000 times per session; confirm whether sky and trees still jump.
+6. Field of view has only been run at the default.
+7. Renderer CPU target: under 3 ms per frame and under 400 ns per draw.
+8. The census of CPU writes into GPU-read memory (docs/gpu-memory-census.md) is unfinished: Tower,
    inventory, director and strikes are not surveyed.
-7. Later: take over the engine's graphics-memory pools so textures and buffers are allocated as Vulkan
+9. Later: take over the engine's graphics-memory pools so textures and buffers are allocated as Vulkan
    objects directly.
 
 ## Decompilation

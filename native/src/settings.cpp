@@ -228,9 +228,9 @@ void load_settings(const std::string& path) {
     }
     log("settings: name %s", s.name.c_str());
     log("settings: render resolution %dx%d", s.render_width, s.render_height);
-    log("settings: %s (game %s, backend %s, window %dx%d%s, vsync %s, fps %s, discord %s)", g_path.c_str(), s.game_dir.c_str(), s.backend.c_str(), s.window_width,
+    log("settings: %s (game %s, backend %s, window %dx%d%s, vsync %s, fps %s, fov %.1f, discord %s)", g_path.c_str(), s.game_dir.c_str(), s.backend.c_str(), s.window_width,
         s.window_height, s.fullscreen ? " fullscreen" : "", s.vsync.c_str(),
-        s.fps ? std::to_string(s.fps).c_str() : "unlimited",
+        s.fps ? std::to_string(s.fps).c_str() : "unlimited", s.fov,
         !s.discord ? "off" : s.discord_app_id.empty() ? "no app id" : "on");
 }
 
