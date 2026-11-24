@@ -251,28 +251,19 @@ void touch(uint64_t key, bool insert, uint32_t handle = 0xFFFFFFFFu) {
 uint64_t object_of(uint32_t type, uint32_t handle) {
     if (handle == 0xFFFFFFFFu || (!(type >= 1 && type <= 4) && type != 6 && type != 8 && type != 9 && type != 12 && type != 13)) return 0;
     const uint64_t o = resolve_handle_safe(handle);
-    return o >= 0x10000 ? (type == 8 ? o + 8 : o) : 0;
+    return o >= 0x10000 ? o : 0;
 }
 // the renderer prepares the resource's GPU copy now (its loader thread)
 void prefetch(uint32_t type, uint64_t o) {
     if (!o || !ng::active()) return;
     const uint64_t res = get(o);
     if (!res) return;
-    if (type == 9 || type == 12 || type == 13) {
+    if (type == 8 || type == 9 || type == 12 || type == 13) {
         ng::prefetch_shader(reinterpret_cast<const uint8_t*>(o), type == 9, res, o);
         return;
     }
-    if ((type >= 1 && type <= 3) || type == 8) {
-        const uint64_t tag = type == 8 ? o - 8 : o;
-        const uint8_t full_mips = field<uint8_t>(tag, 0x31);
-        const uint8_t has_hi = field<uint8_t>(tag, 0x34);
-        const uint32_t* t = reinterpret_cast<const uint32_t*>(o);
-        const uint32_t t_levels = ((t[3] >> 16) & 0xF) + 1;
-        const uint64_t t_base = (uint64_t(t[0]) | uint64_t(t[1] & 0x3F) << 32) << 8;
-        if (type != 8 && has_hi && full_mips > 1 && t_levels == uint32_t(full_mips - 1)) {
-            ng::notify_texture_mips(t, res, tag, t_base, 0);
-        }
-        ng::prefetch_texture(t, res, tag);
+    if (type >= 1 && type <= 3) {
+        ng::prefetch_texture(reinterpret_cast<const uint32_t*>(o), res, o);
     } else if (type == 4) ng::prefetch_buffer(field<uint64_t>(o, 0x28), field<uint32_t>(o, 0), res, o);
     else if (type == 6) {
         const uint32_t isz = field<uint32_t>(o, 0x38);
@@ -396,7 +387,14 @@ ng::Draw* alloc_draw() {
     d->ires = {};
     d->tex_mask[0] = d->tex_mask[1] = d->smp_mask[0] = d->smp_mask[1] = 0;
     d->tex_filter_mask[0] = d->tex_filter_mask[1] = 0;
-    d->tex_sig[0] = d->tex_sig[1] = d->vb_sig = 0;
+    d->tex_sig[0] = d->tex_sig[1] = d->vb_sig = d->pipe_base_key = 0;
+    d->samples_target = false;
+    std::memset(d->tex_res, 0, sizeof d->tex_res);
+    std::memset(d->tex_obj, 0, sizeof d->tex_obj);
+    std::memset(d->tex_view, 0, sizeof d->tex_view);
+    std::memset(d->tex_dk, 0, sizeof d->tex_dk);
+    std::memset(d->smp_lin, 0, sizeof d->smp_lin);
+    std::memset(d->smp_near, 0, sizeof d->smp_near);
     d->clear_color[0] = d->clear_color[1] = d->clear_color[2] = d->clear_color[3] = 0;
     d->clear_depth = 1, d->clear_stencil = 0;
     d->inline_vertices.clear();
@@ -604,12 +602,13 @@ TechFn o_tech_a, o_tech_b;
 TechVoidFn o_tech_c;
 void note_tfx_technique(uint64_t tech) {
     if (tech < 0x10000 || !ng::active()) return;
+    static thread_local uint64_t last_tech = 0;
+    if (tech == last_tech) return;
+    last_tech = tech;
     const uint32_t vs_h = field<uint32_t>(tech, 0x28);
     const uint32_t ps_h = field<uint32_t>(tech, 0x2A8);
     const uint64_t vs_o = vs_h != 0xFFFFFFFFu ? nr::resolve_handle_safe(vs_h) : 0;
     const uint64_t ps_o = ps_h != 0xFFFFFFFFu ? nr::resolve_handle_safe(ps_h) : 0;
-    if (vs_o >= 0x10000) nr::resreg::touch(vs_o, true, vs_h);
-    if (ps_o >= 0x10000) nr::resreg::touch(ps_o, true, ps_h);
     if (vs_o >= 0x10000 || ps_o >= 0x10000) {
         ng::prefetch_shader_pair(vs_o >= 0x10000 ? reinterpret_cast<const uint8_t*>(vs_o) : nullptr,
                                  ps_o >= 0x10000 ? reinterpret_cast<const uint8_t*>(ps_o) : nullptr);

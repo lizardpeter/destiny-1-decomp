@@ -51,6 +51,7 @@ struct Draw {
     uint16_t smp_near[kStages][16] = {};  // bindless sampler_id (forced nearest for non-filterable textures)
     uint64_t tex_sig[kStages] = {};       // 4 bits per slot: (dim | kind << 2) << (slot * 4)
     uint64_t vb_sig = 0;                  // pre-mixed hash of vertex buffer strides & formats
+    uint64_t pipe_base_key = 0;           // pre-mixed draw pipeline key (without target formats)
     bool samples_target = false;          // true if any active texture slot references a render target
     // registers
     uint32_t blend = 0, target_mask = 0xF, su_sc_mode = 0, clip = 0, depth_ctl = 0, stencil_ctl = 0, stencil_ref = 0;

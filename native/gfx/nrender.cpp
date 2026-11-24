@@ -992,7 +992,17 @@ struct Renderer {
     // resource ID (res >> 32) guarantees one persistent VkImage for the texture's lifetime.
     static uint64_t tex_key(const uint32_t* t, uint64_t res) {
         if (!res) return hash_bytes(t, 32) & ~(1ull << 63);
-        return mix(res >> 32, 0x5445585245534944ull) | (1ull << 63);
+        const auto ts = fmt::decode_tsharp(t);
+        if (ts.type == 10 || ts.type == 12 || ts.type == 13) {
+            uint32_t c[8];
+            std::memcpy(c, t, 32);
+            c[0] = 0, c[1] &= ~0xFFFFFu, c[3] &= ~0xF000u;
+            return hash_bytes(c, 32, (res >> 32) * 0x9E3779B97F4A7C15ull) | (1ull << 63);
+        }
+        uint32_t c[8];
+        std::memcpy(c, t, 32);
+        c[0] = 0, c[1] &= ~0xFFFFFu, c[2] = 0, c[3] &= ~0xFF000u, c[4] &= 0x1FFFu;
+        return hash_bytes(c, 32, (res >> 32) * 0x9E3779B97F4A7C15ull) | (1ull << 63);
     }
     void evict_textures();
     uint16_t sampler_id(const uint32_t* s, bool nearest = false);
@@ -1274,17 +1284,17 @@ bool Renderer::init(const Options& o) {
             log("native renderer: failed to allocate bindless descriptor set");
             return false;
         }
-        // Populate slot 0 of every image array with its dummy view, slot 0 of sampler array with dummy_sampler, and binding 13 with the ring buffer
+        // Populate all slots of every image array with its dummy view, all slots of sampler array with dummy_sampler, and binding 13 with the ring buffer
         VkWriteDescriptorSet writes[14]{};
-        VkDescriptorImageInfo img_infos[13]{};
+        std::vector<VkDescriptorImageInfo> img_infos[12];
         for (uint32_t b = 0; b < gcn::kBindlessImageBindings; ++b) {
-            img_infos[b] = {VK_NULL_HANDLE, dummy_views[b], VK_IMAGE_LAYOUT_GENERAL};
-            writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, bindless_set, b, 0, 1,
-                         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &img_infos[b], nullptr, nullptr};
+            img_infos[b].assign(gcn::kMaxBindlessViews, {VK_NULL_HANDLE, dummy_views[b], VK_IMAGE_LAYOUT_GENERAL});
+            writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, bindless_set, b, 0, gcn::kMaxBindlessViews,
+                         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, img_infos[b].data(), nullptr, nullptr};
         }
-        img_infos[12] = {dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
-        writes[12] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, bindless_set, gcn::kBindlessSamplerBinding, 0, 1,
-                      VK_DESCRIPTOR_TYPE_SAMPLER, &img_infos[12], nullptr, nullptr};
+        std::vector<VkDescriptorImageInfo> smp_infos(gcn::kMaxBindlessSamplers, {dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL});
+        writes[12] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, bindless_set, gcn::kBindlessSamplerBinding, 0, gcn::kMaxBindlessSamplers,
+                      VK_DESCRIPTOR_TYPE_SAMPLER, smp_infos.data(), nullptr, nullptr};
         VkDescriptorBufferInfo ring_info{ring.buf, 0, ring.size};
         writes[13] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, bindless_set, gcn::kBindlessRingBinding, 0, 1,
                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring_info, nullptr};
@@ -1697,17 +1707,15 @@ void Renderer::heap_free(Alloc& a) {
 
 uint16_t Renderer::alloc_bindless_view(VkImageView v, uint8_t dim, uint8_t kind) {
     if (!v || !bindless_set) return 0;
+    std::lock_guard lk(bindless_m);
     uint16_t id = 0;
-    {
-        std::lock_guard lk(bindless_m);
-        if (!free_view_ids.empty()) {
-            id = free_view_ids.back();
-            free_view_ids.pop_back();
-        } else if (next_view_id < gcn::kMaxBindlessViews) {
-            id = next_view_id++;
-        } else {
-            return 0;
-        }
+    if (!free_view_ids.empty()) {
+        id = free_view_ids.back();
+        free_view_ids.pop_back();
+    } else if (next_view_id < gcn::kMaxBindlessViews) {
+        id = next_view_id++;
+    } else {
+        return 0;
     }
     const uint32_t binding = uint32_t(dim) * 3 + uint32_t(kind);
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL};
@@ -1719,12 +1727,12 @@ uint16_t Renderer::alloc_bindless_view(VkImageView v, uint8_t dim, uint8_t kind)
 
 void Renderer::free_bindless_view(uint16_t id, uint8_t dim, uint8_t kind) {
     if (!id || !bindless_set) return;
+    std::lock_guard lk(bindless_m);
     const uint32_t binding = uint32_t(dim) * 3 + uint32_t(kind);
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, dummy_views[binding], VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, bindless_set, binding, id, 1,
                            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii, nullptr, nullptr};
     vkUpdateDescriptorSets(ctx.device, 1, &w, 0, nullptr);
-    std::lock_guard lk(bindless_m);
     free_view_ids.push_back(id);
 }
 
@@ -1888,6 +1896,12 @@ uint64_t Renderer::ring_alloc(uint64_t size, uint64_t align) {
     while (end > ring_oldest + R) {
         ring_oldest = oldest_ring();
         if (end <= ring_oldest + R) break;
+        if (inflight.empty() && up_rec.cur != UINT32_MAX && tr != &up_rec) {
+            Recorder* const p = tr;
+            tr = &up_rec;
+            submit();
+            tr = p;
+        }
         if (inflight.empty()) return UINT64_MAX;  // the recordings in progress need more than the ring
         retire_one();
     }
@@ -2144,8 +2158,12 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
     uint32_t layers = (ts.type == 13 || ts.type == 12 || cube) ? ts.last_array + 1 : 1;
     if (cube) layers = std::max(6u, layers - layers % 6);
 
-    const StreamMipInfo smi = get_stream_info(res, obj, ts);
-    const bool streamed = res != 0 && smi.has_hi != 0 && smi.full_mips > 1 && smi.full_w >= ts.width && smi.full_h >= ts.height;
+    const StreamMipInfo smi = (!is3d && ts.type != 12 && ts.type != 13) ? get_stream_info(res, obj, ts) : StreamMipInfo{};
+    const bool streamed = res != 0 && !is3d && ts.type != 12 && ts.type != 13 &&
+                          smi.has_hi != 0 && smi.low_base != 0 && smi.full_mips > 1 &&
+                          smi.full_w >= ts.width && smi.full_h >= ts.height &&
+                          (ts.width == smi.full_w || ts.width == std::max(1u, uint32_t(smi.full_w >> 1))) &&
+                          (ts.height == smi.full_h || ts.height == std::max(1u, uint32_t(smi.full_h >> 1)));
     const uint32_t full_w = streamed ? smi.full_w : ts.width;
     const uint32_t full_h = streamed ? smi.full_h : ts.height;
     const uint32_t full_d = streamed ? smi.full_d : (is3d ? ts.depth : 1);
@@ -2261,14 +2279,15 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
             total += (sizes[k] + 15) & ~15ull;
         }
         Buffer sb;
-        uint64_t base_off = ring_alloc(std::max<uint64_t>(total, 16), 256);
+        const bool prefer_own = (ring_head - ring_oldest) + total > (ring.size / 2);
+        uint64_t base_off = prefer_own ? UINT64_MAX : ring_alloc(std::max<uint64_t>(total, 16), 256);
         const bool own = base_off == UINT64_MAX;
         if (!own) sb = ring, sb.map = ring.map + base_off;
         else sb = make_buffer(std::max<uint64_t>(total, 16), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true), base_off = 0;
         if (!sb.map) return false;
 
         const uint64_t tf0 = now_ns();
-        const uint32_t missing = (!streamed && src_lv_begin == 0 && dst_lv_begin == 0) ? first_missing_mip(ts, fi, s_src, is3d) : src_lv_count;
+        const uint32_t missing = (src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count > 1) ? first_missing_mip(ts, fi, s_src, is3d) : src_lv_count;
         const uint64_t td = now_ns();
         st.t_fill += td - tf0;
         if (missing < src_lv_count) {
@@ -3022,19 +3041,14 @@ Shader* Renderer::shader(const Draw& dr, bool vs, const gcn::TexDim* dims, const
     gcn::TexDim masked_dims[16];
     uint8_t masked_kinds[16] = {};
     for (int i = 0; i < 16; ++i) masked_dims[i] = dims[i], masked_kinds[i] = kinds[i];
-    auto bit = shaders.find(base_key);
-    if (bit != shaders.end()) {
-        const uint16_t tmask = bit->second->res.tex_mask;
-        bool all_default = true;
+    if (auto mit = obj_tex_mask64.find((uint64_t(obj) << 1) | (vs ? 1ull : 0ull)); mit != obj_tex_mask64.end()) {
+        const uint64_t m64 = mit->second;
         for (int i = 0; i < 16; ++i) {
-            if (!(tmask >> i & 1)) {
+            if (!((m64 >> (i * 4)) & 0xF)) {
                 masked_dims[i] = gcn::TexDim::Tex2D;
                 masked_kinds[i] = 0;
-            } else if (masked_dims[i] != gcn::TexDim::Tex2D || masked_kinds[i] != 0) {
-                all_default = false;
             }
         }
-        if (all_default) return bit->second.get();
     }
     uint64_t key = mix(mix(uint64_t(obj), vs), hash_bytes(masked_dims, 16 * sizeof(gcn::TexDim)));
     key = mix(mix(key, hash_bytes(masked_kinds, 16)), uint64_t(uint_in) | uint64_t(sint_in) << 32);
@@ -3109,8 +3123,9 @@ Shader* Renderer::shader(const Draw& dr, bool vs, const gcn::TexDim* dims, const
     canon_key = mix(mix(canon_key, hash_bytes(masked_kinds, 16)), uint64_t(uint_in) | uint64_t(sint_in) << 32);
     if (scaled_in) canon_key = mix(canon_key, scaled_in);
     if (!vs) canon_key = mix(canon_key, uint64_t(dr.vs));
-    shaders[canon_key] = std::move(sh);
-    return out;
+    auto [cit, inserted] = shaders.try_emplace(canon_key, std::move(sh));
+    if (!inserted && sh && sh->module) vkDestroyShaderModule(ctx.device, sh->module, nullptr);
+    return cit->second.get();
 }
 
 uint32_t topology_of(uint32_t prim, VkPrimitiveTopology& t) {
@@ -3586,12 +3601,6 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
             if (x.img == img) { x.asp |= asp; return; }
         need.push_back({img, asp});
     };
-    uint64_t att_bases[9] = {};
-    uint32_t n_att_bases = 0;
-    if (depth && depth->base) att_bases[n_att_bases++] = depth->base;
-    for (int i = 0; i < 8; ++i)
-        if (colors[i] && colors[i]->base) att_bases[n_att_bases++] = colors[i]->base;
-    if (n_att_bases == 0) return;
     for (size_t k = 0; k < n; ++k) {
         const Draw& dr = *run[k];
         for (int st2 = 0; st2 < 2; ++st2)
@@ -3599,11 +3608,6 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
                 const uint32_t slot = __builtin_ctz(msk);
                 if (dr.tex_res[st2][slot] != 0) continue;  // registered textures are never render targets
                 const uint32_t* t = dr.tex[st2][slot];
-                const uint64_t t_base = (uint64_t(t[0]) | uint64_t(t[1] & 0xFF) << 32) << 8;
-                bool match = false;
-                for (uint32_t bi = 0; bi < n_att_bases; ++bi)
-                    if (att_bases[bi] == t_base) { match = true; break; }
-                if (!match) continue;
                 const auto ts = fmt::decode_tsharp(t);
                 if (depth && depth->stencil)
                     if (auto sit = stencil_by_base.find(ts.base); sit != stencil_by_base.end() && sit->second == depth) {
@@ -4207,7 +4211,15 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
             if (src >= dr.inline_vertices.size()) return skip("inline vertex offset");
             size = std::min<uint64_t>(size, dr.inline_vertices.size() - src);
             src += uint64_t(dr.inline_vertices.data());
-        } else if (base < 0x10000) return skip("null vertex buffer");
+        } else if (base < 0x10000 || guest_region_extent(src) < size) {
+            const uint64_t zsz = std::max<uint64_t>(stride ? stride : 16, 16);
+            const uint64_t off = rec_ring(r, zsz, 16);
+            if (off == UINT64_MAX) return skip("ring full");
+            std::memset(ring.map + off, 0, zsz);
+            vbufs[slot] = ring.buf, voffs[slot] = off, vsizes[slot] = zsz;
+            vmask |= 1u << slot;
+            continue;
+        }
         size = std::min<uint64_t>(size, 64ull << 20);
         const uint64_t off = rec_ring(r, std::max<uint64_t>(size, 16), 256);
         if (off == UINT64_MAX) return skip("ring full");
@@ -4627,6 +4639,53 @@ void Renderer::load_texture(const LoadJob& j) {
     const VkFormat f = fmt::vk_format(ts.dfmt, ts.nfmt);
     if (f == VK_FORMAT_UNDEFINED || !fi.bpp || fi.bpp == 96 || !ts.base || ts.width > 16384 || ts.height > 16384) return;
     if (opt.res_current && opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
+    tiling::Surface sf;
+    sf.tile_mode = ts.tiling, sf.bpp = fi.bpp, sf.block = fi.block, sf.pow2 = ts.pow2;
+    sf.width = ts.width, sf.height = ts.height, sf.pitch = ts.pitch;
+    const bool is3d = ts.type == 10, cube = ts.type == 11;
+    sf.depth = is3d ? ts.depth : 1;
+    sf.layers = (ts.type == 13 || ts.type == 12 || cube) ? ts.last_array + 1 : 1;
+    if (cube) sf.layers = std::max(6u, sf.layers - sf.layers % 6);
+    sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
+    tiling::layout(sf);
+    if (guest_region_extent(ts.base) < sf.total_size) return;
+    const uint64_t key = tex_key(t, j.res);
+    const uint64_t content = hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size);
+    {
+        std::lock_guard lk(m);
+        if (target_bases.count(ts.base)) return;
+        auto it = textures.find(key);
+        if (it != textures.end() && it->second) {
+            Image* img = it->second.get();
+            if (img->res_val == j.res && img->src_addr == ts.base) { ++ld_skipped; return; }
+            if (img->content == content && img->src_size == sf.total_size) {
+                img->res_val = j.res, img->src_addr = ts.base;
+                ++ld_moves;
+                return;
+            }
+        }
+    }
+    // Detile outside Renderer::m so engine recording threads never block on background detiling
+    std::vector<uint64_t> sizes(sf.levels), level_off(sf.levels);
+    uint64_t total = 0;
+    for (uint32_t lv = 0; lv < sf.levels; ++lv) {
+        const uint32_t mw = std::max(1u, ts.width >> lv), mh = std::max(1u, ts.height >> lv);
+        const uint32_t ew = fi.block ? (mw + 3) / 4 : mw, eh = fi.block ? (mh + 3) / 4 : mh;
+        sizes[lv] = uint64_t(ew) * eh * (fi.bpp / 8) * std::max(1u, is3d ? std::max(1u, sf.depth >> lv) : sf.layers);
+        level_off[lv] = total;
+        total += (sizes[lv] + 15) & ~15ull;
+    }
+    static thread_local std::vector<uint8_t> scratch;
+    scratch.resize(total);
+    const uint32_t missing = first_missing_mip(ts, fi, sf, is3d);
+    for (uint32_t lv = 0; lv < std::min(missing, sf.levels); ++lv)
+        tiling::detile(sf, lv, reinterpret_cast<const uint8_t*>(ts.base), scratch.data() + level_off[lv]);
+    if (missing < sf.levels) fill_missing_mips(missing, scratch.data(), level_off, sizes, ts, fi, sf, is3d);
+    if ((opt.res_current && opt.res_current(j.obj) != j.res) ||
+        hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size) != content) {
+        ++ld_stale;
+        return;
+    }
     std::lock_guard lk(m);
     if (target_bases.count(ts.base)) return;
     Recorder* const prev_tr = tr;
@@ -4752,6 +4811,8 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
             feedback_snapshots(items.data() + i, j - i, colors, depth);
             begin_pass(colors, depth);
             lk.unlock();
+            std::vector<Draw*> run_slice(items.begin() + i, items.begin() + j);
+            resolve_draw_resources(run_slice, false);
             for (size_t k = i; k < j; ++k) draw(*items[k], run_rec, colors, depth);
             relock();
             i = j - 1;
