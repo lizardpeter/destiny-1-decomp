@@ -2398,6 +2398,10 @@ Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res,uint64_t obj,cons
         auto& cached=stream_mips[rid].entries[slot];
         if(cached.epoch==res&&cached.from_callback)return cached;
         cached=info;
+    }else if(thi){
+        // Invalid authored split metadata does not imply contiguous storage.
+        // Avoid treating the isolated top mip as a complete mip allocation.
+        info.valid=false;
     }
     return info;
 }
@@ -6688,7 +6692,7 @@ void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj) {
 }
 void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64_t low_base,uint64_t hi_base,
                          const uint32_t* low_descriptor){
-    if(!g||!res)return;
+    if(!g||!res||!obj||!g->opt.res_current||g->opt.res_current(obj)!=res)return;
     Renderer::StreamMipInfo info{};
     info.epoch=res;info.obj=obj;info.low_base=low_base;info.hi_base=hi_base;
     info.from_callback=true;
@@ -6712,6 +6716,7 @@ void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64
     }
     {
         std::lock_guard lk(g->mip_m);
+        if(g->opt.res_current(obj)!=res)return;
         auto& history=g->stream_mips[uint32_t(res>>32)].entries;
         if(!info.low_layout.base&&low_base){
             // Recover a previously captured physical layout for the same

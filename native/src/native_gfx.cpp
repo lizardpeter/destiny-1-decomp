@@ -224,8 +224,10 @@ inline uint64_t get(uint64_t key) {
     }
     return g_registry->current(snapshot) ? snapshot.identity : 0;
 }
-void touch(uint64_t key, bool insert, uint32_t handle = UINT32_MAX) {
-    if (g_registry && key >= 0x10000 && g_registry->touch(key, insert, handle)) ++g_events;
+uint64_t touch(uint64_t key, bool insert, uint32_t handle = UINT32_MAX) {
+    uint64_t published=0;
+    if (g_registry && key >= 0x10000 && g_registry->touch(key, insert, handle,&published)) ++g_events;
+    return published;
 }
 // the resource object a (type, handle) names, 0 for the types the renderer does not track
 bool tracked_type(uint32_t type) {
@@ -1228,9 +1230,10 @@ D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
         mip_base(p,plan.base);
     } else o_mips(handle, low_base, hi_base);
     if (const uint64_t o = nr::resreg::object_of(1, handle)) {
-        nr::resreg::touch(o, true, handle);
-        const uint64_t res = nr::resreg::get(o);
-        if (res && ng::active()) {
+        // Do not associate this callback's addresses with a newer epoch
+        // published by another resource event between touch and lookup.
+        const uint64_t res=nr::resreg::touch(o,true,handle);
+        if (res && ng::active() && nr::resreg::get(o)==res) {
             // Construct the low descriptor into private storage with the
             // original 01.33 constructor contract, rather than guessing its
             // tile pitch from the full-resolution high descriptor.

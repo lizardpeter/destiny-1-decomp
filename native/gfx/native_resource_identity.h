@@ -77,7 +77,8 @@ public:
         }
         return {};
     }
-    bool touch(uint64_t key,bool insert,uint32_t handle=UINT32_MAX) {
+    bool touch(uint64_t key,bool insert,uint32_t handle=UINT32_MAX,uint64_t* published=nullptr) {
+        if(published)*published=0;
         if(!key)return false;
         std::lock_guard lock(mutex_);
         const size_t h=home(key);
@@ -113,6 +114,7 @@ public:
         s.pool_epoch.store(e);
         s.identity.store(id);
         s.sequence.fetch_add(1);
+        if(published)*published=id;
         return true;
     }
 };

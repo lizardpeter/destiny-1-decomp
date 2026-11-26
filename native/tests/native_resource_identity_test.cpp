@@ -13,9 +13,11 @@ int main(){
     check(r.touch(0x10000,true,5));
     auto first=r.get(0x10000);
     check(first.handle==5&&uint32_t(first.identity)==1);
-    check(r.touch(0x10000,true,5));
+    uint64_t published=0;
+    check(r.touch(0x10000,true,5,&published));
     auto next=r.get(0x10000);
-    check(next.identity==first.identity+1);
+    check(next.identity==first.identity+1&&published==next.identity);
+    check(!r.touch(0x10000,false,6,&published)&&!published);
     check(!r.touch(0x10000,false,6));
     check(r.touch(0x10000,true,6));
     auto changed=r.get(0x10000);
