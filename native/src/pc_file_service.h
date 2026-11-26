@@ -1,6 +1,7 @@
 #pragma once
 #include "pc_file_queue.h"
 #include "pc_paths.h"
+#include "pc_directory.h"
 
 namespace d1::pc_io {
 // Native game-facing file service. No retail mount names, layouts, error codes,
@@ -8,6 +9,7 @@ namespace d1::pc_io {
 class Service {
     Paths paths_;
     Queue queue_;
+    DirectoryRegistry directories_;
 public:
     Service(const std::filesystem::path& assets, const std::filesystem::path& data,
             unsigned workers = 2, size_t max_operations = 1024, uint64_t max_bytes = 256ull << 20)
@@ -31,6 +33,13 @@ public:
     Result wait(Queue::Id id) { return queue_.wait(id); }
     bool poll(Queue::Id id, Result& result) { return queue_.poll(id, result); }
     bool forget(Queue::Id id) { return queue_.forget(id); }
+    uint32_t open_directory(Root root, const std::filesystem::path& name, std::error_code& ec) {
+        return directories_.open(paths_, root, name, ec);
+    }
+    std::optional<DirectoryEntry> next_directory(uint32_t id, std::error_code& ec) {
+        return directories_.next(id, ec);
+    }
+    bool close_directory(uint32_t id) { return directories_.close(id); }
     const Paths& paths() const { return paths_; }
 };
 } // namespace d1::pc_io
