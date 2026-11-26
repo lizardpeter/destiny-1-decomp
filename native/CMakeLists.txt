@@ -196,3 +196,10 @@ if(NOT WIN32)
   add_test(NAME fios-imports COMMAND fios-imports-test "${CMAKE_CURRENT_BINARY_DIR}/fios-imports-test-dir")
   set_tests_properties(fios-imports PROPERTIES TIMEOUT 30)
 endif()
+
+# Independent bounded mspace model; not an imported retail allocator yet.
+add_executable(pc-mspace-test tests/pc_mspace_test.cpp)
+target_include_directories(pc-mspace-test PRIVATE src)
+target_link_libraries(pc-mspace-test PRIVATE Threads::Threads)
+add_test(NAME pc-mspace COMMAND pc-mspace-test)
+set_tests_properties(pc-mspace PROPERTIES TIMEOUT 60)

@@ -101,3 +101,27 @@ This pass adds an opt-in complete-cohort provider, `D1_NATIVE_FIOS=1`, not enabl
 Validation: the exact committed adapter, ABI assembly, core and dependencies were compiled locally on Linux with g++ C++20 -O2 -Wall -Wextra -Werror and Clang ASan/UBSan. Both the full core test and import harness passed. Core checks include real file and directory I/O, metadata, seek, append, immutable assets, disjoint handle classes, 1,000 deterministic early-delete/callback interleavings and rejection of positional writes on append handles. The import harness checks all 25 NIDs against the exact original symbol names/values, uses the production SysV import wrappers and actual four-argument assembly entry, verifies short-read, write and rejected-destination callback results, validates operation deletion, and checks that an untracked read destination is rejected. Runtime functions for guest TLS, thread registration and mapping delivery are test doubles; no original executable is run by this harness. Existing staging, callback and binary-contract regressions also passed again in optimized builds. Both new tests registered with CTest (import harness currently Linux only).
 
 Remaining integration gates: full Windows/Linux native executable build and live asset-streaming test; original filter and nonzero operation-attribute semantics; actual FIOS initialization pools, thread/TLS behavior, termination and reinitialization; exact EOF/error parity; untracked or suballocated read destinations; virtual-memory protection/unmap metadata edge cases; priority/deadline and cancellation semantics. The adapter explicitly rejects unsupported nonzero attributes, directory filters and open flag 0x10000 instead of silently pretending to implement them. Termination drains the process-lifetime provider rather than reproducing complete original pool destruction; callback-time termination is rejected. The current experimental build flag is intended for controlled local verification only; production remains on the original FIOS PRX. No FPS or game boot claim.
+
+### Native allocator ownership — bounded mspace model
+
+Original executable disassembly and pseudocode at 0x2450–0x2670 establish a dedicated User Malloc arena. 0x2450 allocates and maps 0x4000000 bytes of direct memory with 0x4000000 alignment, then calls sceLibcMspaceCreate("User Malloc", base, 0x4000000, 0), storing the returned handle at 0x1A21618. The direct-memory offset is at 0x1A21610. 0x2510 passes that handle to Destroy and releases the direct-memory range only on success (or no handle). The decompiler omits the Destroy argument, but the machine code at 0x2514 loads RDI explicitly.
+
+| Eboot address | Evidence from register moves and tail jump |
+|---|---|
+| 0x2550 | Malloc: prepends arena handle to caller's one argument |
+| 0x2570 | Free: prepends handle |
+| 0x2590 | Calloc: prepends handle to two arguments |
+| 0x25B0 | Realloc: prepends handle to two arguments |
+| 0x25D0 | Memalign: prepends handle to two arguments |
+| 0x25F0 | PosixMemalign: prepends handle to three arguments |
+| 0x2610 | Reallocalign: (handle, original arg0, original arg2, original arg1) |
+| 0x2630 / 0x2650 | Stats / StatsFast: prepend handle |
+| 0x2670 | UsableSize: direct tail jump, no argument remapping |
+
+The decompiler labels nine of these forwarding wrappers void, but the tail jumps preserve the imported function's return register. Do not infer that Malloc or Realloc return void from that output. Neither the exact imported stats layout nor all imported argument/return types have yet been verified against libc.prx machine code.
+
+pc_mspace.h introduces an independent bounded arena model over caller-owned backing storage: aligned allocation, zeroed allocation, coalescing free, in-place shrink/grow, move-on-reallocation, ownership checks and size/aggregate statistics. It uses host-owned map metadata and a mutex, not an emulation of retail heap metadata. No global malloc/free or C++ operators are redirected, and it is not registered as an import provider. Its first-fit behavior, zero-size semantics, 16-byte minimum and stats representation are model choices, not recovered retail contracts. A freed address can be reused and cannot by itself identify an allocation generation. The model is not yet benchmarked for hot-path use.
+
+The exact model and test were compiled on Linux with g++ C++20 -O2 -Wall -Wextra -Werror and Clang ASan/UBSan. Four workers performed 100000 randomized allocation/reallocation/free iterations with content checks, alignment checks, capacity accounting and final full coalescence. Boundary tests exercised overflow, invalid/interior free, zeroing, exhaustion and failed-realloc preservation. Not a retail binary differential test. The test is registered in CTest; Linux CI now executes the registered native suites instead of only the tiling executable. Windows cross-compilation is not Windows runtime testing.
+
+Next integration gate: recover all 12 mspace imports from the original libc, exact stats and error semantics, handle lifetime, allocator cross-calls and every external consumer of the arena. Keep allocator ownership coherent and preserve guest mapping identity before redirecting any member of the cohort.
