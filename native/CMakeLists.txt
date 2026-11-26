@@ -115,9 +115,10 @@ target_link_libraries(region-extent-cache-test PRIVATE Threads::Threads)
 enable_testing()
 add_test(NAME region-extent-cache COMMAND region-extent-cache-test)
 
-add_executable(native-list-tokens-test tests/native_list_tokens_test.cpp)
-target_include_directories(native-list-tokens-test PRIVATE src)
-add_test(NAME native-list-tokens COMMAND native-list-tokens-test)
+add_executable(native-record-registry-test tests/native_record_registry_test.cpp)
+target_include_directories(native-record-registry-test PRIVATE src)
+target_link_libraries(native-record-registry-test PRIVATE Threads::Threads)
+add_test(NAME native-record-registry COMMAND native-record-registry-test)
 
 add_executable(frame-time-contract-test tests/frame_time_contract_test.cpp)
 target_include_directories(frame-time-contract-test PRIVATE src)
