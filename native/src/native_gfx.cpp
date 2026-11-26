@@ -169,7 +169,9 @@ uint64_t resolve_handle_safe(uint32_t h) {
     const uint64_t pool = tbl + uint64_t(((uint32_t(hs) >> 18) | 0x3FF) & uint32_t(hs)) * 0x40;
     const uint64_t pbase = field<uint64_t>(pool, 0x10);
     const uint32_t esz = field<uint32_t>(pool, 0x30);
-    if (!pbase || !esz || (h & 0x1FFF) * uint64_t(esz) >= field<uint64_t>(pool, 0x20) - pbase) return 0;
+    const uint64_t pend=field<uint64_t>(pool,0x20);
+    const uint64_t off_check=uint64_t(h&0x1FFF)*esz;
+    if (!pbase || esz<16 || pend<pbase || off_check>pend-pbase || pend-pbase-off_check<16) return 0;
     const uint64_t off = uint64_t(h & 0x1FFF) * esz;
     const uint64_t mask = uint64_t(int64_t(field<int32_t>(pool, 0x34)));
     return (pbase + off) - (mask & field<uint64_t>(pbase + off, 8));
@@ -210,7 +212,7 @@ inline uint64_t get(uint64_t key) {
                 (unsigned long long)c, (unsigned long long)key, snapshot.handle);
         return 0;
     }
-    return snapshot.identity;
+    return g_registry->current(snapshot) ? snapshot.identity : 0;
 }
 void touch(uint64_t key, bool insert, uint32_t handle = UINT32_MAX) {
     if (g_registry && key >= 0x10000 && g_registry->touch(key, insert, handle)) ++g_events;
@@ -531,6 +533,17 @@ bool hook(uint64_t off, Fn host, Fn& orig, const char* name) {
 
 // ---------------------------------------------------------------------------- engine resource events
 namespace resev {
+// 0x6FBC0 destroys a package datum pool, clears its occupancy bit and
+// zeroes the descriptor. This is a lifetime boundary, unlike mip release.
+using PoolFreeFn = D1_SYSV void (*)(uint32_t);
+PoolFreeFn o_pool_free;
+D1_SYSV void h_pool_free(uint32_t value) {
+    const uint32_t pool=value&0x3FFFu;
+    auto* registry=nr::resreg::g_registry;
+    const bool retiring=registry&&registry->begin_pool_retire(pool);
+    o_pool_free(value);
+    if(retiring)registry->end_pool_retire(pool);
+}
 uint64_t tex_base(const uint32_t* t) { return (uint64_t(t[0]) | uint64_t(t[1] & 0xFF) << 32) << 8; }
 using SetFn = D1_SYSV uint64_t (*)(uint32_t, uint32_t, uint64_t);
 SetFn o_bind, o_rebind;
@@ -650,6 +663,11 @@ D1_SYSV void h_register(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t
 void install() {
     bool ok = true;
     nr::resreg::init();
+    // The prologue consists of relocatable register pushes; preserve the
+    // original free body and its callbacks. Failure leaves the old registry
+    // behavior rather than disabling otherwise valid resource notifications.
+    if(!hook(0x6FBC0,&h_pool_free,o_pool_free,"resource_pool_destroy"))
+        log("nd: pool destruction lifetime hook unavailable");
     ok &= hook(0xCFCC0, &h_register, o_register, "resource_callbacks_register");
     if (!replace_eboot_function(0x818FA0, reinterpret_cast<const void*>(&h_unlock))) ok = false, log("nd: replacing texture_unlock failed");
     patch_table();

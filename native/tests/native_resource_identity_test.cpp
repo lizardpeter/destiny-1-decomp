@@ -32,6 +32,28 @@ int main(){
     });
     for(uint32_t i=1;i<=100000;++i)check(r.touch(0x20000,true,i));
     stop=true;for(auto& t:readers)t.join();
+    // A reused package may have exactly the same object address and handle.
+    ResourceRegistry<8> pools;
+    const uint32_t handle=(42u<<13)|7;
+    check(handle_pool(handle)==42);
+    check(handle_pool(0x80000000u|(0x2345u<<13)|7)==0x2345);
+    check(pools.touch(0x40000,true,handle));
+    const auto old=pools.get(0x40000);
+    check(pools.begin_pool_retire(42));
+    check(!pools.current(old)&&!pools.get(0x40000).identity);
+    check(!pools.touch(0x40000,true,handle));
+    pools.end_pool_retire(42);
+    check(!pools.touch(0x40000,false,handle));
+    check(pools.touch(0x40000,true,handle));
+    check(pools.get(0x40000).identity>>32!=old.identity>>32);
+    for(unsigned generation=0;generation<10000;++generation){
+        for(unsigned i=0;i<32;++i)
+            check(pools.touch(0x100000+uint64_t(generation)*0x1000+i*16,true,(42u<<13)|i));
+        check(pools.begin_pool_retire(42));
+        pools.end_pool_retire(42);
+        for(unsigned i=0;i<32;++i)
+            check(!pools.get(0x100000+uint64_t(generation)*0x1000+i*16).identity);
+    }
     struct Collision { size_t operator()(const GeometryKey&) const {return 0;} };
     std::unordered_map<GeometryKey,int,Collision> m;
     m[{1,0,64,0,0}]=1;m[{1,0,64,2,32}]=2;m[{1,0,64,4,16}]=3;m[{2,0,64,0,0}]=4;
