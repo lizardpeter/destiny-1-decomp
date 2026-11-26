@@ -23,10 +23,11 @@ inline std::vector<uint32_t> query_reduce_shader() {
     m.decorate(src, DecBinding, {0});
     m.decorate(dst, DecDescriptorSet, {0});
     m.decorate(dst, DecBinding, {1});
-    const Id push_block = m.t_struct({u, u});
+    const Id push_block = m.t_struct({u, u, u});
     m.decorate(push_block, DecBlock);
     m.member_decorate(push_block, 0, DecOffset, {0});
     m.member_decorate(push_block, 1, DecOffset, {4});
+    m.member_decorate(push_block, 2, DecOffset, {8});
     const Id push = m.variable(m.t_ptr(SCPushConstant, push_block), SCPushConstant);
     const Id pu = m.t_ptr(SCPushConstant, u);
     const Id f = m.begin_function(v, m.t_func(v));
@@ -34,6 +35,7 @@ inline std::vector<uint32_t> query_reduce_shader() {
     const Id accum = m.function_variable(m.t_ptr(SCFunction, u));
     const Id count = m.op_r(OpLoad, u, {m.op_r(OpAccessChain, pu, {push, zero})});
     const Id slot = m.op_r(OpLoad, u, {m.op_r(OpAccessChain, pu, {push, one})});
+    const Id first = m.op_r(OpLoad, u, {m.op_r(OpAccessChain, pu, {push, two})});
     m.op(OpStore, {i, zero});
     m.op(OpStore, {accum, zero});
     const Id header = m.label(), body = m.label(), cont = m.label(), merge = m.label();
@@ -44,7 +46,8 @@ inline std::vector<uint32_t> query_reduce_shader() {
     m.op(OpLoopMerge, {merge, cont, 0});
     m.op(OpBranchConditional, {cond, body, merge});
     m.place_label(body);
-    const Id low_index = m.op_r(OpIMul, u, {index, two});
+    const Id absolute = m.op_r(OpIAdd, u, {first, index});
+    const Id low_index = m.op_r(OpIMul, u, {absolute, two});
     const Id high_index = m.op_r(OpIAdd, u, {low_index, one});
     const Id low = m.op_r(OpLoad, u, {m.op_r(OpAccessChain, word, {src, zero, low_index})});
     const Id high = m.op_r(OpLoad, u, {m.op_r(OpAccessChain, word, {src, zero, high_index})});
