@@ -8,8 +8,8 @@ namespace d1::pc_io {
 // or callback ABI. All public opens must go through the asset/data namespace.
 class Service {
     Paths paths_;
-    Queue queue_;
     DirectoryRegistry directories_;
+    Queue queue_; // drain before destroying paths or directory handles
 public:
     Service(const std::filesystem::path& assets, const std::filesystem::path& data,
             unsigned workers = 2, size_t max_operations = 1024, uint64_t max_bytes = 256ull << 20)
