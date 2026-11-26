@@ -1,6 +1,7 @@
 // Retail libc leaf import adapter: explicit allowlist, never a global symbol
 // override. The host C runtime supplies the actual optimized implementations.
 #include "pc_libc_leaf.h"
+#include "pc_libc_wide.h"
 #include "pc_libc_math.h"
 #include "hle.h"
 #include "nid.h"
@@ -17,6 +18,7 @@ void* native_libc_leaf(const std::string& nid, bool include_math) {
         {nid_of("memcmp"), guest_entry<&compare>()},
         {nid_of("memchr"), guest_entry<&find_byte>()},
         {nid_of("strlen"), guest_entry<&length>()},
+        {nid_of("wcslen"), guest_entry<&wide_length16>()},
         {nid_of("strcmp"), guest_entry<&compare_string>()},
         {nid_of("strncmp"), guest_entry<&compare_prefix>()},
         {nid_of("strstr"), guest_entry<&find_string>()},

@@ -203,3 +203,7 @@ target_include_directories(pc-mspace-test PRIVATE src)
 target_link_libraries(pc-mspace-test PRIVATE Threads::Threads)
 add_test(NAME pc-mspace COMMAND pc-mspace-test)
 set_tests_properties(pc-mspace PROPERTIES TIMEOUT 60)
+
+add_executable(pc-libc-wide-test tests/pc_libc_wide_test.cpp)
+target_include_directories(pc-libc-wide-test PRIVATE src)
+add_test(NAME pc-libc-wide COMMAND pc-libc-wide-test)

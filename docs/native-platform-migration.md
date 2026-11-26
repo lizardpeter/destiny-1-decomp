@@ -125,3 +125,28 @@ pc_mspace.h introduces an independent bounded arena model over caller-owned back
 The exact model and test were compiled on Linux with g++ C++20 -O2 -Wall -Wextra -Werror and Clang ASan/UBSan. Four workers performed 100000 randomized allocation/reallocation/free iterations with content checks, alignment checks, capacity accounting and final full coalescence. Boundary tests exercised overflow, invalid/interior free, zeroing, exhaustion and failed-realloc preservation. Not a retail binary differential test. The test is registered in CTest; Linux CI now executes the registered native suites instead of only the tiling executable. Windows cross-compilation is not Windows runtime testing.
 
 Next integration gate: recover all 12 mspace imports from the original libc, exact stats and error semantics, handle lifetime, allocator cross-calls and every external consumer of the arena. Keep allocator ownership coherent and preserve guest mapping identity before redirecting any member of the cohort.
+
+### Retail libc export recovery and native wide-string leaf
+
+Read the 927802-byte libc.prx directly through the project's R2 object API (ETag 6953eee266069be46b1434b2a96fa0ce). Parsed the SCE dynamic string/symbol tables and resolved each export by its original NID. These are libc module virtual addresses, not eboot offsets.
+
+| Export | VA | Symbol size (bytes) |
+|---|---:|---:|
+| sceLibcMspaceCreate | 0x9780 | 8 |
+| sceLibcMspaceDestroy | 0x9790 | 5 |
+| sceLibcMspaceMalloc | 0x7EB0 | 8 |
+| sceLibcMspaceFree | 0x97A0 | 364 |
+| sceLibcMspaceCalloc | 0x9910 | 149 |
+| sceLibcMspaceRealloc | 0x99B0 | 81 |
+| sceLibcMspaceMemalign | 0x9450 | 37 |
+| sceLibcMspacePosixMemalign | 0x9A20 | 167 |
+| sceLibcMspaceReallocalign | 0x9A10 | 8 |
+| sceLibcMspaceMallocStats | 0x9AD0 | 5 |
+| sceLibcMspaceMallocStatsFast | 0x9AE0 | 5 |
+| sceLibcMspaceMallocUsableSize | 0x9AF0 | 49 |
+
+UsableSize takes a single pointer (RDI), tests null, reads the preceding 8-byte chunk header and inspects flags and a conditional tail byte. It does not accept an mspace handle. This is direct evidence that mixing host/model and retail allocations before migrating all consumers can cause invalid metadata reads. Create clears R8D before tail-jumping; Malloc duplicates RDI into RDX; Reallocalign duplicates RDI into R8 before its tail jump. These are internal argument adaptations, not evidence that the public prototypes have the extra arguments. The full allocator implementation and stats output ABI remain to be recovered.
+
+wcslen (NID WkkeywLJcgU, VA 0x17030, 34 bytes) is a relocation-free loop that compares a 16-bit memory operand to zero, advances by two bytes, then divides the byte distance by two. Its result counts 16-bit code units, not Unicode scalar values. The native leaf uses explicit 16-bit loads via memcpy to avoid alignment and host wchar_t ABI dependencies. It is library-scoped and enabled with the existing default native leaf cohort; D1_PC_LIBC_LEAVES=0 still restores the original. Current native libc import coverage becomes 20 default leaves plus 18 opt-in math/time leaves (38/143 total). No allocator or locale-dependent import was redirected.
+
+Local validation: 100000 randomized original-machine-code differential calls (including unaligned addresses), plus 128 guard-page boundary cases passed on Linux x86-64. The original 34-byte relocation-free routine was copied only into a private local execution harness, never into the repository. The committed portable unit test passed optimized and ASan/UBSan builds on 100000 randomized cases plus a UTF-16 surrogate-pair case. CTest registration added. Full Windows runtime and live-game compatibility remain unverified.
