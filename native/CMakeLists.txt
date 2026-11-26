@@ -157,3 +157,8 @@ add_test(NAME pc-service COMMAND pc-service-test "${CMAKE_CURRENT_BINARY_DIR}/pc
 add_executable(fios-contract-test tests/fios_contract_test.cpp)
 target_include_directories(fios-contract-test PRIVATE src)
 add_test(NAME fios-contract COMMAND fios-contract-test)
+
+add_executable(pc-libc-math-test tests/pc_libc_math_test.cpp)
+target_include_directories(pc-libc-math-test PRIVATE src)
+target_compile_options(pc-libc-math-test PRIVATE -frounding-math)
+add_test(NAME pc-libc-math COMMAND pc-libc-math-test)
