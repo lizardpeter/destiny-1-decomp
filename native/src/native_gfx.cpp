@@ -36,6 +36,7 @@
 #include "native_record_registry.h"
 #include "../gfx/native_record_fifo.h"
 #include "../gfx/native_cbm_contract.h"
+#include "../gfx/native_cbm_pool.h"
 #include "native_submission.h"
 #include "../gfx/native_close_contract.h"
 #include "../gfx/native_resource_identity.h"
@@ -1143,6 +1144,22 @@ bool native_cbm_enabled(){
     }();
     return enabled;
 }
+bool native_cbm_pool_enabled(){
+    static const bool enabled=[] {
+        const char* v=std::getenv("D1_PC_NATIVE_CBM_POOL");
+        return native_cbm_enabled()&&v&&std::atoi(v)!=0;
+    }();
+    return enabled;
+}
+std::unique_ptr<ng::cbm::Pool> g_cbm_pool;
+std::array<uint32_t,ng::cbm::slot_count*2> g_cbm_table{};
+uint64_t g_cbm_base=0,g_cbm_manager=0;
+uint32_t cbm_sample(uint64_t cbm){
+    return __atomic_load_n(reinterpret_cast<uint32_t*>(field<uint64_t>(cbm,0x20)),__ATOMIC_ACQUIRE);
+}
+void cbm_require(uint64_t cbm){
+    if(!g_cbm_pool||cbm!=g_cbm_manager){log("nd: invalid native CBM manager");std::abort();}
+}
 // The retail CBM still owns chunk indices and list fence bookkeeping.
 // Replace its two GPU memory allocations with ordinary PC host memory.
 D1_SYSV void h_cbm_init(uint64_t cbm,uint32_t bytes){
@@ -1160,6 +1177,18 @@ D1_SYSV void h_cbm_init(uint64_t cbm,uint32_t bytes){
     if(!memory){log("nd: native CBM backing allocation failed");std::abort();}
     const uint64_t base=uint64_t(memory);
     register_native_host_region(base,l.bytes);
+    if(native_cbm_pool_enabled()){
+        if(g_cbm_pool){log("nd: duplicate native CBM pool");std::abort();}
+        g_cbm_manager=cbm;g_cbm_base=base;
+        g_cbm_pool=std::make_unique<Pool>(uint32_t(bytes/chunk_bytes),field<uint32_t>(cbm,0x1c));
+        for(uint32_t i=0;i<slot_count;++i){g_cbm_table[i*2]=0;g_cbm_table[i*2+1]=invalid_chain;}
+        put_field(cbm,0,uint64_t(g_cbm_table.data()));
+        put_field(cbm,8,uint64_t(0));put_field(cbm,0x18,uint32_t(0));
+        put_field(cbm,0x20,base+l.label);put_field(cbm,0x30,uint64_t(0));
+        put_field(base,l.label,uint32_t(field<uint32_t>(cbm,0x1c)-1));
+        log("nd: native CBM owns %u chunks and all 512 completion slots",uint32_t(bytes/chunk_bytes));
+        return;
+    }
     using NewFn=D1_SYSV uint64_t(*)(uint64_t);
     using InitFn=D1_SYSV void(*)(uint64_t);
     using SizeFn=D1_SYSV void(*)(uint64_t,uint32_t,uint32_t);
@@ -1185,6 +1214,80 @@ D1_SYSV void h_cbm_init(uint64_t cbm,uint32_t bytes){
         memory,bytes,uint32_t(bytes/chunk_bytes));
     // Backing remains process-owned even after retail metadata teardown:
     // pending native completion callbacks must never target recycled memory.
+}
+D1_SYSV bool h_cbm_retire(uint64_t cbm){
+    cbm_require(cbm);
+    return g_cbm_pool->retire(cbm_sample(cbm),[&](uint32_t slot,uint32_t head){
+        g_cbm_table[slot*2]=0;g_cbm_table[slot*2+1]=ng::cbm::invalid_chain;
+        put_field(cbm,8,head);
+    });
+}
+D1_SYSV void h_cbm_wait(uint64_t cbm){
+    cbm_require(cbm);
+    while(!g_cbm_pool->empty()&&!h_cbm_retire(cbm))os::sleep_us(30);
+}
+D1_SYSV void h_cbm_reclaim(uint64_t cbm){
+    while(h_cbm_retire(cbm)){}
+}
+D1_SYSV uint64_t h_cbm_reserve(uint64_t cbm){
+    cbm_require(cbm);
+    for(;;){
+        auto r=g_cbm_pool->reserve([&](ng::cbm::Pool::Reservation r,uint32_t tail,uint32_t seq){
+            g_cbm_table[r.slot*2]=ng::cbm::open_value(r.seq);
+            g_cbm_table[r.slot*2+1]=ng::cbm::invalid_chain;
+            put_field(cbm,0x1c,seq);put_field(cbm,0xc,tail);
+        });
+        if(r.slot!=UINT32_MAX)return r.slot;
+        h_cbm_wait(cbm);
+    }
+}
+D1_SYSV uint64_t h_cbm_chunk(uint64_t cbm,uint32_t bytes,uint32_t alignment,uint64_t rec){
+    cbm_require(cbm);
+    // All recovered callers request a full 512 KiB chunk, aligned to 128.
+    if(bytes!=ng::cbm::chunk_bytes||alignment!=0x80||!rec){
+        log("nd: unsupported native CBM allocation (%u, %u)",bytes,alignment);std::abort();
+    }
+    const uint32_t slot=field<uint32_t>(rec,0x1c);
+    if(slot>=ng::cbm::slot_count)std::abort();
+    for(uint32_t retry=0;;++retry){
+        const auto id=g_cbm_pool->allocate(slot,[&](uint32_t id,uint32_t count){
+            // The first 24 bytes retain the original full-chunk allocation
+            // bookkeeping. The actual free-list links live in the native pool.
+            put_field(rec,8,id);
+            if(count==1)put_field(rec,12,id);
+            put_field(rec,16,uint32_t(count*ng::cbm::chunk_bytes));
+        });
+        if(id!=UINT32_MAX)return g_cbm_base+uint64_t(id)*ng::cbm::chunk_bytes;
+        if(retry==1500000){log("nd: native CBM exhausted or invalid slot");std::abort();}
+        if(!h_cbm_retire(cbm))os::sleep_us(10);
+    }
+}
+D1_SYSV void h_cbm_close(uint64_t cbm,uint32_t emit,uint32_t index,uint64_t rec,uint64_t gfx){
+    cbm_require(cbm);
+    uint32_t sequence=0;
+    if(!g_cbm_pool->close(index,[&](uint32_t seq,uint32_t last){
+        sequence=seq;g_cbm_table[index*2+1]=last;g_cbm_table[index*2]=seq;
+    })){log("nd: native CBM close without reservation");std::abort();}
+    (void)rec;
+    if(emit==1){
+        using LabelFn=D1_SYSV void(*)(uint64_t,uint32_t,uint32_t,uint64_t,uint32_t,uint64_t,uint32_t,uint32_t);
+        reinterpret_cast<LabelFn>(nr::g_base+0xF80C90)(gfx,4,0,field<uint64_t>(cbm,0x20),1,sequence,0,0);
+    }
+}
+D1_SYSV void h_cbm_tick(uint64_t cbm){
+    h_cbm_reclaim(cbm);put_field(cbm,0x14,uint32_t(1));
+}
+D1_SYSV uint32_t h_cbm_block_size(uint64_t cbm){
+    cbm_require(cbm);return uint32_t(ng::cbm::chunk_bytes);
+}
+D1_SYSV void h_cbm_destroy(uint64_t cbm){
+    if(!g_cbm_pool)return;
+    cbm_require(cbm);
+    while(!g_cbm_pool->empty())h_cbm_wait(cbm);
+    put_field(cbm,0,uint64_t(0));put_field(cbm,0x30,uint64_t(0));
+    g_cbm_pool.reset();g_cbm_base=g_cbm_manager=0;
+    // As with the backing-only mode, the mapped bytes are not recycled
+    // during this process; delayed completion writes retain their identity.
 }
 std::mutex g_fifo_m;
 std::unordered_map<uint64_t,std::unique_ptr<ng::NativeRecordFifo>> g_fifos;
@@ -1636,6 +1739,17 @@ bool install() {
     if (native_drain_enabled()) ok &= hook(0x7DD060, &h_drain, o_drain, "native_device_drain");
     if (native_ring_enabled()) ok &= hook(0x7DEA90, &h_reserve_record, o_reserve_record, "native_worker_reserve");
     if (native_cbm_enabled()) rep(0x7EF7D0,reinterpret_cast<const void*>(&h_cbm_init));
+    if(native_cbm_pool_enabled()){
+        rep(0x7EF180,reinterpret_cast<const void*>(&h_cbm_wait));
+        rep(0x7EF2A0,reinterpret_cast<const void*>(&h_cbm_retire));
+        rep(0x7EEF90,reinterpret_cast<const void*>(&h_cbm_reclaim));
+        rep(0x7EF460,reinterpret_cast<const void*>(&h_cbm_reserve));
+        rep(0x7EF8B0,reinterpret_cast<const void*>(&h_cbm_chunk));
+        rep(0x7EF3A0,reinterpret_cast<const void*>(&h_cbm_close));
+        rep(0x7EF630,reinterpret_cast<const void*>(&h_cbm_tick));
+        rep(0x7EFC00,reinterpret_cast<const void*>(&h_cbm_block_size));
+        rep(0x7EF5C0,reinterpret_cast<const void*>(&h_cbm_destroy));
+    }
     g_on = ok;
     log("nd: native device layer: %zu Gnm entry points replaced%s",
         sizeof kNoops / sizeof kNoops[0] + 8, ok ? "" : " - REQUIRED REPLACEMENTS FAILED");

@@ -120,6 +120,7 @@ Native renderer (`native/gfx`):
 | Legacy frame skipping | Removed: all submitted frames execute on the native renderer; no fabricated occlusion results |
 | `D1_NG_NOCACHE=1` | no geometry cache and no texture change tracking |
 | Native device | Required; startup fails if the native renderer or required device hooks cannot be installed. The retail submit boundary associates engine record addresses with native lists, not packet tokens |
+| `D1_PC_NATIVE_CBM_POOL=1` | Experimental native chunk/slot allocator, requires native CBM; replaces original metadata and reclaim, retains record fields and EOP label |
 | `D1_PC_NATIVE_CBM=1` | Experimental host-owned command-buffer backing and completion label; retains original chunk metadata and reclaim logic |
 | `D1_PC_NATIVE_BIND=1` | Experimental source-defined bind/repoint, mip transition and native blitter queue/storage; retains legacy tag fields and layout constructors |
 | `D1_PC_NATIVE_RING=1` | Experimental native ready-FIFO and source-defined main begin/worker reservation, requires native close and drain; original record layout mirrored for compatibility |
