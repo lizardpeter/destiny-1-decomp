@@ -31,6 +31,7 @@ struct Draw {
     uint64_t caller = 0;        // engine call site (diagnostics)
     const uint8_t* vs = nullptr;  // engine vertex shader object (fetch shader size/address, Gnm VsShader at +0x14)
     const uint8_t* ps = nullptr;  // Gnm PsShader
+    uint64_t shader_res[kStages] = {}; // resource epoch at native preparation (0: unregistered)
     uint32_t num_vb = 0;
     uint32_t vb[16][4] = {};    // V# per vertex buffer API slot (vertex declaration element)
     uint32_t tex[kStages][16][8] = {};
