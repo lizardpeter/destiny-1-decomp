@@ -30,6 +30,34 @@ int main(){
     check(owner_handle(2,10,20)==10&&owner_handle(1,10,20)==20);
     auto p=copy(0x1000,0x2000,0x80,0x100000040ull);
     check(p.src==0x1000&&p.dst==0x2080&&p.bytes==0x40);
+    // Retail link encoding: invalid, direct handle, empty chain and
+    // linked list; callbacks can change the successor before it is read.
+    for(uint32_t type=0;type<4;++type){
+        for(uint32_t idx:{0u,1u,0xfffeu,0xffffu}){
+            const auto token=(type<<30)|idx;
+            check(memory_link_container(token)==(type==3&&idx!=0xffffu));
+        }
+    }
+    std::array<uint32_t,4> link_handles{0x80000010u,0x80000020u,0x80000030u,0x80000040u};
+    std::array<uint16_t,4> link_next{1,2,3,0xffff};
+    std::vector<uint32_t> visited;
+    auto at=[&](uint16_t i){check(i<link_handles.size());return link_handles[i];};
+    auto next=[&](uint16_t i){check(i<link_next.size());return link_next[i];};
+    auto visit=[&](uint32_t h){visited.push_back(h);};
+    visit_memory_links(UINT32_MAX,at,next,visit);
+    visit_memory_links(0x0000ffffu,at,next,visit);
+    check(visited.empty());
+    visit_memory_links(0x800000aa,at,next,visit);
+    check(visited==std::vector<uint32_t>{0x800000aau});
+    visited.clear();
+    visit_memory_links(0,at,next,visit);
+    check(visited==std::vector<uint32_t>(link_handles.begin(),link_handles.end()));
+    visited.clear();
+    visit_memory_links(0,at,next,[&](uint32_t h){
+        visit(h);
+        if(h==link_handles[0])link_next[0]=2;
+    });
+    check(visited==std::vector<uint32_t>({link_handles[0],link_handles[2],link_handles[3]}));
     namespace pool=d1::ng::pool;
     // Synthetic pool table with a three-node list; exercise head, middle,
     // tail, singleton and unoccupied release, plus callback ordering.
