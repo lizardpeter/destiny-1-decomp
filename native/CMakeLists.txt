@@ -219,3 +219,7 @@ target_include_directories(pc-thread-keys-test PRIVATE src)
 target_link_libraries(pc-thread-keys-test PRIVATE Threads::Threads)
 add_test(NAME pc-thread-keys COMMAND pc-thread-keys-test)
 set_tests_properties(pc-thread-keys PROPERTIES TIMEOUT 60)
+
+add_executable(native-memory-policy-test tests/native_memory_policy_test.cpp)
+target_include_directories(native-memory-policy-test PRIVATE gfx)
+add_test(NAME native-memory-policy COMMAND native-memory-policy-test)

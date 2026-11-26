@@ -11,6 +11,7 @@
 // points at one samples it directly. Device memory for images is suballocated from large
 // blocks. Flips blit the video-out target into the window's swapchain.
 #include "nrender.h"
+#include "native_memory_policy.h"
 #include "../src/native_ranges.h"
 #include "../src/host_memory.h"
 
@@ -569,8 +570,11 @@ struct Renderer {
     bool init(const Options& o);
     Buffer make_buffer(uint64_t size, VkBufferUsageFlags usage, bool host, bool prefer_device = false);
     void free_buffer(Buffer& b);
-    VkDeviceMemory alloc(VkMemoryRequirements req, VkMemoryPropertyFlags want);
-    Alloc heap_alloc(VkMemoryRequirements req);
+    VkDeviceMemory alloc(VkMemoryRequirements req, VkMemoryPropertyFlags required,
+                         VkMemoryPropertyFlags preferred, const void* next = nullptr);
+    Buffer make_native_buffer(uint64_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags required,
+                              VkMemoryPropertyFlags preferred, bool mapped);
+    Alloc heap_alloc(VkMemoryRequirements req, VkImage image, bool requires_dedicated, bool prefers_dedicated);
     void heap_free(Alloc& a);
     std::unique_ptr<Image> make_image(VkFormat f, uint32_t w, uint32_t h, uint32_t d, uint32_t layers, uint32_t levels,
                                       bool cube, bool is3d, bool depth, bool stencil);
@@ -1295,6 +1299,7 @@ bool Renderer::init(const Options& o) {
         for (int kind = 0; kind < 3; ++kind) {
             dummy[k][kind] = make_image(dummy_fmts[kind], 1, 1, 1, dim == gcn::TexDim::Cube ? 6 : 1, 1,
                                         dim == gcn::TexDim::Cube, dim == gcn::TexDim::Tex3D, false, false);
+            if (!dummy[k][kind]) { log("native renderer: mandatory dummy image allocation failed"); return false; }
             VkClearColorValue zero{};
             VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
             vkCmdClearColorImage(rc().cmd, dummy[k][kind]->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
@@ -1674,98 +1679,85 @@ void Renderer::wait_serial(uint64_t serial) {
     while (serial_done < serial && !inflight.empty()) retire_one();
 }
 
-VkDeviceMemory Renderer::alloc(VkMemoryRequirements req, VkMemoryPropertyFlags want) {
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = find_memory_type(ctx, req.memoryTypeBits, want);
-    if (ai.memoryTypeIndex == UINT32_MAX) ai.memoryTypeIndex = find_memory_type(ctx, req.memoryTypeBits, 0);
-    VkDeviceMemory m = VK_NULL_HANDLE;
-    if (vkAllocateMemory(ctx.device, &ai, nullptr, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
-    return m;
+VkDeviceMemory Renderer::alloc(VkMemoryRequirements req, VkMemoryPropertyFlags required,
+                               VkMemoryPropertyFlags preferred, const void* next) {
+    VkPhysicalDeviceMemoryProperties props{};
+    vkGetPhysicalDeviceMemoryProperties(ctx.gpu, &props);
+    uint32_t flags[32]{};
+    for (uint32_t i=0;i<props.memoryTypeCount;++i) flags[i]=props.memoryTypes[i].propertyFlags;
+    const auto order=memory_type_order(req.memoryTypeBits,flags,props.memoryTypeCount,required,preferred);
+    for(size_t i=0;i<order.count;++i) {
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.pNext=next;
+        ai.allocationSize=req.size;
+        ai.memoryTypeIndex=order.indices[i];
+        VkDeviceMemory memory=VK_NULL_HANDLE;
+        if(vkAllocateMemory(ctx.device,&ai,nullptr,&memory)==VK_SUCCESS) return memory;
+    }
+    return VK_NULL_HANDLE;
 }
 
-Buffer Renderer::make_buffer(uint64_t size, VkBufferUsageFlags usage, bool host, bool prefer_device) {
+Buffer Renderer::make_native_buffer(uint64_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags required,
+                                   VkMemoryPropertyFlags preferred, bool mapped) {
+    if (!size) return {};
     Buffer b;
-    b.size = size;
+    b.size=size;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = size;
-    bci.usage = usage;
-    if (vkCreateBuffer(ctx.device, &bci, nullptr, &b.buf) != VK_SUCCESS) return Buffer{};
-    VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(ctx.device, b.buf, &req);
-    const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    // host-visible memory in VRAM (resizable BAR) where the GPU offers it: what shaders read
-    // from it every frame (constants, streamed vertices) then stays on the card instead of
-    // crossing PCIe on every access
-    if (host && prefer_device) {
-        const uint32_t t = find_memory_type(ctx, req.memoryTypeBits, hv | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (t != UINT32_MAX) {
-            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            ai.allocationSize = req.size;
-            ai.memoryTypeIndex = t;
-            if (vkAllocateMemory(ctx.device, &ai, nullptr, &b.mem) != VK_SUCCESS) b.mem = VK_NULL_HANDLE;
-            else log("native renderer: %llu MiB buffer in device-local host-visible memory", (unsigned long long)(size >> 20));
+    bci.size=size;
+    bci.usage=usage;
+    if(vkCreateBuffer(ctx.device,&bci,nullptr,&b.buf)!=VK_SUCCESS) return {};
+    VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    VkMemoryRequirements2 req{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,&dedicated};
+    VkBufferMemoryRequirementsInfo2 info{VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2};
+    info.buffer=b.buf;
+    vkGetBufferMemoryRequirements2(ctx.device,&info,&req);
+    VkMemoryDedicatedAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    dai.buffer=b.buf;
+    // All these VkBuffers own their allocation, so dedicated allocation is
+    // compatible with both required and preferred dedicated requirements.
+    b.mem=alloc(req.memoryRequirements,required,preferred,
+                dedicated.requiresDedicatedAllocation||dedicated.prefersDedicatedAllocation ? &dai : nullptr);
+    if(!b.mem||vkBindBufferMemory(ctx.device,b.buf,b.mem,0)!=VK_SUCCESS) {
+        free_buffer(b);
+        return {};
+    }
+    if(mapped) {
+        void* p=nullptr;
+        if(vkMapMemory(ctx.device,b.mem,0,VK_WHOLE_SIZE,0,&p)!=VK_SUCCESS||!p) {
+            free_buffer(b);
+            return {};
         }
-    }
-    if (!b.mem)
-        b.mem = alloc(req, host ? hv : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (!b.mem) {
-        vkDestroyBuffer(ctx.device, b.buf, nullptr);
-        return Buffer{};
-    }
-    vkBindBufferMemory(ctx.device, b.buf, b.mem, 0);
-    if (host) {
-        void* p = nullptr;
-        vkMapMemory(ctx.device, b.mem, 0, VK_WHOLE_SIZE, 0, &p);
-        b.map = static_cast<uint8_t*>(p);
+        b.map=static_cast<uint8_t*>(p);
     }
     return b;
 }
 
-// Memory the CPU reads after the GPU wrote it: host-cached where offered (reading uncached or
-// write-combined memory is very slow), plain host-visible otherwise.
+Buffer Renderer::make_buffer(uint64_t size,VkBufferUsageFlags usage,bool host,bool prefer_device) {
+    const VkMemoryPropertyFlags hv=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    return make_native_buffer(size,usage,host?hv:0,
+                              (!host||prefer_device)?VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT:0,host);
+}
+
 Buffer Renderer::make_readback_buffer(uint64_t size) {
-    Buffer b;
-    b.size = size;
-    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = size;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    if (vkCreateBuffer(ctx.device, &bci, nullptr, &b.buf) != VK_SUCCESS) return Buffer{};
-    VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(ctx.device, b.buf, &req);
-    const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    uint32_t t = find_memory_type(ctx, req.memoryTypeBits, hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-    if (t == UINT32_MAX) t = find_memory_type(ctx, req.memoryTypeBits, hv);
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = t;
-    if (t == UINT32_MAX || vkAllocateMemory(ctx.device, &ai, nullptr, &b.mem) != VK_SUCCESS) {
-        vkDestroyBuffer(ctx.device, b.buf, nullptr);
-        return Buffer{};
-    }
-    vkBindBufferMemory(ctx.device, b.buf, b.mem, 0);
-    void* p = nullptr;
-    vkMapMemory(ctx.device, b.mem, 0, VK_WHOLE_SIZE, 0, &p);
-    b.map = static_cast<uint8_t*>(p);
-    return b;
+    const VkMemoryPropertyFlags hv=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    return make_native_buffer(size,VK_BUFFER_USAGE_TRANSFER_DST_BIT,hv,VK_MEMORY_PROPERTY_HOST_CACHED_BIT,true);
 }
 
-Alloc Renderer::heap_alloc(VkMemoryRequirements req) {
+Alloc Renderer::heap_alloc(VkMemoryRequirements req, VkImage image, bool requires_dedicated, bool prefers_dedicated) {
     Alloc a;
     uint32_t type = find_memory_type(ctx, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (type == UINT32_MAX) type = find_memory_type(ctx, req.memoryTypeBits, 0);
     if (type == UINT32_MAX) return a;
     const uint64_t align = std::max<uint64_t>({req.alignment, ctx.props.limits.bufferImageGranularity, 256});
     auto dedicated = [&] {
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        ai.allocationSize = req.size;
-        ai.memoryTypeIndex = type;
-        if (vkAllocateMemory(ctx.device, &ai, nullptr, &a.mem) != VK_SUCCESS) a.mem = VK_NULL_HANDLE;
+        VkMemoryDedicatedAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+        dai.image = image;
+        a.mem = alloc(req, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &dai);
         a.size = req.size, a.offset = 0, a.block = -1;
         if (a.mem) heap.used += req.size;
         return a;
     };
-    if (req.size >= (64ull << 20)) return dedicated();
+    if (requires_dedicated || prefers_dedicated || req.size >= (64ull << 20)) return dedicated();
     for (int pass = 0; pass < 2; ++pass) {
         for (size_t bi = 0; bi < heap.blocks.size(); ++bi) {
             auto& b = heap.blocks[bi];
@@ -1885,6 +1877,7 @@ void Renderer::destroy_image(Image* img) {
 }
 
 void Renderer::free_buffer(Buffer& b) {
+    if (b.map && b.mem) vkUnmapMemory(ctx.device, b.mem);
     if (b.buf) vkDestroyBuffer(ctx.device, b.buf, nullptr);
     if (b.mem) vkFreeMemory(ctx.device, b.mem, nullptr);
     b = Buffer{};
@@ -1931,11 +1924,14 @@ std::unique_ptr<Image> Renderer::make_image(VkFormat f, uint32_t w, uint32_t h, 
         if (told++ < 20) log("native renderer: vkCreateImage failed (%d): format %d %ux%ux%u, %u levels, %u layers", int(r), int(f), w, h, d, levels, layers);
         return nullptr;
     }
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(ctx.device, img->image, &req);
+    VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    VkMemoryRequirements2 req{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated};
+    VkImageMemoryRequirementsInfo2 info{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
+    info.image = img->image;
+    vkGetImageMemoryRequirements2(ctx.device, &info, &req);
     const uint64_t t1 = now_ns();
     st.t_vkimg += t1 - t0;
-    img->mem = heap_alloc(req);
+    img->mem = heap_alloc(req.memoryRequirements, img->image, dedicated.requiresDedicatedAllocation, dedicated.prefersDedicatedAllocation);
     st.t_heap += now_ns() - t1;
     if (!img->mem.mem) {
         static int logged = 0;
@@ -1945,8 +1941,13 @@ std::unique_ptr<Image> Renderer::make_image(VkFormat f, uint32_t w, uint32_t h, 
         return nullptr;
     }
     const uint64_t tb = now_ns();
-    vkBindImageMemory(ctx.device, img->image, img->mem.mem, img->mem.offset);
+    const VkResult bound = vkBindImageMemory(ctx.device, img->image, img->mem.mem, img->mem.offset);
     st.t_bind += now_ns() - tb;
+    if (bound != VK_SUCCESS) {
+        log("native renderer: vkBindImageMemory failed (%d)", int(bound));
+        destroy_image(img.get());
+        return nullptr;
+    }
     // straight to GENERAL, where every image lives
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -2758,30 +2759,8 @@ bool Renderer::geo_alloc(uint64_t size, int& block, uint64_t& off) {
         if (pass || geo_blocks.size() >= max_blocks) return false;
         // a new 64 MiB block: host-visible (device-local too where the GPU offers it)
         GeoBlock nb;
-        nb.buf.size = 64ull << 20;
-        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bci.size = nb.buf.size;
-        bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-        if (vkCreateBuffer(ctx.device, &bci, nullptr, &nb.buf.buf) != VK_SUCCESS) return false;
-        VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(ctx.device, nb.buf.buf, &req);
-        const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        nb.buf.mem = alloc(req, host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (!nb.buf.mem) {
-            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            ai.allocationSize = req.size;
-            ai.memoryTypeIndex = find_memory_type(ctx, req.memoryTypeBits, host);
-            if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(ctx.device, &ai, nullptr, &nb.buf.mem) != VK_SUCCESS)
-                nb.buf.mem = VK_NULL_HANDLE;
-        }
-        // alloc() falls back to any memory type: make sure this one can be mapped
-        void* map = nullptr;
-        if (!nb.buf.mem || vkBindBufferMemory(ctx.device, nb.buf.buf, nb.buf.mem, 0) != VK_SUCCESS ||
-            vkMapMemory(ctx.device, nb.buf.mem, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
-            free_buffer(nb.buf);
-            return false;
-        }
-        nb.buf.map = static_cast<uint8_t*>(map);
+        nb.buf = make_buffer(64ull << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true, true);
+        if (!nb.buf.map) return false;
         nb.free[0] = nb.buf.size;
         geo_blocks.push_back(std::move(nb));
     }
