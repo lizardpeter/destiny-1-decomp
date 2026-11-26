@@ -340,7 +340,6 @@ struct Image {
         return overlap(src_addr, src_size) || (low_loaded && overlap(low_base, low_size)) ||
                (hi_loaded && overlap(hi_base, hi_size));
     }
-    uint32_t resident_base_level = 0; // 0 when top mip is resident, 1 when only low mips are resident
     bool low_loaded = false;
     bool hi_loaded = false;
     bool stale = false;
@@ -605,13 +604,13 @@ struct Renderer {
                 publish_ambiguous(base);
                 (++targets_gen, ++gen_why[0]);
             }
-            it->second = img, ++views_gen;
+            it->second = img, ++target_views_gen;
         } else if (auto ib = images_by_base.find(base); ib != images_by_base.end() && ib->second.size() > 1) {
             // (target_for picks the most recently bound of same-size images at one address)
             bool same_size = false, other_attrs = false;
             for (Image* c : ib->second)
                 if (c != img && c->w == img->w && c->h == img->h) same_size = true, other_attrs |= target_attrs(c) != target_attrs(img);
-            if (same_size) ++views_gen;
+            if (same_size) ++target_views_gen;
             // an address whose sampled image alternates between kinds: pipeline() keys draws
             // that sample it by what it resolves to (instead of invalidating every pipeline)
             if (other_attrs && !std::binary_search(ambiguous_bases.begin(), ambiguous_bases.end(), base)) {
@@ -621,9 +620,10 @@ struct Renderer {
             }
         }
     }
-    // bumped whenever what a T# resolves to may change (textures uploaded or dropped, render
-    // targets bound): the recording threads' view caches are valid for one value
+    // Asset residency and attachment aliases are separate namespaces. Only
+    // unregistered descriptors can depend on attachment-address mappings.
     std::atomic<uint64_t> views_gen{1};
+    std::atomic<uint64_t> target_views_gen{1};
     // what draw() last set in the current command buffer (invalid: set everything)
     struct DrawState {
         bool valid = false;
@@ -983,7 +983,7 @@ struct Renderer {
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
     Image* upload_texture(const uint32_t* t, uint64_t res = 0, uint64_t obj = 0,
                           const uint8_t* prepared = nullptr, uint64_t prepared_size = 0);
-    void resolve_draw_resources(Draw* const* draws, size_t count, bool have_lock);
+    void resolve_draw_resources(Draw* const* draws, size_t count);
     struct DiskPipeSpec {
         uint64_t vs_hash = 0, ps_hash = 0;
         uint64_t tex_sig[2] = {};
@@ -1115,7 +1115,7 @@ struct Renderer {
         uint64_t chunk_pos = 0, chunk_end = 0;  // (parallel) this worker's slice of the ring
         std::vector<Sub::ReCopy> recopy;        // (see Sub::recopy)
     };
-    std::mutex pipe_m, geo_m, tex_m, set_m, ring_m, skip_m, secondary_view_m;
+    std::mutex pipe_m, geo_m, tex_m, set_m, ring_m, skip_m;
     uint64_t rec_ring(Rec& r, uint64_t size, uint64_t align = 256);
     uint64_t rec_copy(Rec& r, const void* src, uint64_t size) {
         const uint64_t p = rec_ring(r, std::max<uint64_t>(size, 16));
@@ -1134,7 +1134,8 @@ struct Renderer {
         for (int i = 0; i < 5; ++i) colors[i] = color_target(dr.color[i]);
         Image* depth = depth_target(dr.depth);
         Draw* one = &dr;
-        resolve_draw_resources(&one, 1, true);
+        feedback_snapshots(&one, 1, colors, depth);
+        resolve_draw_resources(&one, 1);
         Rec r;
         r.cmd = rc().cmd, r.ds = &rc().dstate;
         draw(dr, r, colors, depth);
@@ -2241,17 +2242,12 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         img->last_used = rc().submit_no;
         img->last_frame = st.frames;
         if (res && img->res_val) {
-            const uint32_t want_base_lv = cur_is_low ? 1u : 0u;
             const bool have_want = streamed
                 ? (img->res_val == res && (cur_is_low ? (img->low_loaded && img->low_base == ts.base)
                               : (img->hi_loaded && img->hi_base == ts.base && img->low_loaded && img->low_base == smi.low_base)))
                 : (img->res_val == res && img->src_addr == ts.base);
             if (have_want) {
                 img->res_val = res;
-                if (img->resident_base_level != want_base_lv) {
-                    img->resident_base_level = want_base_lv;
-                    ++views_gen;
-                }
                 ++st.res_hits;
                 st.t_tex_hit += now_ns() - t_in;
                 return img;
@@ -2426,7 +2422,6 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             } else {
                 ok = true;
             }
-            img->resident_base_level = 1;
         } else {
             if ((!img->low_loaded || img->low_base != smi.low_base) && smi.low_base && smi.low_base != ts.base) {
                 img->low_loaded = false;
@@ -2467,14 +2462,12 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 ok = true;
             }
             ok = ok && img->low_loaded && img->hi_loaded && img->low_base == smi.low_base;
-            img->resident_base_level = 0;
         }
         img->res_val = res;
         img->res_obj = smi.obj ? smi.obj : obj;
         img->src_addr = ts.base, img->src_size = cur_bytes, img->version = ~0ull;
     } else {
         ok = upload_range(sf, ts.base, 0, full_levels, 0);
-        img->resident_base_level = 0;
         img->low_loaded = img->hi_loaded = ok;
         if (ok && res) {
             img->res_val = res, img->res_obj = smi.obj ? smi.obj : obj;
@@ -2904,7 +2897,7 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
     const auto ts = fmt::decode_tsharp(t);
     VkComponentMapping comp{swz(ts.dst_sel & 7), swz(ts.dst_sel >> 3 & 7), swz(ts.dst_sel >> 6 & 7),
                             swz(ts.dst_sel >> 9 & 7)};
-    if (auto sit = stencil_by_base.find(ts.base); sit != stencil_by_base.end() && sit->second->stencil) {
+    if (!res) if (auto sit = stencil_by_base.find(ts.base); sit != stencil_by_base.end() && sit->second->stencil) {
         sit->second->sampled = true;
         sampled_bases.insert(ts.base);
         static std::unordered_set<uint64_t> told;
@@ -2913,7 +2906,7 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
                 (unsigned long long)sit->second->base);
         return view(sit->second, VK_IMAGE_VIEW_TYPE_2D, {}, 0, true, true);
     }
-    if (Image* img = target_for(ts)) {
+    if (!res) if (Image* img = target_for(ts)) {
         img->sampled = true;
         sampled_bases.insert(ts.base);
         if (img->depth) return view(img, VK_IMAGE_VIEW_TYPE_2D, {}, 0, true);
@@ -2928,11 +2921,22 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
     auto it = textures.find(tex_key(t, res));
     Image* img = it != textures.end() ? it->second.get() : nullptr;
     const uint8_t fallback_kind = ts.nfmt == 4 ? 1u : ts.nfmt == 5 ? 2u : 0u;
-    if (!img) return {dummy_views[int(dim) * 3 + fallback_kind], 0, uint8_t(dim), fallback_kind, fallback_kind == 0};
+    const ViewHandle fallback{dummy_views[int(dim) * 3 + fallback_kind], 0, uint8_t(dim), fallback_kind, fallback_kind == 0};
+    if (!img || img->stale) return fallback;
+    // A split texture has one native image, but each captured descriptor has its
+    // own mip origin. A later low/high bind must not change an earlier draw.
+    uint32_t origin = 0;
+    if (img->low_size || img->hi_size) {
+        const bool low = ts.last_level + 1 == img->levels - 1;
+        const bool high = ts.last_level + 1 == img->levels;
+        if (low && img->low_loaded && ts.base == img->low_base) origin = 1;
+        else if (!(high && img->hi_loaded && img->low_loaded && ts.base == img->hi_base))
+            return fallback;
+    }
     img->last_used = rc().submit_no;
     img->last_frame = st.frames;
     tv_texture = img;
-    const uint32_t first = std::min(img->resident_base_level + std::max(ts.base_level, (ts.min_lod + 255) >> 8),
+    const uint32_t first = std::min(origin + std::max(ts.base_level, (ts.min_lod + 255) >> 8),
                                     img->levels ? img->levels - 1 : 0);
     static const bool log_stream = std::getenv("D1_NG_LOG_STREAM") != nullptr;
     if (log_stream && res && img->levels > 1 && (img->low_size || img->hi_size)) {
@@ -2942,14 +2946,14 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
         static uint32_t messages = 0;
         const uint32_t rid = uint32_t(res >> 32);
         const uint64_t state = mix(mix(mix(res, uint64_t(img->image)), ts.base),
-                                   uint64_t(first) | uint64_t(img->resident_base_level) << 32);
+                                   uint64_t(first) | uint64_t(origin) << 32);
         auto it = last.find(rid);
         if (messages < 1024 && (it == last.end() || it->second != state)) {
             last[rid] = state;
             ++messages;
             log("ng stream [BIND res=%u epoch=%u img=%p]: frame %llu view [%u..%u] resident=%u low=%#llx/%llu hi=%#llx/%llu T#=%#llx",
                 rid, uint32_t(res), (void*)img->image, (unsigned long long)st.frames,
-                first, img->levels - 1, img->resident_base_level, (unsigned long long)img->low_base,
+                first, img->levels - 1, origin, (unsigned long long)img->low_base,
                 (unsigned long long)img->low_size, (unsigned long long)img->hi_base,
                 (unsigned long long)img->hi_size, (unsigned long long)ts.base);
         }
@@ -3607,9 +3611,6 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
         for (size_t i = 0; i < n; ++i) skip("no target");
         return;
     }
-    // Resolve views against the targets bound for this run, not against the
-    // address aliases that happened to be current at submission start.
-    resolve_draw_resources(run, n, true);
     const uint32_t T = rec_threads + 1;
     Sub& sb = subs[rc().cur];
     if (sb.sec.size() < T) sb.sec.resize(T);
@@ -3621,6 +3622,7 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
             return;
         }
     feedback_snapshots(run, n, colors, depth, true);
+    resolve_draw_resources(run, n);
     begin_pass(colors, depth, true);
     rc().pass_secondary = true;
     VkFormat cfmt[8]{};
@@ -4058,10 +4060,11 @@ void Renderer::masked_stencil_clear(Image* depth, uint32_t value, uint32_t write
 }
 
 // Pre-resolves every draw's textures and samplers to bindless IDs and 4-bit (TexDim, tex_kind)
-// signatures before the draw loop runs. Uses thread-local caches validated by views_gen so the
-// shared renderer mutex is only taken on a cache miss when called without the lock.
-void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, bool have_lock) {
-    struct TvEntry { uint64_t key = 0, gen = 0; ViewHandle vh{}; Image* tex = nullptr; };
+// signatures before the draw loop runs. The run's owner holds m: cache entries,
+// texture lifetime accounting and snapshot view creation are coherent. Workers
+// consume only the resulting IDs, never the attachment or texture maps.
+void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
+    struct TvEntry { uint64_t key = 0, gen = 0, target_gen = 0; ViewHandle vh{}; Image* tex = nullptr; };
     static thread_local std::unique_ptr<TvEntry[]> tvc_ptr;
     if (!tvc_ptr) tvc_ptr = std::make_unique<TvEntry[]>(4096);
     TvEntry* const tvc = tvc_ptr.get();
@@ -4070,7 +4073,8 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, bool hav
     if (!smc_ptr) smc_ptr = std::make_unique<SmpPair[]>(1024);
     SmpPair* const smc = smc_ptr.get();
 
-    const uint64_t gen = views_gen.load(std::memory_order_acquire) ^ (targets_gen.load(std::memory_order_acquire) * 0x9E3779B97F4A7C15ull);
+    const uint64_t gen = views_gen.load(std::memory_order_acquire);
+    const uint64_t tg = target_views_gen.load(std::memory_order_acquire);
     const uint64_t sub_no = rc().submit_no;
     for (size_t di = 0; di < count; ++di) {
         Draw& dr = *draws[di];
@@ -4093,17 +4097,30 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, bool hav
                                      (uint64_t(dim) + 1) * 0x9E3779B97F4A7C15ull;
                 TvEntry& e = tvc[key & 4095];
                 ViewHandle vh;
-                if (e.key == key && e.gen == gen) {
+                const uint64_t dependency = tres ? 0 : tg;
+                if (e.key == key && e.gen == gen && e.target_gen == dependency) {
                     vh = e.vh;
-                    if (e.tex) e.tex->last_used = sub_no;
+                    if (e.tex) e.tex->last_used = sub_no, e.tex->last_frame = st.frames;
                 } else {
-                    std::unique_lock<std::mutex> lk(this->m, std::defer_lock);
-                    if (!have_lock) lk.lock();
                     vh = texture_view(T, dim, tres);
                     Image* tex = tv_texture;
-                    if (Image* ri = target_for(fmt::decode_tsharp(T)))
+                    if (!tres) if (Image* ri = target_for(fmt::decode_tsharp(T)))
                         vh = texture_view(T, ri->is3d ? gcn::TexDim::Tex3D : gcn::TexDim::Tex2D, tres), tex = nullptr;
-                    e = {key, gen, vh, tex};
+                    e = {key, gen, dependency, vh, tex};
+                }
+                // Snapshots are pass-local, not part of the persistent cache.
+                // Resolve by the actual target object, including stencil/read aliases.
+                if (!tres && !rc().snaps.empty()) {
+                    const auto ts = fmt::decode_tsharp(T);
+                    auto sit = stencil_by_base.find(ts.base);
+                    const bool stencil = sit != stencil_by_base.end() && sit->second->stencil;
+                    Image* att = stencil ? sit->second : target_for(ts);
+                    for (auto& [source, snap] : rc().snaps) {
+                        if (source != att) continue;
+                        vh = stencil ? view(snap, VK_IMAGE_VIEW_TYPE_2D, {}, 0, true, true)
+                                     : target_view(snap, source, T);
+                        break;
+                    }
                 }
                 dr.tex_view[s][slot] = vh.id;
                 const uint8_t dk = uint8_t((vh.dim & 3) | ((vh.kind & 3) << 2));
@@ -4120,8 +4137,6 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, bool hav
                 const uint64_t key = hash_bytes(S, 16) | 1;
                 SmpPair& se = smc[key & 1023];
                 if (se.key != key) {
-                    std::unique_lock<std::mutex> lk(this->m, std::defer_lock);
-                    if (!have_lock) lk.lock();
                     const uint16_t lin = sampler_id(S, false);
                     const uint16_t near = sampler_id(S, true);
                     se = {key, lin, near};
@@ -4350,16 +4365,10 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     }
     lap(r.t_geo);
 
-    if (!r.parallel) {
-        const Draw* one = &dr;
-        feedback_snapshots(&one, 1, colors, depth);
-    }
-
     // 3. Stage resource table diffing (dwords 0..15: constant buffer dword offsets in the ring;
     // dwords 16..31: packed (view_id | sampler_id << 16)). Re-uploaded to the ring only when a
     // stage's active slots changed since the previous draw.
     DrawState& ds = *r.ds;
-    const bool has_snaps = !rc().snaps.empty();
     bool push_dirty = !ds.valid;
     for (int s = 0; s < 2; ++s) {
         const Shader* sh = s ? p->ps : p->vs;
@@ -4410,26 +4419,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         // Sampled image bindless IDs (low 16 bits of stage_table[s][16 + slot])
         for (uint32_t m = tex_m; m; m &= m - 1) {
             const uint32_t slot = __builtin_ctz(m);
-            uint16_t vid = dr.tex_view[s][slot];
-            if (has_snaps && (dr.tex_mask[s] >> slot & 1)) {
-                const uint32_t* T = dr.tex[s][slot];
-                const uint64_t base = (uint64_t(T[0]) | uint64_t(T[1] & 0xFF) << 32) << 8;
-                for (auto& [att, sn] : rc().snaps)
-                    if (att->base == base) {
-                        // Secondary workers run while their parent owns m and waits
-                        // for them. Serialize their view creation with a separate
-                        // mutex; list recorders, whose parent released m, use m.
-                        std::unique_lock<std::mutex> lk(r.secondary ? secondary_view_m : this->m, std::defer_lock);
-                        if (r.parallel) lk.lock();
-                        const auto ts = fmt::decode_tsharp(T);
-                        auto sit = stencil_by_base.find(ts.base);
-                        if (sit != stencil_by_base.end() && sit->second == att && att->stencil)
-                            vid = view(sn, VK_IMAGE_VIEW_TYPE_2D, {}, 0, true, true).id;
-                        else if (target_for(ts) == att)
-                            vid = target_view(sn, att, T).id;
-                        break;
-                    }
-            }
+            const uint16_t vid = dr.tex_view[s][slot];
             const uint32_t prev = ds.stage_table[s][16 + slot];
             if ((prev & 0xFFFFu) != vid) {
                 ds.stage_table[s][16 + slot] = (prev & 0xFFFF0000u) | vid;
@@ -4617,7 +4607,7 @@ void Renderer::pre_pass(const std::vector<Draw*>& draws) {
                     if (e.key == k && e.sub == rc().submit_no) continue;
                     e = {k, rc().submit_no};
                     const uint64_t b = fmt::decode_tsharp(t).base;
-                    const bool is_target = target_bases.count(b) != 0;
+                    const bool is_target = !d->tex_res[s][i] && target_bases.count(b) != 0;
                     if (is_target) tsharp_bases.insert(b);  // (only render target addresses matter there)
                     if (!is_target || !target_current(b)) {
                         upload_texture(t, d->tex_res[s][i], d->tex_obj[s][i]);
@@ -4777,7 +4767,6 @@ void Renderer::load_texture(const LoadJob& j) {
     const uint64_t content = hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size);
     {
         std::lock_guard lk(m);
-        if (target_bases.count(ts.base)) return;
         auto it = textures.find(key);
         if (it != textures.end() && it->second && !it->second->stale) {
             Image* img = it->second.get();
@@ -4811,7 +4800,6 @@ void Renderer::load_texture(const LoadJob& j) {
         return;
     }
     std::lock_guard lk(m);
-    if (target_bases.count(ts.base)) return;
     Recorder* const prev_tr = tr;
     struct Restore { Recorder* p; ~Restore() { tr = p; } } restore{prev_tr};
     tr = &up_rec;
@@ -4934,9 +4922,9 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
                 break;
             }
             feedback_snapshots(items.data() + i, j - i, colors, depth);
+            resolve_draw_resources(items.data() + i, j - i);
             begin_pass(colors, depth);
             lk.unlock();
-            resolve_draw_resources(items.data() + i, j - i, false);
             for (size_t k = i; k < j; ++k) draw(*items[k], run_rec, colors, depth);
             relock();
             i = j - 1;
@@ -5061,6 +5049,7 @@ bool Renderer::target_current(uint64_t base) {
     if (img->depth || img->tv_version == ~0ull || (!opt.version && !dynamic_copy) || mem_version(base, img->tv_size) == img->tv_version)
         return true;
     target_by_base.erase(it);
+    ++target_views_gen;
     (++targets_gen, ++gen_why[4]);
     target_bases.erase(base);
     img->tv_version = ~0ull, img->tv_frame = 0;
