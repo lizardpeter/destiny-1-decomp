@@ -1762,6 +1762,11 @@ void append_record(uint64_t global,uint64_t record,bool ready) {
         log("nd: native record FIFO full or duplicate reservation");std::abort();
     }
 }
+D1_SYSV void h_record_segment(uint64_t record,uint64_t context,uint32_t kind,uint32_t hint,uint32_t final_flag){
+    if(!ng::record_segment(reinterpret_cast<void*>(record),reinterpret_cast<const void*>(context),kind,hint,final_flag)){
+        log("nd: native command segment ledger exhausted");std::abort();
+    }
+}
 void reset_record(uint64_t record) {
     // 0x6AC60 initializes the common 24-byte record header.
     put_field(record,0,uint64_t(0xffffffff80000000ull));
@@ -1921,10 +1926,9 @@ void native_close(uint64_t dev,uint32_t kind,bool worker) {
         put_field(global,0xBC,field<uint32_t>(global,0xB8));
         put_field(global,0xB8,field<uint32_t>(field<uint64_t>(label_state,0),uint64_t(label_index)*8));
     }
-    // 0x7DB810 also has intermediate-segment callers (0x7DC140).
-    // Leave it intact: it records actual ranges and diagnostic fields only.
-    using Segment=D1_SYSV void(*)(uint64_t,uint64_t,uint32_t,uint32_t,uint32_t);
-    reinterpret_cast<Segment>(nr::g_base+0x7DB810)(rec,gfx,plan.segment_kind,plan.segment_hint,1);
+    // Preserve actual ranges for remaining engine readers. No synthetic
+    // command extent is required for native queue publication.
+    h_record_segment(rec,gfx,plan.segment_kind,plan.segment_hint,1);
     put_field(gfx,0,field<uint64_t>(gfx,0x10));
     put_field(gfx,0x80,field<uint64_t>(gfx,0x90));
     if(!worker)put_field(rec,0x28,uint8_t(plan.flip));
@@ -2153,6 +2157,7 @@ bool install() {
     rep(0xF80A80, reinterpret_cast<const void*>(&s_pred_off));
     rep(0xF8F3A0, reinterpret_cast<const void*>(&s_dma));
     rep(0xF8B500, reinterpret_cast<const void*>(&s_set_cbs));
+    rep(0x7DB810,reinterpret_cast<const void*>(&h_record_segment));
     rep(0x7DCCE0,reinterpret_cast<const void*>(&h_begin));
     ok &= hook(0x7DD6A0, &h_begin_inherit, o_begin_inherit, "cmdlist_begin_inherit");
     rep(0x7DCEC0,reinterpret_cast<const void*>(&h_end));
