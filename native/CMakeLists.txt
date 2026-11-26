@@ -131,3 +131,7 @@ add_test(NAME native-ranges COMMAND native-ranges-test)
 add_executable(query-reduce-test tests/query_reduce_test.cpp gfx/spirv.cpp)
 target_include_directories(query-reduce-test PRIVATE gfx)
 add_test(NAME query-reduce COMMAND query-reduce-test)
+
+add_executable(pc-libc-leaf-test tests/pc_libc_leaf_test.cpp)
+target_include_directories(pc-libc-leaf-test PRIVATE src)
+add_test(NAME pc-libc-leaf COMMAND pc-libc-leaf-test)
