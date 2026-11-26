@@ -25,7 +25,7 @@
 #include <mutex>
 
 #include "hle.h"
-#include "render_bridge.h"
+#include "host_memory.h"
 #include "runtime.h"
 #include "region_extent_cache.h"
 
