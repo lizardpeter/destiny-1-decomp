@@ -1314,8 +1314,8 @@ D1_SYSV uint64_t build_3d(void* p,uint32_t w,uint32_t h,uint32_t depth,uint32_t 
 // this synchronous callback scope. Addresses alone cannot prove a full chain.
 struct MipBounds {uint64_t low=0,high=0,low_size=0,high_size=0;};
 thread_local MipBounds mip_bounds;
-using MipHandlesFn=D1_SYSV void(*)(uint32_t,uint32_t,uint32_t);
-MipHandlesFn o_mip_handles,o_mip_relocation;
+using MipHandlesFn=D1_SYSV void(*)(uint64_t,uint32_t,uint32_t);
+MipHandlesFn o_mip_relocation;
 uint64_t mip_allocation_size(uint32_t h,uint64_t base){
     if(h==UINT32_MAX||base<0x10000)return 0;
     using SizeFn=D1_SYSV uint64_t(*)(uint32_t*);
@@ -1333,12 +1333,21 @@ struct MipBoundsScope {
     }
     ~MipBoundsScope(){mip_bounds=previous;}
 };
-D1_SYSV void h_mip_handles(uint32_t tag,uint32_t low,uint32_t high){
-    MipBoundsScope bounds(low,high);o_mip_handles(tag,low,high);
+// Complete 0xE01E0 body (analysis/ps4-0133/pseudocode/000e0000.c):
+// resolve both memory handles (invalid sentinel -> zero), then dispatch
+// the registered mip callback at 0x254EE80(tag,low address,high address).
+// This leaf starts with non-prologue instructions, so a trampoline is
+// neither necessary nor supported. Preserve the live callback table;
+// do not call h_mips directly or assume which callback is registered.
+D1_SYSV void h_mip_handles(uint64_t tag,uint32_t low,uint32_t high){
+    MipBoundsScope bounds(low,high);
+    using Callback=D1_SYSV void(*)(uint64_t,uint64_t,uint64_t);
+    const auto callback=nr::eb<Callback>(0x254EE80);
+    if(callback)callback(tag,mip_bounds.low,mip_bounds.high);
     // Malformed or unbound handle: never strand the publication gate.
     if(pending_mip_bind.owns_lock())pending_mip_bind.unlock();
 }
-D1_SYSV void h_mip_relocation(uint32_t tag,uint32_t low,uint32_t high){
+D1_SYSV void h_mip_relocation(uint64_t tag,uint32_t low,uint32_t high){
     MipBoundsScope bounds(low,high);o_mip_relocation(tag,low,high);
 }
 using MipFn = D1_SYSV void (*)(uint32_t, uint64_t, uint64_t);
@@ -1490,7 +1499,9 @@ bool install() {
     ok &= hook(0x7D3560, &h_copy, o_copy, "resource_move_copy");
     ok &= hook(0x7D37B0, &h_swap, o_swap, "resource_move_commit");
     const bool mip_hook=hook(0x7D4480, &h_mips, o_mips, "texture_mips");
-    const bool handle_hook=hook(0xE01E0,&h_mip_handles,o_mip_handles,"texture_mip_handle_bounds");
+    const bool handle_hook=replace_eboot_function(0xE01E0,reinterpret_cast<const void*>(&h_mip_handles));
+    if(!handle_hook)log("nd: replacing native texture_mip_handle_bounds (eboot+0xe01e0) failed");
+    else log("nd: native texture_mip_handle_bounds replacement installed");
     mip_pair_hooked=mip_hook&&handle_hook;ok &= mip_pair_hooked;
     ok &= hook(0xE00D0,&h_mip_relocation,o_mip_relocation,"texture_mip_relocation_bounds");
     if(native_bind_enabled()){
