@@ -27,6 +27,7 @@
 #include "hle.h"
 #include "render_bridge.h"
 #include "runtime.h"
+#include "region_extent_cache.h"
 
 namespace d1 {
 
@@ -231,32 +232,8 @@ void for_each_guest_region(void (*fn)(uint64_t addr, uint64_t size)) {
 }
 
 uint64_t guest_region_extent(uint64_t addr) {
-    // Cache exact mapping boundaries, not merged adjacent allocations. Normal
-    // renderer range checks should not serialize every draw on g_mem_mutex.
-    // This is a metadata cache, not a pin against concurrent unmapping.
-    struct Span { uint64_t begin = 0, limit = 0, end = 0; };
-    struct Cache { uint64_t gen = 0; Span spans[8]{}; unsigned next = 0; };
-    static thread_local Cache cache;
-    const uint64_t gen = g_regions_gen.load(std::memory_order_acquire);
-    if (cache.gen == gen) {
-        for (const Span& span : cache.spans)
-            if (addr >= span.begin && addr < span.limit) return span.end - addr;
-    }
-    std::lock_guard lk(g_mem_mutex);
-    const uint64_t current = g_regions_gen.load(std::memory_order_relaxed);
-    if (cache.gen != current) {
-        cache = {};
-        cache.gen = current;
-    }
-    auto next = g_regions.upper_bound(addr);
-    if (next == g_regions.begin()) return 0;
-    const auto it = std::prev(next);
-    const uint64_t end = it->first + it->second.size;
-    if (addr >= end) return 0;
-    // Even if mappings overlap, use the same predecessor as region_of().
-    const uint64_t limit = next != g_regions.end() && next->first < end ? next->first : end;
-    cache.spans[cache.next++ & 7] = {it->first, limit, end};
-    return end - addr;
+    static thread_local RegionExtentCache cache;
+    return cache.lookup(addr, g_regions_gen, g_mem_mutex, g_regions);
 }
 
 static int32_t sceKernelQueryMemoryProtection(void* addr, void** start, void** end, int* prot) {
