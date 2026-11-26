@@ -2409,14 +2409,6 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     };
     const uint64_t key = tex_key(t, res);
     ++st.tex_checks;
-    if(res){
-        if(auto* old=historical_texture(key,t,res)){
-            old->last_used=rc().submit_no;old->last_frame=st.frames;
-            ++texture_history_hits;++st.res_hits;
-            st.t_tex_hit+=now_ns()-t_in;
-            return old;
-        }
-    }
     // Registered image ownership is already established by the exact epoch
     // and successfully uploaded descriptor. No tile-layout calculation,
     // mutable tag read or host mapping lock is needed on this hot path.
@@ -2436,6 +2428,14 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                     return img;
                 }
             }
+        }
+    }
+    if(res){
+        if(auto* old=historical_texture(key,t,res)){
+            old->last_used=rc().submit_no;old->last_frame=st.frames;
+            ++texture_history_hits;++st.res_hits;
+            st.t_tex_hit+=now_ns()-t_in;
+            return old;
         }
     }
     // Existing exact old-epoch GPU images can still be used above. Do not
@@ -2493,6 +2493,23 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         return nullptr;
     }
 
+    // The tiled source must remain owned while detiling. A mapped range
+    // can be recycled or rewritten by the streaming threads after a
+    // coverage check, even if its virtual address did not change.
+    static thread_local std::vector<uint8_t> primary_source,secondary_source;
+    MappingSpans primary_spans,secondary_spans;
+    bool primary_ready=false;
+    const auto current_epoch=[&]{return !res||!obj||!opt.res_current||opt.res_current(obj)==res;};
+    auto capture_source=[&](uint64_t base,uint64_t bytes,std::vector<uint8_t>& dst,MappingSpans& spans){
+        if(!bytes||bytes>(512ull<<20)||!current_epoch()||
+           !guest_capture_read_spans(base,bytes,spans))return false;
+        dst.resize(bytes);
+        return guest_copy_current_spans(base,bytes,spans,dst.data())&&current_epoch();
+    };
+    auto primary=[&]{
+        if(!primary_ready)primary_ready=capture_source(ts.base,cur_bytes,primary_source,primary_spans);
+        return primary_ready;
+    };
     std::unique_ptr<Image> prev;
     auto it = textures.find(key);
     bool found = it != textures.end();
@@ -2532,7 +2549,8 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             }
             if (!streamed && matches_shape(img)&&same_layout&&img->src_size == cur_bytes &&
                 (prepared ? prepared_hash==img->content :
-                 (guest_readable_range(ts.base,cur_bytes)&&hash_bytes(reinterpret_cast<const void*>(ts.base),cur_bytes)==img->content))) {
+                 (primary()&&hash_bytes(primary_source.data(),cur_bytes)==img->content&&
+                  guest_matches_current_spans(ts.base,cur_bytes,primary_spans,primary_source.data())&&current_epoch()))) {
                 img->remember_relocation();
                 img->res_val = res, img->src_addr = ts.base;
                 std::memcpy(img->resident_descriptor[0],t,32);
@@ -2614,11 +2632,24 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     auto upload_range = [&](const tiling::Surface& s_src, uint64_t base_addr, uint32_t src_lv_begin, uint32_t src_lv_count, uint32_t dst_lv_begin) -> bool {
         if (!src_lv_count || src_lv_begin >= s_src.levels || src_lv_count > s_src.levels - src_lv_begin ||
             dst_lv_begin >= full_levels || src_lv_count > full_levels - dst_lv_begin) return false;
-        const auto& last = s_src.mips[src_lv_begin + src_lv_count - 1];
-        if (!base_addr || (prepared ? prepared_source_size < last.offset + last.size :
-                          !guest_readable_range(base_addr,last.offset + last.size))) {
-            ++texture_range_rejects;
-            return false;
+        const auto& last=s_src.mips[src_lv_begin+src_lv_count-1];
+        const uint64_t needed=last.offset+last.size;
+        if(!base_addr||!needed||(prepared&&prepared_source_size<needed)){
+            ++texture_range_rejects;return false;
+        }
+        const uint8_t* tiled=nullptr;
+        const MappingSpans* spans=nullptr;
+        uint64_t captured=needed;
+        if(!prepared){
+            if(base_addr==ts.base&&needed<=cur_bytes){
+                if(!primary()){++texture_range_rejects;return false;}
+                tiled=primary_source.data();spans=&primary_spans;captured=cur_bytes;
+            }else{
+                if(!capture_source(base_addr,needed,secondary_source,secondary_spans)){
+                    ++texture_range_rejects;return false;
+                }
+                tiled=secondary_source.data();spans=&secondary_spans;
+            }
         }
         uint64_t total = 0;
         std::vector<uint64_t> sizes(src_lv_count), level_off(src_lv_count);
@@ -2658,7 +2689,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             if(own)free_buffer(sb);
             return false; // do not silently fall back to guest memory
         }
-        const uint32_t missing = (!use_prepared && src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count > 1) ? first_missing_mip(ts, fi, s_src, is3d) : src_lv_count;
+        const uint32_t missing = (!use_prepared && src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count > 1) ? first_missing_mip(ts, fi, s_src, is3d,tiled) : src_lv_count;
         const uint64_t td = now_ns();
         st.t_fill += td - tf0;
         if (crop) {
@@ -2669,7 +2700,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 const uint32_t dw = elems(std::max(1u, full_w >> dl)), dh = elems(std::max(1u, full_h >> dl));
                 const uint32_t slices = is3d ? std::max(1u, full_d >> dl) : layers;
                 cropped_source.resize(uint64_t(sw) * sh * slices * bytes);
-                tiling::detile(s_src, sl, reinterpret_cast<const uint8_t*>(base_addr), cropped_source.data());
+                tiling::detile(s_src,sl,tiled,cropped_source.data());
                 for (uint32_t z = 0; z < slices; ++z)
                     for (uint32_t y = 0; y < dh; ++y)
                         std::memcpy(sb.map + level_off[k] + (uint64_t(z) * dh + y) * dw * bytes,
@@ -2682,7 +2713,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             static thread_local std::vector<uint8_t> scratch;
             scratch.resize(total);
             for (uint32_t k = 0; k < missing; ++k)
-                tiling::detile(s_src, src_lv_begin + k, reinterpret_cast<const uint8_t*>(base_addr), scratch.data() + level_off[k]);
+                tiling::detile(s_src,src_lv_begin+k,tiled,scratch.data()+level_off[k]);
             const uint64_t tf = now_ns();
             st.t_detile += tf - td;
             fill_missing_mips(missing, scratch.data(), level_off, sizes, ts, fi, s_src, is3d);
@@ -2690,8 +2721,14 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             st.t_fill += now_ns() - tf;
         } else {
             for (uint32_t k = 0; k < src_lv_count; ++k)
-                tiling::detile(s_src, src_lv_begin + k, reinterpret_cast<const uint8_t*>(base_addr), sb.map + level_off[k]);
+                tiling::detile(s_src,src_lv_begin+k,tiled,sb.map+level_off[k]);
             st.t_detile += now_ns() - td;
+        }
+        if(!current_epoch()||(!prepared&&(!spans||
+           !guest_matches_current_spans(base_addr,captured,*spans,tiled)))){
+            if(own)free_buffer(sb);
+            ++st.tex_torn;
+            return false;
         }
         std::vector<VkBufferImageCopy> regions(src_lv_count);
         for (uint32_t k = 0; k < src_lv_count; ++k) {
@@ -2790,14 +2827,14 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         if (ok && res) {
             img->res_val = res, img->res_obj = smi.obj ? smi.obj : obj;
             img->src_addr = ts.base, img->src_size = sf.total_size, img->version = ~0ull;
-            img->content = prepared ? prepared_hash : hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size);
+            img->content=prepared?prepared_hash:hash_bytes(primary_source.data(),sf.total_size);
         } else if (ok && (opt.watch || dynamic_copy)) {
             const uint64_t tw = now_ns();
             img->version = mem_watch(ts.base, sf.total_size);
-            if (dynamic_copy) img->content = hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size);
+            if(dynamic_copy)img->content=hash_bytes(primary_source.data(),sf.total_size);
             st.t_watch += now_ns() - tw;
             if (img->version != ~0ull) img->src_addr = ts.base, img->src_size = sf.total_size, img->checked = rc().submit_no;
-            if (dynamic_copy && !img->content) img->content = hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size);
+
         }
     }
 
@@ -2862,7 +2899,9 @@ uint32_t Renderer::first_missing_mip(const fmt::TSharp& ts, const fmt::FormatInf
             const uint64_t at = (n - kSpan) * k / (kSamples - 1);
             if (!zero(p + at, kSpan)) return false;
         }
-        return n > (256u << 10) || zero(p, n);
+        // Sparse valid mip data can miss every probe. Never synthesize
+        // a replacement mip solely because the sampled bytes are zero.
+        return zero(p,n);
     };
     const uint8_t* guest = source ? source : reinterpret_cast<const uint8_t*>(ts.base);
     if (level_zero(guest + sf.mips[0].offset, sf.mips[0].size)) return sf.levels;
