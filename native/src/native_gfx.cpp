@@ -25,7 +25,6 @@
 
 #include "formats.h"
 #include "nrender.h"
-#include "native_list_tokens.h"
 #include "settings.h"
 #ifdef D1_FRONTEND_SDL
 #include "frontend.h"
@@ -703,26 +702,24 @@ void install() {
 // ---------------------------------------------------------------------------- native device layer
 namespace nd {
 bool g_on = false;
-constexpr uint32_t kMagic = kNativeListMagic;  // token: NOP {magic, id lo, id hi}
 struct Item {
     ng::Draw* d = nullptr;  // null: a constant buffer binding
     nr::CbEvent cb{};
 };
 struct List {
-    uint64_t id = 0, dev = 0;
+    uint64_t dev = 0;
     std::vector<Item> items;
     std::vector<uint8_t*> chunks;
     size_t used = 0;
     bool eop = false;
     uint64_t made = 0;
-    bool recorded = false;
-    uint32_t handle = 0;
-    std::vector<ng::LateCb> late;
-    ng::Draw::Cb dflt[ng::kStages][16] = {};
 };
 std::mutex g_lists_m;
+// 0x7DD060 submits record+0x30 directly. Associate the owned list with
+// that array's address, not with a GPU packet encoded in its contents.
 std::unordered_map<uint64_t, List*> g_lists;
-std::atomic<uint64_t> g_next{1};
+std::vector<List*> g_abandoned;
+constexpr uint64_t kRecordDcbArray = 0x30;
 constexpr int kMaxCtx = 16;
 std::atomic<uint64_t> g_devs[kMaxCtx];
 std::atomic<int> g_ndevs{0};
@@ -760,7 +757,7 @@ List* list_of(int c) {
     List* l = g_ctx[c].cur.load(std::memory_order_relaxed);
     if (!l) {
         l = new List;
-        l->id = g_next++, l->dev = dev_addr(c), l->made = gpu_flip_count();
+        l->dev = dev_addr(c), l->made = gpu_flip_count();
         g_ctx[c].cur.store(l, std::memory_order_relaxed);
     }
     return l;
@@ -770,78 +767,48 @@ void begin_list(uint64_t dev) {
     if (c < 0) return;
     if (List* old = g_ctx[c].cur.exchange(nullptr)) {
         std::lock_guard lk(g_lists_m);
-        g_lists[old->id] = old;
+        g_abandoned.push_back(old);
     }
     auto* l = new List;
-    l->id = g_next++, l->dev = dev, l->made = gpu_flip_count();
+    l->dev = dev, l->made = gpu_flip_count();
     g_ctx[c].cur.store(l, std::memory_order_relaxed);
     ++g_lists_made;
 }
-void write_token(uint64_t cb, uint64_t id) {
+// The retail ring (0x7DB810 / 0x7DCEC0 / 0x7DE950) uses the difference
+// between its begin and end pointers to decide whether a record is ready
+// to submit. Until that ring is reconstructed, reserve one word of size
+// bookkeeping. No packet or list ID is written or decoded.
+bool mark_record_nonempty(uint64_t cb) {
     using ReserveFn = D1_SYSV bool (*)(uint64_t, uint32_t, uint64_t);
     uint32_t* p = field<uint32_t*>(cb, 0x10);
-    if (uint64_t(field<uint64_t>(cb, 8) - uint64_t(p)) / 4 < 4) {
-        if (!reinterpret_cast<ReserveFn>(field<uint64_t>(cb, 0x18))(cb, 4, field<uint64_t>(cb, 0x20))) return;
+    if (!p || field<uint64_t>(cb, 8) < uint64_t(p) ||
+        field<uint64_t>(cb, 8) - uint64_t(p) < sizeof(uint32_t)) {
+        const uint64_t reserve = field<uint64_t>(cb, 0x18);
+        if (!reserve || !reinterpret_cast<ReserveFn>(reserve)(cb, 1, field<uint64_t>(cb, 0x20))) return false;
         p = field<uint32_t*>(cb, 0x10);
     }
-    p[0] = 0xC0021000u;  // type 3 NOP, 4 dwords
-    p[1] = kMagic, p[2] = uint32_t(id), p[3] = uint32_t(id >> 32);
-    *reinterpret_cast<uint32_t**>(cb + 0x10) = p + 4;
+    if (!p || field<uint64_t>(cb, 8) < uint64_t(p) ||
+        field<uint64_t>(cb, 8) - uint64_t(p) < sizeof(uint32_t)) return false;
+    *reinterpret_cast<uint32_t**>(cb + 0x10) = p + 1;
+    return true;
 }
-void record(List* l) {
-    if (!ng::list_recording() || l->items.empty()) return;
-    // A list containing CPU-visible resource writes must be executed in actual
-    // submission order. Recording those writes at list close can reorder them
-    // across other lists and duplicate them at submit.
-    for (const Item& it : l->items)
-        if (it.d && (it.d->kind == ng::Draw::Dma || it.d->kind == ng::Draw::WriteData))
-            return;
-    struct SavedCb { ng::Draw* draw; ng::Draw::Cb cb[ng::kStages][16]; };
-    std::vector<SavedCb> saved;
-    ng::Draw::Cb local[ng::kStages][16] = {};
-    bool bound[ng::kStages][16] = {};
-    std::vector<ng::Draw*> items;
-    items.reserve(l->items.size());
-    for (Item& it : l->items) {
-        if (!it.d) {
-            local[it.cb.stage][it.cb.slot] = it.cb.cb;
-            bound[it.cb.stage][it.cb.slot] = true;
-            continue;
-        }
-        ng::Draw* d = it.d;
-        if (d->kind <= ng::Draw::Clear) {
-            saved.emplace_back();
-            saved.back().draw = d;
-            std::memcpy(saved.back().cb, d->cb, sizeof d->cb);
-            for (int st = 0; st < ng::kStages; ++st)
-                for (int sl = 0; sl < 16; ++sl) {
-                    ng::Draw::Cb& c = d->cb[st][sl];
-                    if (bound[st][sl]) {
-                        c = local[st][sl];
-                    } else {
-                        if (!l->dflt[st][sl].addr && c.addr) l->dflt[st][sl] = c;
-                        c = {ng::kLateCb | uint64_t(st) << 4 | uint64_t(sl), c.size};
-                    }
-                }
-        }
-        items.push_back(d);
-    }
-    l->recorded = ng::record_list(items, l->handle, l->late);
-    // Captured draws remain valid even if native recording fails or is discarded.
-    for (const auto& v : saved) std::memcpy(v.draw->cb, v.cb, sizeof v.cb);
-}
-List* end_list(uint64_t dev) {
+void end_list(uint64_t dev) {
     const int c = ctx_of_dev(dev);
-    if (c < 0) return nullptr;
-    List* l = list_of(c);
-    record(l);
-    {
-        std::lock_guard lk(g_lists_m);
-        g_lists[l->id] = l;
+    const uint64_t gfx = field<uint64_t>(dev, 0x50), rec = field<uint64_t>(dev, 0x58);
+    if (c < 0 || !gfx || !rec || !mark_record_nonempty(gfx)) {
+        log("nd: cannot publish native list to retail record");
+        std::abort();
     }
-    if (const uint64_t gfx = field<uint64_t>(dev, 0x50)) write_token(gfx, l->id);
-    return l;
+    List* l = list_of(c);
+    // The original close appends its EOP label through our device callback,
+    // then publishes the record ready flag. Do not record speculatively here.
+    std::lock_guard lk(g_lists_m);
+    if (!g_lists.emplace(rec + kRecordDcbArray, l).second) {
+        log("nd: native list record reused before submission (%#llx)", (unsigned long long)rec);
+        std::abort();
+    }
 }
+
 void add(int c, ng::Draw* d) {
     if (List* l = list_of(c)) l->items.push_back({d, {}});
     else nr::release_draw(d);
@@ -1436,29 +1403,24 @@ bool native_gfx_install() {
 bool native_device_active() { return nd::g_on; }
 void gnm_signal_eop();  // hle_gpu.cpp
 // The queue owns detached native lists, not pointers into the engine's
-// reusable console-shaped command buffers. Tokens are decoded at the API boundary.
+// reusable console-shaped command buffers. The retail record address is the boundary key.
 struct NativeSubmission {
     std::vector<nd::List*> lists;
     std::unordered_map<const ng::Draw*, uint64_t> completion_mappings;
 };
 NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
     auto batch = std::make_unique<NativeSubmission>();
-    std::unique_lock lk(nd::g_lists_m);
-    for (uint32_t k = 0; k < count; ++k) {
-        const uint32_t* p = dcbs[k];
-        const uint32_t n = p ? sizes[k] / 4 : 0;
-        const bool complete = visit_native_list_tokens(p, n, [&](uint64_t id) {
-            if (auto it = nd::g_lists.find(id); it != nd::g_lists.end()) {
-                batch->lists.push_back(it->second);
-                nd::g_lists.erase(it);
-            }
-        });
-        if (!complete) {
-            static unsigned bad = 0;
-            if (bad++ < 16) log("nd: truncated retail list token stream at native submission boundary");
+    {
+        std::lock_guard lk(nd::g_lists_m);
+        const auto it = nd::g_lists.find(uint64_t(dcbs));
+        if (it == nd::g_lists.end() || !count || count > 64) {
+            log("nd: unknown retail submission record %#llx (%u segments); no compatibility packet fallback",
+                (unsigned long long)uint64_t(dcbs), count);
+            std::abort();
         }
+        batch->lists.push_back(it->second);
+        nd::g_lists.erase(it);
     }
-    lk.unlock();
     // These labels outlive the submission API. Capture the destination's
     // identity here, before the GPU queue is allowed to delay the operation.
     for (const nd::List* list : batch->lists)
@@ -1472,26 +1434,18 @@ void native_device_execute_submit(NativeSubmission* batch) {
     if (!batch) return;
     std::unique_ptr<NativeSubmission> owned(batch);
     auto& lists = owned->lists;
-    // Only the consumer thread retires orphaned list allocations. Never hold
-    // the capture mutex while calling the renderer or retiring memory.
+    // Only abandoned *unpublished* lists are reclaimed here. A published
+    // record may legitimately wait behind a worker; never age it out.
     std::vector<nd::List*> orphans;
-    static uint64_t sweep = 0;
-    if (++sweep % 256 == 0) {
+    {
         std::lock_guard lk(nd::g_lists_m);
-        for (auto it = nd::g_lists.begin(); it != nd::g_lists.end();) {
-            if (it->second->made + 300 < gpu_flip_count()) {
-                orphans.push_back(it->second);
-                it = nd::g_lists.erase(it);
-            } else ++it;
-        }
+        orphans.swap(nd::g_abandoned);
     }
     for (nd::List* l : orphans) {
-        if (l->recorded) ng::discard_recorded(l->handle);
         ++nd::g_orphans;
         nd::free_list(l);
     }
     std::vector<ng::Draw*> draws;
-    std::vector<uint32_t> recorded;
     struct PendingLabel { uint64_t addr, mapping; bool timestamp; std::vector<uint8_t> bytes; };
     std::vector<PendingLabel> labels;
     if (!ng::active()) {
@@ -1508,19 +1462,9 @@ void native_device_execute_submit(NativeSubmission* batch) {
         nr::g_frame_executed = true;
         draws.clear();
     };
-    auto flush_recorded = [&] {
-        if (recorded.empty()) return;
-        const auto t0 = std::chrono::steady_clock::now();
-        ng::submit_recorded(recorded);
-        nr::g_exec_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - t0).count());
-        nr::g_frame_executed = true;
-        recorded.clear();
-    };
     auto complete = [&](bool eop) {
         // Flush only at an actual completion boundary. A label must not wait
         // for unrelated later lists, nor become visible before prior GPU work.
-        flush_recorded();
         flush_draws();
         ng::after_gpu([pending = std::move(labels), eop]() mutable {
             for (auto& label : pending) {
@@ -1547,45 +1491,28 @@ void native_device_execute_submit(NativeSubmission* batch) {
     };
 
     for (nd::List* l : lists) {
-        if (l->recorded) {
-            flush_draws();
-            for (const ng::LateCb& lc : l->late) {
-                const ng::Draw::Cb& c = nr::g_ce_known[lc.stage][lc.slot] ?
-                    nr::g_ce[lc.stage][lc.slot] : l->dflt[lc.stage][lc.slot];
-                ng::fill_late(lc, c.addr, c.size);
+        for (nd::Item& it : l->items) {
+            if (!it.d) {
+                nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
+                nr::g_ce_known[it.cb.stage][it.cb.slot] = true;
+                continue;
             }
-            recorded.push_back(l->handle);
-            for (nd::Item& it : l->items)
-                if (!it.d) {
-                    nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
-                    nr::g_ce_known[it.cb.stage][it.cb.slot] = true;
-                }
-        } else {
-            flush_recorded();
-            for (nd::Item& it : l->items) {
-                if (!it.d) {
-                    nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
-                    nr::g_ce_known[it.cb.stage][it.cb.slot] = true;
-                    continue;
-                }
-                ng::Draw* d = it.d;
-                if (d->kind == ng::Draw::WriteData && d->prim == ng::kEopLabel) {
-                    auto stamp = owned->completion_mappings.find(d);
-                    labels.push_back({d->caller, stamp == owned->completion_mappings.end() ? 0 : stamp->second,
-                                      d->count != 0, d->inline_vertices});
-                    complete(false);
-                    continue;
-                }
-                if (d->kind <= ng::Draw::Clear)
-                    for (int st = 0; st < 2; ++st)
-                        for (int sl = 0; sl < 16; ++sl)
-                            if (nr::g_ce_known[st][sl]) d->cb[st][sl] = nr::g_ce[st][sl];
-                draws.push_back(d);
+            ng::Draw* d = it.d;
+            if (d->kind == ng::Draw::WriteData && d->prim == ng::kEopLabel) {
+                auto stamp = owned->completion_mappings.find(d);
+                labels.push_back({d->caller, stamp == owned->completion_mappings.end() ? 0 : stamp->second,
+                                  d->count != 0, d->inline_vertices});
+                complete(false);
+                continue;
             }
+            if (d->kind <= ng::Draw::Clear)
+                for (int st = 0; st < 2; ++st)
+                    for (int sl = 0; sl < 16; ++sl)
+                        if (nr::g_ce_known[st][sl]) d->cb[st][sl] = nr::g_ce[st][sl];
+            draws.push_back(d);
         }
         if (l->eop) complete(true);
     }
-    flush_recorded();
     flush_draws();
     nd::g_lists_run += lists.size();
     for (nd::List* l : lists) nd::free_list(l);
