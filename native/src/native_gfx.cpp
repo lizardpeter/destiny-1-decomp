@@ -86,13 +86,9 @@ uint64_t mix(uint64_t h, uint64_t v) {
 }
 
 // ---- hooked device API (System V signatures as decompiled)
-using DrawIndexedFn = D1_SYSV void (*)(uint64_t, uint64_t, uint64_t, int32_t, uint32_t);
-using DrawFn = D1_SYSV void (*)(uint64_t, uint64_t, uint32_t);
 using SetVertexBufferFn = D1_SYSV void (*)(uint64_t, uint32_t, uint32_t, uint32_t, int32_t);
 using AllocConstantsFn = D1_SYSV uint64_t (*)(uint64_t, uint32_t, uint32_t, uint32_t);
 
-DrawIndexedFn o_draw_indexed;
-DrawFn o_draw;
 SetVertexBufferFn o_set_vertex_buffer;
 AllocConstantsFn o_alloc_constants;
 
@@ -456,23 +452,17 @@ void push(ng::Draw* d) {
 
 }  // namespace nr
 
-using DrawInstancedFn = D1_SYSV void (*)(uint64_t, uint32_t, uint32_t, uint64_t, uint32_t);
-using DrawQuadsFn = D1_SYSV void (*)(uint64_t, uint32_t, uint64_t, int32_t);
-using DrawInlineFn = D1_SYSV void (*)(uint64_t, uint32_t, int32_t, const void*, int32_t);
 using ClearFn = D1_SYSV void (*)(uint64_t, uint32_t);
 using DispatchFn = D1_SYSV void (*)(uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, int32_t);
-DrawInstancedFn o_draw_instanced;
-using DrawIndexedInstancedFn = D1_SYSV void (*)(uint64_t, uint32_t, uint32_t, uint64_t, uint32_t, uint64_t, uint32_t);
-DrawIndexedInstancedFn o_draw_indexed_instanced;
-DrawQuadsFn o_draw_quads;
-DrawInlineFn o_draw_inline;
 ClearFn o_clear;
 DispatchFn o_dispatch;
 
-thread_local uint32_t t_instances = 1;
-D1_SYSV void r_draw_indexed(uint64_t dev, uint64_t prim, uint64_t, int32_t first, uint32_t count) {
+// 0x7E16A0 sets an instance count, calls 0x7E15D0 and restores one.
+// Both original paths now generate the same native record directly,
+// without a console draw trampoline or thread-local instance override.
+void capture_indexed(uint64_t dev,uint32_t prim,int32_t first,uint32_t count,uint32_t instances,uint64_t caller){
     if (field<uint8_t>(dev, 0x26)) {
-        ng::Draw* d = nr::capture(dev, uint32_t(prim), uint64_t(__builtin_return_address(0)));
+        ng::Draw* d = nr::capture(dev,prim,caller);
         d->kind = ng::Draw::Indexed;
         const uint64_t ib = field<uint64_t>(dev, 0x1D70);
         const uint32_t isz = ib ? field<uint32_t>(ib, 0x38) : 0;
@@ -480,9 +470,12 @@ D1_SYSV void r_draw_indexed(uint64_t dev, uint64_t prim, uint64_t, int32_t first
         d->index_addr = ib ? field<uint64_t>(ib, 0x30) + uint64_t(uint32_t((isz * 2 + 2) * first)) : 0;
         if (ib && nr::resreg::g_on) d->ires = {nr::resreg::get(ib), field<uint64_t>(ib, 0x30), uint64_t(field<uint32_t>(ib, 0x3C)) * (isz ? 4 : 2)};
         d->count = count;
-        d->instances = t_instances;
+        d->instances=instances;
         nr::push(d);
     }
+}
+D1_SYSV void r_draw_indexed(uint64_t dev,uint64_t prim,uint64_t,int32_t first,uint32_t count){
+    capture_indexed(dev,uint32_t(prim),first,count,1,uint64_t(__builtin_return_address(0)));
 }
 D1_SYSV void r_draw(uint64_t dev, uint64_t prim, uint32_t count) {
     if (field<uint8_t>(dev, 0x26)) {
@@ -500,11 +493,9 @@ D1_SYSV void r_draw_instanced(uint64_t dev, uint32_t prim, uint32_t count, uint6
         nr::push(d);
     }
 }
-D1_SYSV void r_draw_indexed_instanced(uint64_t dev, uint32_t prim, uint32_t count, uint64_t a, uint32_t instances,
-                                      uint64_t b, uint32_t first) {
-    t_instances = instances ? instances : 1;
-    o_draw_indexed_instanced(dev, prim, count, a, instances, b, first);
-    t_instances = 1;
+D1_SYSV void r_draw_indexed_instanced(uint64_t dev,uint32_t prim,uint32_t count,uint64_t,uint32_t instances,
+                                     uint64_t,uint32_t first){
+    capture_indexed(dev,prim,int32_t(first),count,instances?instances:1,uint64_t(__builtin_return_address(0)));
 }
 D1_SYSV void r_draw_quads(uint64_t dev, uint32_t prim, uint64_t first, int32_t prims) {
     ng::Draw* d = nr::capture(dev, prim, uint64_t(__builtin_return_address(0)));
@@ -2527,12 +2518,12 @@ bool native_gfx_install() {
         return false;
     }
     bool ok = true;
-    ok &= hook(0x7E15D0, &r_draw_indexed, o_draw_indexed, "draw_indexed");
-    ok &= hook(0x7E17C0, &r_draw, o_draw, "draw");
-    ok &= hook(0x7E1710, &r_draw_instanced, o_draw_instanced, "draw_instanced");
-    ok &= hook(0x7E16A0, &r_draw_indexed_instanced, o_draw_indexed_instanced, "draw_indexed_instanced");
-    ok &= hook(0x7E1840, &r_draw_quads, o_draw_quads, "draw_shared_indices");
-    ok &= hook(0x7E1960, &r_draw_inline, o_draw_inline, "draw_inline");
+    ok &= replace_eboot_function(0x7E15D0,reinterpret_cast<const void*>(&r_draw_indexed));
+    ok &= replace_eboot_function(0x7E17C0,reinterpret_cast<const void*>(&r_draw));
+    ok &= replace_eboot_function(0x7E1710,reinterpret_cast<const void*>(&r_draw_instanced));
+    ok &= replace_eboot_function(0x7E16A0,reinterpret_cast<const void*>(&r_draw_indexed_instanced));
+    ok &= replace_eboot_function(0x7E1840,reinterpret_cast<const void*>(&r_draw_quads));
+    ok &= replace_eboot_function(0x7E1960,reinterpret_cast<const void*>(&r_draw_inline));
     ok &= hook(0x7E2A00, &r_clear, o_clear, "clear");
     ok &= hook(0x7DF630, &r_alloc_constants, o_alloc_constants, "alloc_constants");
     ok &= hook(0x7DEC20, &r_set_vertex_buffer, o_set_vertex_buffer, "set_vertex_buffer");
