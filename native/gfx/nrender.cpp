@@ -1601,8 +1601,12 @@ void Renderer::retire_one() {
     inflight.pop_front();
     Sub& sb = subs[i];
     const uint64_t tw = now_ns();
-    vkWaitForFences(ctx.device, 1, &sb.fence, VK_TRUE, UINT64_MAX);
+    const VkResult waited = vkWaitForFences(ctx.device, 1, &sb.fence, VK_TRUE, UINT64_MAX);
     st.t_wait += now_ns() - tw;
+    if (waited != VK_SUCCESS) {
+        log("native renderer: completion fence failed (%d); refusing to publish unfinished GPU results", int(waited));
+        std::_Exit(1);
+    }
     if (sb.timepool) {
         uint64_t ticks[2]{};
         // The submission fence has completed: never add a query wait to the frame.
@@ -5542,9 +5546,17 @@ void Renderer::store_query_predicates() {
 void Renderer::write_zpass_results(Sub& sb) {
     if (sb.zrecs.empty() && !sb.q_used) return;
     std::vector<uint64_t> res(sb.q_used, 0);
-    if (sb.q_used)
-        vkGetQueryPoolResults(ctx.device, sb.qpool, 0, sb.q_used, res.size() * 8, res.data(), 8,
-                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (sb.q_used) {
+        // write_results runs only after the submission completed. WAIT here
+        // would hide a missing query end and could deadlock the completion thread.
+        const VkResult result = vkGetQueryPoolResults(ctx.device, sb.qpool, 0, sb.q_used,
+            res.size() * 8, res.data(), 8, VK_QUERY_RESULT_64_BIT);
+        if (result != VK_SUCCESS) {
+            log("native renderer: completed submission has unavailable occlusion results (%d, %u queries)",
+                int(result), sb.q_used);
+            std::_Exit(1);
+        }
+    }
     std::vector<uint64_t> prefix(sb.q_used + 1, 0);
     for (uint32_t i = 0; i < sb.q_used; ++i) prefix[i + 1] = prefix[i] + res[i];
     for (const auto& z : sb.zrecs) {
@@ -6213,7 +6225,11 @@ void Renderer::completion_loop() {
             if (serial_done_seen.load() < d.serial) {
                 VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
                 wi.semaphoreCount = 1, wi.pSemaphores = &timeline, wi.pValues = &d.serial;
-                vkWaitSemaphores(ctx.device, &wi, UINT64_MAX);
+                const VkResult result = vkWaitSemaphores(ctx.device, &wi, UINT64_MAX);
+                if (result != VK_SUCCESS) {
+                    log("native renderer: GPU completion timeline wait failed (%d)", int(result));
+                    std::_Exit(1);
+                }
             }
             for (;;) {  // the results of every submission up to it, into guest memory, in order
                 std::pair<uint64_t, uint32_t> e;
