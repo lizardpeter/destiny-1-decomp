@@ -32,7 +32,7 @@
 #endif
 #include "hle.h"
 #include "os.h"
-#include "render_bridge.h"
+#include "frame_telemetry.h"
 #include "runtime.h"
 #include "tiling.h"
 
@@ -1377,9 +1377,7 @@ bool native_gfx_research_fault(void*, void*) { return false; }
 
 void native_gfx_install() {
     const char* mode = getenv("D1_NATIVE_GFX");
-#ifndef D1_RENDERER_SHADPS4
     if (!mode) mode = "render";
-#endif
     if (!mode || std::strcmp(mode, "render") != 0) return;
     nr::g_base = rt().modules[0].base;
     nr::build_vsharp = reinterpret_cast<nr::BuildVsharpFn>(nr::g_base + 0xF7CF90);
@@ -1421,11 +1419,9 @@ void native_gfx_install() {
 #endif
     if (!ng::init(opt)) {
         log("native gfx: renderer unavailable; not capturing");
-#ifndef D1_RENDERER_SHADPS4
         if (opt.window_handles)
             os::error_box("The renderer could not start, so nothing can be drawn.\n\nIt needs a GPU driver with "
                           "Vulkan 1.4 (update the graphics driver). Details are in d1-native.log.");
-#endif
         return;
     }
     bool ok = true;
