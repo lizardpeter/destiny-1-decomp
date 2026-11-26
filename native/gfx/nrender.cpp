@@ -780,9 +780,19 @@ struct Renderer {
     // copies first, e.g. streamed mips or new glyphs, then draws with the result); the textures
     // whose memory they write are marked stale.
     uint64_t dma_stale = 0;
-    void run_copies(const std::vector<Draw*>& items) {
+    void run_copies(Draw* const* items, size_t count, bool include_writes = false) {
         std::vector<std::pair<uint64_t, uint64_t>> ranges;
-        for (Draw* d : items) {
+        for (size_t i = 0; i < count; ++i) {
+            Draw* d = items[i];
+            if (include_writes && d->kind == Draw::WriteData) {
+                const uint64_t n = d->inline_vertices.size();
+                if (n && d->caller >= 0x10000 && guest_region_extent(d->caller) >= n) {
+                    std::memcpy(reinterpret_cast<void*>(d->caller), d->inline_vertices.data(), n);
+                    ranges.emplace_back(d->caller, d->caller + n);
+                    dma_texture_check(d->caller, n);
+                }
+                continue;
+            }
             if (d->kind != Draw::Dma || d->caller < 0x10000 || guest_region_extent(d->caller) < d->count) continue;
             if (d->prim == 2) {
                 auto* w = reinterpret_cast<uint32_t*>(d->caller);
@@ -918,7 +928,7 @@ struct Renderer {
     }
     std::atomic<uint64_t> lr_lists{0}, lr_ns{0}, lr_wait_ns{0}, lr_sub_ns{0};  // (statistics)
     bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late);
-    void pre_pass(const std::vector<Draw*>& draws);
+    void pre_pass(Draw* const* draws, size_t count);
     void submit_recorded(const std::vector<uint32_t>& handles);
     void discard_recorded(uint32_t handle);
     Recorder main_rec;
@@ -4647,7 +4657,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
 
 // Resources first (copies cannot run inside a render pass): targets, then textures (each
 // distinct target set and T# once per recording: thousands of draws share a few).
-void Renderer::pre_pass(const std::vector<Draw*>& draws) {
+void Renderer::pre_pass(Draw* const* draws, size_t count) {
     const uint64_t tp = now_ns();
     apply_cpu_writes();
     if (reload_all) {
@@ -4661,7 +4671,9 @@ void Renderer::pre_pass(const std::vector<Draw*>& draws) {
     // (each distinct target set and T# once per submission: thousands of draws share a few)
     const uint64_t t_tgt0 = now_ns();
     const Draw* prev_d = nullptr;
-    for (Draw* d : draws) {
+    for (size_t i = 0; i < count; ++i) {
+        Draw* d = draws[i];
+        if (d->kind != Draw::Indexed && d->kind != Draw::Auto && d->kind != Draw::Clear) continue;
         if (prev_d && std::memcmp(prev_d->color, d->color, sizeof d->color) == 0 &&
             std::memcmp(prev_d->depth, d->depth, sizeof d->depth) == 0)
             continue;
@@ -4672,15 +4684,21 @@ void Renderer::pre_pass(const std::vector<Draw*>& draws) {
     st.t_tgt += now_ns() - t_tgt0;
     struct Seen { uint64_t key, sub; };
     static std::vector<Seen> seen(1u << 13);
-    for (Draw* d : draws)
+    // A submission can contain several resource-write boundaries. A descriptor
+    // seen before one of them must be checked again in the next segment.
+    static uint64_t preparation_epoch = 0;
+    const uint64_t epoch = ++preparation_epoch;
+    for (size_t di = 0; di < count; ++di) {
+        Draw* d = draws[di];
+        if (d->kind != Draw::Indexed && d->kind != Draw::Auto) continue;
         for (int s = 0; s < 2; ++s)
             for (uint32_t mask = d->tex_mask[s]; mask; mask &= mask - 1) {
                     const uint32_t i = __builtin_ctz(mask);
                     const uint32_t* t = d->tex[s][i];
                     const uint64_t k = hash_bytes(t, 32) ^ d->tex_res[s][i];
                     Seen& e = seen[k & (seen.size() - 1)];
-                    if (e.key == k && e.sub == rc().submit_no) continue;
-                    e = {k, rc().submit_no};
+                    if (e.key == k && e.sub == epoch) continue;
+                    e = {k, epoch};
                     const uint64_t b = fmt::decode_tsharp(t).base;
                     const bool is_target = !d->tex_res[s][i] && target_bases.count(b) != 0;
                     if (is_target) tsharp_bases.insert(b);  // (only render target addresses matter there)
@@ -4688,6 +4706,7 @@ void Renderer::pre_pass(const std::vector<Draw*>& draws) {
                         upload_texture(t, d->tex_res[s][i], d->tex_obj[s][i]);
                     }
                 }
+    }
     barrier();
     st.t_pre += now_ns() - tp;
 }
@@ -4704,8 +4723,10 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
     ++st.submits;
     retire_completed();
     begin_record();
-    run_copies(draws);
-    pre_pass(draws);
+    if (rc().cur == UINT32_MAX) {
+        log("native renderer: no available native submission slot");
+        std::_Exit(1);
+    }
     rc().q_on = false;
     for (Draw* d : draws) rc().q_on |= d->kind == Draw::ZPass;
     if (rc().q_on) {
@@ -4721,19 +4742,35 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
             vkCmdResetQueryPool(rc().cmd, sb.qpool, 0, kQueries);
         } else rc().q_on = false;
     }
-    for (size_t i = 0; i < draws.size(); ++i) {
+    // Preserve the original order of resource writes relative to draw commands.
+    // Previously all DMA writes were executed before the first draw, and
+    // WRITE_DATA was executed after pre-pass uploads. Both could expose the
+    // wrong texture contents. Each native run is prepared after its preceding
+    // writes, and uploads are encoded into the same command buffer.
+    const auto memory_write = [](const Draw* d) {
+        return d->kind == Draw::Dma || d->kind == Draw::WriteData;
+    };
+    for (size_t i = 0; i < draws.size();) {
+        if (memory_write(draws[i])) {
+            size_t end = i + 1;
+            while (end < draws.size() && memory_write(draws[end])) ++end;
+            end_pass();
+            run_copies(draws.data() + i, end - i, true);
+            i = end;
+            continue;
+        }
+        size_t end = i + 1;
+        while (end < draws.size() && !memory_write(draws[end])) ++end;
+        pre_pass(draws.data() + i, end - i);
+        for (; i < end; ++i) {
         Draw* d = draws[i];
         switch (d->kind) {
         case Draw::Clear: clear(*d); break;
         case Draw::ZPass: zpass(d->index_addr); break;
         case Draw::PredOn: predicate(d->index_addr, d->count & 1); break;
         case Draw::PredOff: rc().pred_cur = -1; break;
-        case Draw::Dma: break;  // (done before the textures: run_copies)
+        case Draw::Dma: case Draw::WriteData: break; // handled at ordered resource-write boundaries
         case Draw::Eop: break;  // (the device layer raises the event after the submission)
-        case Draw::WriteData:
-            if (d->caller >= 0x10000 && guest_region_extent(d->caller) >= d->inline_vertices.size())
-                std::memcpy(reinterpret_cast<void*>(d->caller), d->inline_vertices.data(), d->inline_vertices.size());
-            break;
         default: {
             // a run of plain draws into the same targets: recorded in parallel
             size_t j = i + 1;
@@ -4742,7 +4779,7 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
                     return (x->kind == Draw::Indexed || x->kind == Draw::Auto) && std::memcmp(x->color, d->color, sizeof d->color) == 0 &&
                            std::memcmp(x->depth, d->depth, sizeof d->depth) == 0;
                 };
-                while (j < draws.size() && plain(draws[j])) ++j;
+                while (j < end && plain(draws[j])) ++j;
             }
             if (j - i >= rec_min_run) {
                 run_parallel(draws.data() + i, j - i);
@@ -4751,6 +4788,7 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
                 draw(*d);
             }
             break;
+        }
         }
         }
     }
@@ -4959,9 +4997,9 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
     up_rec.lr = true;
     up_rec.submit_no = R.submit_no;
     begin_record();
-    run_copies(items);
+    run_copies(items.data(), items.size());
     pre_for = &R;
-    if (up_rec.cur != UINT32_MAX) pre_pass(items);
+    if (up_rec.cur != UINT32_MAX) pre_pass(items.data(), items.size());
     pre_for = nullptr;
     tr = &R;
     // Resolve once per plain run after its actual targets have been bound.
