@@ -145,3 +145,7 @@ add_test(NAME pc-file COMMAND pc-file-test "${CMAKE_CURRENT_BINARY_DIR}/pc-file-
 add_executable(pc-paths-test tests/pc_paths_test.cpp)
 target_include_directories(pc-paths-test PRIVATE src)
 add_test(NAME pc-paths COMMAND pc-paths-test "${CMAKE_CURRENT_BINARY_DIR}/pc-paths-test-dir")
+
+add_executable(pc-mount-test tests/pc_mount_test.cpp)
+target_include_directories(pc-mount-test PRIVATE src)
+add_test(NAME pc-mount COMMAND pc-mount-test)
