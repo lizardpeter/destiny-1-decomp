@@ -71,6 +71,32 @@ int main(){
                     check(last_mip(load<uint32_t>(object.data(),12))==(type>=14?0:mip));
                     check(release_top_mip(object.data())==(high!=0&&full==(type>=14?1:mip+1)));
                 }
+    for(unsigned i=0;i<100000;++i){
+        std::array<uint8_t,80> object{};
+        for(auto& byte:object)byte=uint8_t(rng());
+        const uint32_t kind=i%3+1;
+        store(object.data(),0x40,kind);
+        const uint32_t w=load<uint16_t>(object.data(),0x28),h=load<uint16_t>(object.data(),0x2a);
+        const uint32_t d=load<uint16_t>(object.data(),0x2c),l=object[0x31];
+        const uint32_t word1=load<uint32_t>(object.data(),4),word3=load<uint32_t>(object.data(),12);
+        const uint64_t low=rng(),high=(i&1)?rng()|1:0;
+        auto p=mip_plan(object.data(),low,high);
+        auto half=[&](uint32_t n){return n<=3?1:n/2;};
+        auto rounded=[&](uint32_t n){return object[0x35]?((half(n)+3)/4*4):half(n);};
+        check(p.width==(high?w:rounded(w))&&p.height==(high?h:rounded(h)));
+        check(p.depth==(kind==3?(high?d:half(d)):1));
+        check(p.levels==(high?l:l-1)&&p.base==(high?high:low));
+        check(p.volume==(kind==3)&&p.cube==(kind==2));
+        check(p.tile==(word3>>20&31));
+        uint32_t packed=(word1>>20&63)|(word1>>26&15)<<8;
+        for(unsigned j=0;j<4;++j)packed|=(word3>>(j*3)&7)<<(12+j*3);
+        check(p.format==packed);
+        check(p.fragments==(kind==2||word3>>28<14?0:word3>>16&15));
+        auto expected=object;
+        store(expected.data(),0,uint32_t(p.base>>8));expected[4]&=0xc0;
+        mip_base(object.data(),p.base);
+        check(object==expected);
+    }
     check(apply(16,false,nullptr,0)==Result::bound);
     std::array<uint8_t,80> obj{};
     check(apply(10,false,obj.data(),1,obj.size())==Result::rejected);

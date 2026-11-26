@@ -622,7 +622,22 @@ D1_SYSV void h_swap(uint64_t a, uint64_t b) {
 using MipFn = D1_SYSV void (*)(uint32_t, uint64_t, uint64_t);
 MipFn o_mips;
 D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
-    o_mips(handle, low_base, hi_base);
+    if(native_bind_enabled()) {
+        const uint64_t obj=nr::resreg::object_of(1,handle);
+        if(!obj)return;
+        using namespace ng::binding;
+        auto* p=reinterpret_cast<void*>(obj);
+        const auto plan=mip_plan(p,low_base,hi_base);
+        // The 2D/cube and volume descriptor constructors still own the
+        // original tile-layout calculation. Do not guess a different pitch.
+        using Construct2D=D1_SYSV uint64_t(*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+        using Construct3D=D1_SYSV uint64_t(*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+        if(plan.volume)
+            reinterpret_cast<Construct3D>(nr::g_base+0xF83AB0)(p,plan.width,plan.height,plan.depth,plan.levels,plan.format,plan.tile);
+        else
+            reinterpret_cast<Construct2D>(nr::g_base+0xF83530)(p,plan.width,plan.height,1,plan.levels,plan.format,plan.tile,plan.fragments,uint32_t(plan.cube));
+        mip_base(p,plan.base);
+    } else o_mips(handle, low_base, hi_base);
     if (const uint64_t o = nr::resreg::object_of(1, handle)) {
         nr::resreg::touch(o, true, handle);
         const uint64_t res = nr::resreg::get(o);
@@ -630,6 +645,14 @@ D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
             ng::notify_texture_mips(reinterpret_cast<const uint32_t*>(o), res, o, low_base, hi_base);
         }
     }
+}
+D1_SYSV bool h_resident(uint32_t handle) {
+    const auto obj=nr::resreg::object_of(1,handle);
+    return obj&&ng::binding::fully_resident(reinterpret_cast<const void*>(obj));
+}
+D1_SYSV void h_flags(uint32_t flags,uint32_t* a,uint32_t* b) {
+    const uint32_t value=1^((flags>>1)&1);
+    *a=value;*b=value;
 }
 using TechFn = D1_SYSV uint64_t (*)(uint64_t, uint64_t);
 using TechVoidFn = D1_SYSV void (*)(uint64_t, uint64_t);
@@ -699,6 +722,10 @@ void patch_table() {
     if (*slot(0x254EE38) && *slot(0x254EE38) != uint64_t(&h_bind)) o_bind = reinterpret_cast<SetFn>(*slot(0x254EE38)), *slot(0x254EE38) = uint64_t(&h_bind);
     if (*slot(0x254EE40) && *slot(0x254EE40) != uint64_t(&h_rebind)) o_rebind = reinterpret_cast<SetFn>(*slot(0x254EE40)), *slot(0x254EE40) = uint64_t(&h_rebind);
     if (*slot(0x254EE48) && *slot(0x254EE48) != uint64_t(&h_release)) o_release = reinterpret_cast<RelFn>(*slot(0x254EE48)), *slot(0x254EE48) = uint64_t(&h_release);
+    if(native_bind_enabled()){
+        if(*slot(0x254EE88)==nr::g_base+0x7D5520)*slot(0x254EE88)=uint64_t(&h_resident);
+        if(*slot(0x254EEA0)==nr::g_base+0x7D55C0)*slot(0x254EEA0)=uint64_t(&h_flags);
+    }
 }
 D1_SYSV void h_register(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h, uint64_t i,
                         uint64_t j, uint64_t k, uint64_t l, uint64_t mm, uint64_t n, uint64_t o, uint64_t p) {

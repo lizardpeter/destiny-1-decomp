@@ -36,9 +36,44 @@ constexpr uint32_t last_mip(uint32_t word3) {
     const uint32_t type=word3>>28;
     return type>=14?0:(word3>>16)&15;
 }
+inline bool fully_resident(const void* object) {
+    return load<uint8_t>(object,0x31)==last_mip(load<uint32_t>(object,12))+1;
+}
 inline bool release_top_mip(const void* object) {
-    return load<uint8_t>(object,0x34)!=0 &&
-           load<uint8_t>(object,0x31)==last_mip(load<uint32_t>(object,12))+1;
+    return load<uint8_t>(object,0x34)!=0 && fully_resident(object);
+}
+// 0x7D4480: pure descriptor reconstruction arguments. The remaining
+// retail layout constructors calculate the actual tile pitch/size.
+struct MipPlan {
+    uint32_t width,height,depth,levels,format,tile,fragments;
+    bool cube,volume;
+    uint64_t base;
+};
+inline MipPlan mip_plan(const void* object,uint64_t low,uint64_t high) {
+    const uint32_t word1=load<uint32_t>(object,4),word3=load<uint32_t>(object,12);
+    const uint32_t type=load<uint32_t>(object,0x40);
+    MipPlan p{load<uint16_t>(object,0x28),load<uint16_t>(object,0x2a),
+              load<uint16_t>(object,0x2c),load<uint8_t>(object,0x31),
+              ((word1>>20)&63)|(((word1>>26)&15)<<8)|((word3&0xfff)<<12),
+              (word3>>20)&31,(word3>>28)>=14?(word3>>16)&15:0,
+              type==2,type==3,high?high:low};
+    if(!high){
+        p.width=p.width<4?1:p.width>>1;
+        p.height=p.height<4?1:p.height>>1;
+        if(load<uint8_t>(object,0x35)){
+            p.width=(p.width+3)&0xfffc;
+            p.height=(p.height+3)&0xfffc;
+        }
+        p.depth=p.depth<4?1:p.depth>>1;
+        --p.levels; // original 32-bit subtraction, including malformed zero
+    }
+    if(!p.volume)p.depth=1;
+    if(p.cube)p.fragments=0;
+    return p;
+}
+inline void mip_base(void* object,uint64_t base) {
+    store(object,0,uint32_t(base>>8));
+    store(object,4,load<uint32_t>(object,4)&0xffffffc0u);
 }
 enum class Result { unsupported, rejected, bound };
 constexpr bool supported(uint32_t type,bool repoint) {
