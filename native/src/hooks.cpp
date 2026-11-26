@@ -20,7 +20,7 @@
 #include <mutex>
 #include "hle.h"
 #include "os.h"
-#include "render_bridge.h"
+#include "pc_frontend.h"
 #include "runtime.h"
 #include "settings.h"
 #include "frame_time_contract.h"
