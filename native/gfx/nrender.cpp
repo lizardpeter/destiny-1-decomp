@@ -2876,8 +2876,9 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
     const bool copied = snapshot ? (std::memcpy(dst,snapshot,res.size),true) :
         guest_copy_current_mapping(res.base,res.size,mapping,dst);
     std::memset(dst + res.size, 0, span.size - res.size);
-    if (!copied || guest_mapping_identity(res.base,res.size)!=mapping ||
-        (snapshot && opt.res_current(object)!=res.id)) {
+    if (!copied || (snapshot ?
+        (!guest_matches_current_mapping(res.base,res.size,mapping,snapshot)||opt.res_current(object)!=res.id) :
+        guest_mapping_identity(res.base,res.size)!=mapping)) {
         // No GPU command references this span yet; return it to the page.
         subs[rc().cur].geo_staging_used = span.offset;
         geo_free_now(block, off, res.size);
@@ -2916,7 +2917,7 @@ GeoEntry* Renderer::geo_lookup_res(uint64_t addr, uint64_t size, int index_size,
     GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
     std::unique_lock shard_lock(sh.m);
     if(snapshot && (!opt.res_current || opt.res_current(object)!=res ||
-                   guest_mapping_identity(addr,size)!=mapping))return nullptr;
+                   !guest_matches_current_mapping(addr,size,mapping,snapshot)))return nullptr;
     const void* source=snapshot?static_cast<const void*>(snapshot):reinterpret_cast<const void*>(addr);
     GeoEntry& e = sh.map[key];
     e.last_used = submit_seq.load(std::memory_order_relaxed);

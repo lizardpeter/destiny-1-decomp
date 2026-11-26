@@ -26,6 +26,7 @@
 
 #include "hle.h"
 #include "host_memory.h"
+#include "native_mapping_contract.h"
 #include "pc_mount_adapter.h"
 #include "runtime.h"
 #include "region_extent_cache.h"
@@ -229,7 +230,7 @@ static const std::pair<const uint64_t, Region>* region_of(uint64_t a) {
     auto it = g_regions.upper_bound(a);
     if (it == g_regions.begin()) return nullptr;
     --it;
-    return a < it->first + it->second.size ? &*it : nullptr;
+    return mapping_contains(it->first,it->second.size,a,1) ? &*it : nullptr;
 }
 
 // Every guest mapping the GPU has been told about (late renderer attach replays them).
@@ -257,15 +258,15 @@ void register_native_host_region(uint64_t base, uint64_t size) {
 uint64_t guest_mapping_identity(uint64_t addr, uint64_t size) {
     std::lock_guard lk(g_mem_mutex);
     const auto* r = region_of(addr);
-    if (!r || !size || size > r->second.size - (addr - r->first)) return 0;
+    if (!r || !mapping_contains(r->first,r->second.size,addr,size)) return 0;
     return r->second.identity;
 }
 bool guest_copy_current_mapping(uint64_t addr, uint64_t size, uint64_t identity, void* destination) {
     if (!identity || !size || !destination) return false;
     std::lock_guard lk(g_mem_mutex);
     const auto* r=region_of(addr);
-    if (!r || r->second.identity!=identity || size>r->second.size-(addr-r->first) ||
-        !(host_prot(r->second.prot)&os::kRead)) return false;
+    if (!r || !mapping_allows(r->first,r->second.size,r->second.identity,addr,size,identity,
+                              host_prot(r->second.prot),os::kRead)) return false;
     std::memcpy(destination,reinterpret_cast<const void*>(addr),size);
     return true;
 }
@@ -273,8 +274,8 @@ bool guest_matches_current_mapping(uint64_t addr,uint64_t size,uint64_t identity
     if(!identity||!size||!snapshot)return false;
     std::lock_guard lk(g_mem_mutex);
     const auto* r=region_of(addr);
-    return r&&r->second.identity==identity&&size<=r->second.size-(addr-r->first)&&
-           (host_prot(r->second.prot)&os::kRead)&&
+    return r&&mapping_allows(r->first,r->second.size,r->second.identity,addr,size,identity,
+                            host_prot(r->second.prot),os::kRead)&&
            std::memcmp(reinterpret_cast<const void*>(addr),snapshot,size)==0;
 }
 bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
@@ -282,8 +283,8 @@ bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity
     if (!identity || !size || !write) return false;
     std::lock_guard lk(g_mem_mutex);
     const auto* r = region_of(addr);
-    if (!r || r->second.identity != identity || size > r->second.size - (addr - r->first) ||
-        !(host_prot(r->second.prot) & os::kWrite)) return false;
+    if (!r || !mapping_allows(r->first,r->second.size,r->second.identity,addr,size,identity,
+                              host_prot(r->second.prot),os::kWrite)) return false;
     write(reinterpret_cast<void*>(addr), context);
     return true;
 }

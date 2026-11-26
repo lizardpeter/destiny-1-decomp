@@ -243,3 +243,7 @@ target_include_directories(native-record-fifo-test PRIVATE gfx)
 target_link_libraries(native-record-fifo-test PRIVATE Threads::Threads)
 add_test(NAME native-record-fifo COMMAND native-record-fifo-test)
 set_tests_properties(native-record-fifo PROPERTIES TIMEOUT 60)
+
+add_executable(native-mapping-contract-test tests/native_mapping_contract_test.cpp)
+target_include_directories(native-mapping-contract-test PRIVATE src)
+add_test(NAME native-mapping-contract COMMAND native-mapping-contract-test)
