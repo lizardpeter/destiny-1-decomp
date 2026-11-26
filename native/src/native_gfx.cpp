@@ -699,8 +699,6 @@ D1_SYSV bool release(uint64_t address,uint64_t bytes,uint32_t tag,uint8_t top,in
 }
 // The outer callers (including AF8F0) already hold the allocator lock.
 // B34F0 is the common container-release boundary, not a GPU-only hook.
-using ContainerReleaseFn=D1_SYSV bool(*)(uint32_t);
-ContainerReleaseFn original_container_release;
 D1_SYSV bool release_container(uint32_t id){
     const uint64_t table=nr::g_base+0x1ad5000;
     // The recovered fixed table has 465 entries of 320 bytes. Reject
@@ -714,18 +712,14 @@ D1_SYSV bool release_container(uint32_t id){
         });
 }
 bool install(){
-    const char* v=std::getenv("D1_PC_NATIVE_ASSET_BACKING");
-    if(v&&std::atoi(v)==0)return true;
+    // Required native production cohorts. The individual allocator
+    // functions still explicitly identify unreconstructed cases.
     bool ok=hook(0xB4780,&reserve,original_reserve,"asset_region_reserve");
     ok&=hook(0xB4630,&commit,original_commit,"asset_region_commit");
-    const char* sub=std::getenv("D1_PC_NATIVE_ASSET_SUBALLOC");
-    if(!sub||std::atoi(sub)!=0){
-        ok&=hook(0xB2BD0,&allocate,original_alloc,"asset_region_suballocate");
-        ok&=hook(0xB2F40,&release,original_free,"asset_region_release");
-    }
-    const char* containers=std::getenv("D1_PC_NATIVE_CONTAINER_RELEASE");
-    if(!containers||std::atoi(containers)!=0)
-        ok&=hook(0xB34F0,&release_container,original_container_release,"asset_container_release");
+    ok&=hook(0xB2BD0,&allocate,original_alloc,"asset_region_suballocate");
+    ok&=hook(0xB2F40,&release,original_free,"asset_region_release");
+    ok&=replace_eboot_function(0xB34F0,reinterpret_cast<const void*>(&release_container));
+    if(!ok)log("nd: required native asset backing/release installation failed");
     return ok;
 }
 } // namespace asset_backing
@@ -734,8 +728,6 @@ bool install(){
 namespace resev {
 // 0x6FBC0 destroys a package datum pool, clears its occupancy bit and
 // zeroes the descriptor. This is a lifetime boundary, unlike mip release.
-using PoolFreeFn = D1_SYSV void (*)(uint32_t);
-PoolFreeFn o_pool_free;
 D1_SYSV void h_pool_free(uint32_t value) {
     const uint32_t pool=value&0x3FFFu;
     auto* registry=nr::resreg::g_registry;
@@ -750,11 +742,7 @@ D1_SYSV void h_pool_free(uint32_t value) {
         auto gate=ng::texture_leases().retire();
         retiring=registry&&registry->begin_pool_retire(pool);
     }
-    static const bool native=[]{
-        const char* v=std::getenv("D1_PC_NATIVE_POOL_DESTROY");
-        return !v||std::atoi(v)!=0;
-    }();
-    if(native){
+    {
         using Notify=D1_SYSV void(*)(uint32_t,uint32_t);
         using ReleaseTag=D1_SYSV bool(*)(uint32_t);
         ng::pool::destroy(value,root,[](uint32_t i,uint16_t kind){
@@ -766,7 +754,7 @@ D1_SYSV void h_pool_free(uint32_t value) {
               // now-replaced B34F0 body for every container release.
               reinterpret_cast<ReleaseTag>(nr::g_base+0xaf8f0)(tag);
           });
-    }else o_pool_free(value);
+    }
     if(retiring){
         auto gate=ng::texture_leases().retire();
         registry->end_pool_retire(pool);
@@ -774,15 +762,6 @@ D1_SYSV void h_pool_free(uint32_t value) {
 }
 uint64_t tex_base(const uint32_t* t) { return (uint64_t(t[0]) | uint64_t(t[1] & 0xFF) << 32) << 8; }
 // Both switch dispatchers and their leaves define AL, not full RAX.
-using SetFn = D1_SYSV bool (*)(uint32_t, uint32_t, uint64_t);
-SetFn o_bind, o_rebind;
-bool native_bind_enabled() {
-    static const bool enabled=[] {
-        const char* v=std::getenv("D1_PC_NATIVE_BIND");
-        return (!v||std::atoi(v)!=0);
-    }();
-    return enabled;
-}
 // The retail high-mip bind at CBAA4 is followed immediately by E01E0.
 // Keep the publication gate across that pair, not across unrelated calls.
 thread_local decltype(ng::texture_leases().retire()) pending_mip_bind;
@@ -793,7 +772,7 @@ bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint,bool
     // have their own binding contracts.
     decltype(ng::texture_leases().retire()) texture_transaction;
     if(type>=1&&type<=3)texture_transaction=ng::texture_leases().retire();
-    if(native_bind_enabled()) {
+    {
         using namespace ng::binding;
         if(!supported(type,repoint))return false;
         if(type==16)return true;
@@ -811,12 +790,6 @@ bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint,bool
             return true;
         }
     }
-    const bool ok=(repoint?o_rebind:o_bind)(type,handle,addr);
-    if(ok){
-        if(paired&&texture_transaction.owns_lock())pending_mip_bind=std::move(texture_transaction);
-        else nr::resreg::event(type,handle,true);
-    }
-    return ok;
 }
 D1_SYSV bool h_bind(uint32_t type,uint32_t handle,uint64_t addr) {
     const auto caller=uint64_t(__builtin_return_address(0));
@@ -825,10 +798,8 @@ D1_SYSV bool h_bind(uint32_t type,uint32_t handle,uint64_t addr) {
 D1_SYSV bool h_rebind(uint32_t type,uint32_t handle,uint64_t addr) {
     return resource_bind(type,handle,addr,true);
 }
-using RelFn = D1_SYSV void (*)(uint32_t, uint32_t);
-RelFn o_release;
 D1_SYSV void h_release(uint32_t type, uint32_t handle) {
-    if(native_bind_enabled()) {
+    {
         // 0x7D2FE0: all non-texture cases are RET-only or unsupported.
         // 0x7D43E0: release a high mip only when the full chain is resident.
         // The mip callback owns the actual epoch publication. Do not retire
@@ -842,8 +813,6 @@ D1_SYSV void h_release(uint32_t type, uint32_t handle) {
         }
         return;
     }
-    o_release(type, handle);
-    nr::resreg::event(type, handle, false);
 }
 // 0x7DAA60 and 0x7DB230: process-lifetime native queue storage and
 // completion label. No package allocator, GPU direct-memory allocation or
@@ -1051,8 +1020,6 @@ D1_SYSV bool h_blit_complete() {
                                              __ATOMIC_SEQ_CST,__ATOMIC_ACQUIRE));
     }
 }
-using Two = D1_SYSV void (*)(uint64_t, uint64_t);
-Two o_copy, o_swap;
 namespace relocation {
 using Unary=D1_SYSV void(*)(uint64_t);
 using ClockFn=D1_SYSV uint32_t(*)();
@@ -1185,13 +1152,11 @@ void swap(uint32_t a,uint32_t b){
 }
 } // namespace relocation
 D1_SYSV void h_copy(uint64_t a, uint64_t b) {
-    if(native_bind_enabled())relocation::copy(uint32_t(a),uint32_t(b));
-    else o_copy(a,b);
+    relocation::copy(uint32_t(a),uint32_t(b));
     nr::resreg::event_any(uint32_t(a)), nr::resreg::event_any(uint32_t(b));
 }
 D1_SYSV void h_swap(uint64_t a, uint64_t b) {
-    if(native_bind_enabled())relocation::swap(uint32_t(a),uint32_t(b));
-    else o_swap(a,b);
+    relocation::swap(uint32_t(a),uint32_t(b));
     nr::resreg::event_any(uint32_t(a)), nr::resreg::event_any(uint32_t(b));
 }
 namespace texture_constructor {
@@ -1381,8 +1346,6 @@ D1_SYSV void h_mip_relocation(uint64_t tag,uint32_t low,uint32_t high){
             if(callback)callback(resource,mip_bounds.low,mip_bounds.high);
         });
 }
-using MipFn = D1_SYSV void (*)(uint32_t, uint64_t, uint64_t);
-MipFn o_mips;
 D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
     // A descriptor and its two source allocations belong to one published
     // generation. Draw capture cannot observe the constructor's partial writes.
@@ -1404,7 +1367,7 @@ D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
             }
         }
     }
-    if(native_bind_enabled()) {
+    {
         const uint64_t obj=nr::resreg::object_of(1,handle);
         if(!obj)return;
         using namespace ng::binding;
@@ -1419,7 +1382,7 @@ D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
         else
             reinterpret_cast<Construct2D>(nr::g_base+0xF83530)(p,plan.width,plan.height,1,plan.levels,plan.format,plan.tile,plan.fragments,uint32_t(plan.cube));
         mip_base(p,plan.base);
-    } else o_mips(handle, low_base, hi_base);
+    }
     if (const uint64_t o = nr::resreg::object_of(1, handle)) {
         // Do not associate this callback's addresses with a newer epoch
         // published by another resource event between touch and lookup.
@@ -1504,10 +1467,10 @@ using RegFn = D1_SYSV void (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
 RegFn o_register;
 void patch_table() {
     auto slot = [](uint64_t off) { return reinterpret_cast<uint64_t*>(nr::g_base + off); };
-    if (*slot(0x254EE38) && *slot(0x254EE38) != uint64_t(&h_bind)) o_bind = reinterpret_cast<SetFn>(*slot(0x254EE38)), *slot(0x254EE38) = uint64_t(&h_bind);
-    if (*slot(0x254EE40) && *slot(0x254EE40) != uint64_t(&h_rebind)) o_rebind = reinterpret_cast<SetFn>(*slot(0x254EE40)), *slot(0x254EE40) = uint64_t(&h_rebind);
-    if (*slot(0x254EE48) && *slot(0x254EE48) != uint64_t(&h_release)) o_release = reinterpret_cast<RelFn>(*slot(0x254EE48)), *slot(0x254EE48) = uint64_t(&h_release);
-    if(native_bind_enabled()){
+    if (*slot(0x254EE38)) *slot(0x254EE38) = uint64_t(&h_bind);
+    if (*slot(0x254EE40)) *slot(0x254EE40) = uint64_t(&h_rebind);
+    if (*slot(0x254EE48)) *slot(0x254EE48) = uint64_t(&h_release);
+    {
         if(*slot(0x254EE88)==nr::g_base+0x7D5520)*slot(0x254EE88)=uint64_t(&h_resident);
         if(*slot(0x254EEA0)==nr::g_base+0x7D55C0)*slot(0x254EEA0)=uint64_t(&h_flags);
     }
@@ -1521,15 +1484,19 @@ D1_SYSV void h_register(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t
 bool install() {
     bool ok = true;
     nr::resreg::init();
-    // Preserve the original free body and its callbacks. The default
-    // native resource path requires this lifetime boundary.
-    ok &= hook(0x6FBC0,&h_pool_free,o_pool_free,"resource_pool_destroy");
+    // Complete source-defined bodies have no retail trampoline.
+    auto replace=[&](uint64_t address,const void* fn,const char* name){
+        const bool installed=replace_eboot_function(address,fn);
+        if(!installed)log("nd: required native replacement %s (eboot+%#llx) failed",name,(unsigned long long)address);
+        return installed;
+    };
+    ok &= replace(0x6FBC0,reinterpret_cast<const void*>(&h_pool_free),"resource_pool_destroy");
     ok &= hook(0xCFCC0, &h_register, o_register, "resource_callbacks_register");
     if (!replace_eboot_function(0x818FA0, reinterpret_cast<const void*>(&h_unlock))) ok = false, log("nd: replacing texture_unlock failed");
     patch_table();
-    ok &= hook(0x7D3560, &h_copy, o_copy, "resource_move_copy");
-    ok &= hook(0x7D37B0, &h_swap, o_swap, "resource_move_commit");
-    const bool mip_hook=hook(0x7D4480, &h_mips, o_mips, "texture_mips");
+    ok &= replace(0x7D3560,reinterpret_cast<const void*>(&h_copy),"resource_move_copy");
+    ok &= replace(0x7D37B0,reinterpret_cast<const void*>(&h_swap),"resource_move_commit");
+    const bool mip_hook=replace(0x7D4480,reinterpret_cast<const void*>(&h_mips),"texture_mips");
     const bool handle_hook=replace_eboot_function(0xE01E0,reinterpret_cast<const void*>(&h_mip_handles));
     if(!handle_hook)log("nd: replacing native texture_mip_handle_bounds (eboot+0xe01e0) failed");
     else log("nd: native texture_mip_handle_bounds replacement installed");
@@ -1537,7 +1504,7 @@ bool install() {
     const bool relocation_hook=replace_eboot_function(0xE00D0,reinterpret_cast<const void*>(&h_mip_relocation));
     if(!relocation_hook)log("nd: replacing native texture_mip_relocation_bounds (eboot+0xe00d0) failed");
     ok &= relocation_hook;
-    if(native_bind_enabled()){
+    {
         ok &= hook(0xF89BD0,&texture_constructor::calculate_footprint,texture_constructor::original_footprint,"texture_footprint");
         ok &= replace_eboot_function(0xF83530,reinterpret_cast<const void*>(&texture_constructor::build_2d));
         ok &= replace_eboot_function(0xF83AB0,reinterpret_cast<const void*>(&texture_constructor::build_3d));
@@ -2225,10 +2192,8 @@ D1_SYSV void s_dma(uint64_t cb, uint64_t dst, uint64_t src, uint32_t bytes) {
     ng::Draw* d = nr::alloc_draw();
     d->kind = ng::Draw::Dma;
     d->index_addr = src, d->caller = dst, d->count = bytes, d->prim = 0, d->index32 = 0;
-    if(resev::native_bind_enabled()){
-        d->dma_checked=true;
-        guest_capture_move_spans(dst,src,bytes,d->dma_dst_spans,d->dma_src_spans);
-    }
+    d->dma_checked=true;
+    guest_capture_move_spans(dst,src,bytes,d->dma_dst_spans,d->dma_src_spans);
     add(c, d);
 }
 D1_SYSV void s_set_cbs(uint64_t cue, uint32_t stage, uint32_t first, uint32_t count, const uint32_t* vs) {
