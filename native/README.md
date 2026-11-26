@@ -120,6 +120,7 @@ Native renderer (`native/gfx`):
 | Legacy frame skipping | Removed: all submitted frames execute on the native renderer; no fabricated occlusion results |
 | `D1_NG_NOCACHE=1` | no geometry cache and no texture change tracking |
 | Native device | Required; startup fails if the native renderer or required device hooks cannot be installed. The retail submit boundary associates engine record addresses with native lists, not packet tokens |
+| `D1_PC_NATIVE_CLOSE=1` | Experimental source-defined main/worker command-list close, without fabricated command-buffer extent. Keeps original ring, segment accounting and completion labels; not yet live-validated |
 | Early recording | Retail device adapter now records only in actual submit order, including the original close-time completion labels. Parallel native secondary command recording remains enabled |
 | `D1_ND_RES=0` | the engine's GPU resources (textures, vertex and index buffers) are tracked by write-protecting their memory again, instead of by the engine's own resource events (default: kept per resource and epoch, see docs/gpu-resources.md). The log's "engine resources" line counts uses, moves with the same contents and real changes |
 | `D1_NG_PREFETCH=0` | engine resources are uploaded at their first draw instead of on the renderer's loader thread when the engine binds or moves them (default). The log's "loader" line counts uploads ahead of use, moves kept and work dropped because the resource changed again |

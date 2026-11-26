@@ -34,6 +34,7 @@
 #include "frame_telemetry.h"
 #include "host_memory.h"
 #include "native_record_registry.h"
+#include "../gfx/native_close_contract.h"
 #include "../gfx/native_resource_identity.h"
 #include "runtime.h"
 #include "tiling.h"
@@ -791,12 +792,82 @@ D1_SYSV void h_begin_inherit(uint64_t dev, uint64_t rec, uint64_t a, uint64_t sa
     o_begin_inherit(dev, rec, a, saved);
     begin_list(dev);
 }
+bool native_close_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("D1_PC_NATIVE_CLOSE");
+        return v && std::atoi(v)!=0;
+    }();
+    return enabled;
+}
+template<class T> void put_field(uint64_t base,uint64_t offset,T value) {
+    std::memcpy(reinterpret_cast<void*>(base+offset),&value,sizeof value);
+}
+// Source-defined close for ordinary and worker command lists. The engine
+// still owns its ordered ring and its progress labels, but native work does
+// not need a fake nonzero DCB extent. Preserve any genuine segment metadata.
+void native_close(uint64_t dev,uint32_t kind,bool worker) {
+    const int c=ctx_of_dev(dev);
+    const uint64_t global=field<uint64_t>(dev,0),gfx=field<uint64_t>(dev,0x50),rec=field<uint64_t>(dev,0x58);
+    if(c<0||!global||!gfx||!rec) {
+        log("nd: invalid native close context");
+        std::abort();
+    }
+    List* list=list_of(c);
+    const uint64_t label_state=nr::g_base+0x26E4840;
+    const uint32_t label_index=field<uint32_t>(rec,0x1C);
+    const auto plan=ng::close_plan(kind,nr::eb<uint8_t>(0x26DF291),worker);
+    // 0x7EF3A0 updates the engine's dependency label and invokes the
+    // already-native EOP callback before the record is made ready.
+    using CloseLabel=D1_SYSV void(*)(uint64_t,uint32_t,uint32_t,uint64_t,uint64_t);
+    reinterpret_cast<CloseLabel>(nr::g_base+0x7EF3A0)(label_state,plan.label_flag,label_index,rec,gfx);
+    uint32_t completed=0,previous=0;
+    if(worker) {
+        previous=field<uint32_t>(global,0xBC);
+        completed=field<uint32_t>(field<uint64_t>(label_state,0x20),0);
+    }
+    if(plan.update_progress) {
+        put_field(global,0xBC,field<uint32_t>(global,0xB8));
+        put_field(global,0xB8,field<uint32_t>(field<uint64_t>(label_state,0),uint64_t(label_index)*8));
+    }
+    // 0x7DB810 also has intermediate-segment callers (0x7DC140).
+    // Leave it intact: it records actual ranges and diagnostic fields only.
+    using Segment=D1_SYSV void(*)(uint64_t,uint64_t,uint32_t,uint32_t,uint32_t);
+    reinterpret_cast<Segment>(nr::g_base+0x7DB810)(rec,gfx,plan.segment_kind,plan.segment_hint,1);
+    put_field(gfx,0,field<uint64_t>(gfx,0x10));
+    put_field(gfx,0x80,field<uint64_t>(gfx,0x90));
+    if(!worker)put_field(rec,0x28,uint8_t(plan.flip));
+    // All close-time events are captured now. Publish before either the
+    // already-enqueued worker record or the main ring entry becomes ready.
+    if(!g_records.publish(rec,list)) {
+        log("nd: native close record reused before submission (%#llx)",(unsigned long long)rec);
+        std::abort();
+    }
+    clear_current(dev,list);
+    __atomic_exchange_n(reinterpret_cast<uint32_t*>(rec+0x18),1u,__ATOMIC_SEQ_CST);
+    if(plan.append_ring) {
+        put_field(global,0x2D0,field<uint32_t>(global,0x2D0)+1);
+        const uint32_t tail=field<uint32_t>(global,0x2C8),slot=ng::record_ring_slot(tail);
+        put_field(global,0xC8+uint64_t(slot)*8,rec);
+        put_field(global,0xC0,field<uint32_t>(global,0xC0)+1);
+        put_field(rec,0x930,slot);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        put_field(global,0x2C8,tail+1);
+        put_field(global,0xB4,field<uint32_t>(global,0xB4)^1u);
+    }
+    put_field(dev,0x50,uint64_t(0));
+    put_field(dev,0x58,uint64_t(0));
+    // Worker records were enqueued by 0x7DEA90 before recording started.
+    if(worker&&ng::worker_should_submit(completed,previous,nr::eb<uint8_t>(0x18DCC30)))
+        reinterpret_cast<Dev1Fn>(nr::g_base+0x7DD060)(dev);
+}
 D1_SYSV void h_end(uint64_t dev, uint64_t rec, uint64_t kind) {
+    if(native_close_enabled()) {native_close(dev,uint32_t(kind),false);return;}
     List* list = end_list(dev);
     o_end(dev, rec, kind);
     clear_current(dev, list);
 }
 D1_SYSV void h_end_submit(uint64_t dev) {
+    if(native_close_enabled()) {native_close(dev,0,true);return;}
     List* list = end_list(dev);
     o_end_submit(dev);
     clear_current(dev, list);
@@ -1372,7 +1443,12 @@ struct NativeSubmission {
 };
 NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
     auto batch = std::make_unique<NativeSubmission>();
-    nd::List* submitted = nd::g_records.take(uint64_t(dcbs), count);
+    // In the experimental close path a native list can have zero actual
+    // retail command-buffer segments. The record identity remains authoritative.
+    const uint64_t array=uint64_t(dcbs);
+    nd::List* submitted = nd::native_close_enabled() && count<=64 && array>0x30
+        ? nd::g_records.take_record(array-0x30)
+        : nd::g_records.take(array,count);
     if (!submitted) {
         log("nd: unknown retail submission record %#llx (%u segments); no compatibility packet fallback",
             (unsigned long long)uint64_t(dcbs), count);

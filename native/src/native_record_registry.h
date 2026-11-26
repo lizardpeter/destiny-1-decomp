@@ -23,14 +23,20 @@ public:
         std::lock_guard lock(mutex_);
         return published_.emplace(address, list).second;
     }
-    List* take(uint64_t array_address, uint32_t segments) {
-        if (!array_address || !segments || segments > 64) return nullptr;
+    List* take_record(uint64_t record) {
+        const uint64_t address=key(record);
+        if (!address) return nullptr;
         std::lock_guard lock(mutex_);
-        const auto it = published_.find(array_address);
+        const auto it = published_.find(address);
         if (it == published_.end()) return nullptr;
         List* list = it->second;
         published_.erase(it);
         return list;
+    }
+    // Only the old retail import adapter validates segment count.
+    List* take(uint64_t array_address,uint32_t segments) {
+        if(array_address<=dcb_array_offset||!segments||segments>64)return nullptr;
+        return take_record(array_address-dcb_array_offset);
     }
     void abandon(List* list) {
         if (!list) return;

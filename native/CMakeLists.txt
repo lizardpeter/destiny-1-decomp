@@ -229,3 +229,7 @@ target_include_directories(native-resource-identity-test PRIVATE gfx)
 target_link_libraries(native-resource-identity-test PRIVATE Threads::Threads)
 add_test(NAME native-resource-identity COMMAND native-resource-identity-test)
 set_tests_properties(native-resource-identity PROPERTIES TIMEOUT 60)
+
+add_executable(native-close-contract-test tests/native_close_contract_test.cpp)
+target_include_directories(native-close-contract-test PRIVATE gfx)
+add_test(NAME native-close-contract COMMAND native-close-contract-test)

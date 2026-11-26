@@ -26,6 +26,10 @@ int main() {
     require(!registry.take(0x1030, 1));
     require(registry.publish(0x1000, &b));
     require(registry.take(0x1030, 64) == &b);
+    require(registry.publish(0x1000,&a));
+    require(!registry.take(0x1030,0));
+    require(registry.take_record(0x1000)==&a);
+    require(!registry.take_record(0x1000));
     registry.abandon(&a);
     registry.abandon(&b);
     registry.abandon(nullptr);
