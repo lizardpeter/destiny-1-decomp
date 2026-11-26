@@ -10,8 +10,8 @@ class Service {
     Queue queue_;
 public:
     Service(const std::filesystem::path& assets, const std::filesystem::path& data,
-            unsigned workers = 2, size_t max_operations = 1024)
-        : paths_(assets, data), queue_(workers, max_operations) {}
+            unsigned workers = 2, size_t max_operations = 1024, uint64_t max_bytes = 256ull << 20)
+        : paths_(assets, data), queue_(workers, max_operations, max_bytes) {}
     Queue::Id open(Root root, const std::filesystem::path& name, OpenOptions options, std::error_code& ec) {
         auto f = paths_.open(root, name, options, ec);
         return f ? queue_.attach(std::move(f), ec) : 0;
@@ -24,6 +24,10 @@ public:
     Queue::Id write_at(Queue::Id id, uint64_t off, const void* data, uint64_t n, Queue::Callback cb, std::error_code& ec) {
         return queue_.write_at(id, off, data, n, std::move(cb), ec);
     }
+    Queue::Id read_staged(Queue::Id id, uint64_t off, uint64_t n, Queue::Delivery delivery, Queue::Callback cb, std::error_code& ec) {
+        return queue_.read_staged(id, off, n, std::move(delivery), std::move(cb), ec);
+    }
+    uint64_t staging_bytes() const { return queue_.staging_bytes(); }
     Result wait(Queue::Id id) { return queue_.wait(id); }
     bool poll(Queue::Id id, Result& result) { return queue_.poll(id, result); }
     bool forget(Queue::Id id) { return queue_.forget(id); }
