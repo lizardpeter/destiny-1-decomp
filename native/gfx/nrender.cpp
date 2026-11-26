@@ -750,6 +750,12 @@ struct Renderer {
     std::mutex load_m;
     std::condition_variable load_cv;
     std::deque<LoadJob> load_q;
+    std::unordered_set<uint64_t> load_pending; // speculative work only; first use remains authoritative
+    static uint64_t load_key(const LoadJob& j) {
+        uint64_t h = mix(mix(mix(j.kind, j.res), j.obj), mix(j.base, j.size));
+        if (j.kind == 1) h = mix(h, hash_bytes(j.t, sizeof j.t));
+        return h;
+    }
     std::thread loader;
     bool load_on = false;
     std::atomic<uint64_t> ld_tex{0}, ld_moves{0}, ld_buf{0}, ld_stale{0}, ld_skipped{0}, ld_dropped{0}, ld_ns{0};
@@ -761,7 +767,12 @@ struct Renderer {
         if (!load_on) return;
         {
             std::lock_guard lk(load_m);
-            if (load_q.size() >= 20000) load_q.pop_front(), ++ld_dropped;  // (the draws upload what is dropped)
+            if (!load_pending.insert(load_key(j)).second) return;
+            if (load_q.size() >= 20000) {
+                load_pending.erase(load_key(load_q.front()));
+                load_q.pop_front();
+                ++ld_dropped; // draws upload anything that was dropped
+            }
             load_q.push_back(j);
         }
         load_cv.notify_one();
@@ -3159,7 +3170,10 @@ uint64_t Renderer::shader_code_hash(const uint8_t* obj, bool vs, uint64_t res) {
     if (!obj || uint64_t(obj) < 0x10000) return 0;
     const uint64_t ok = shader_object_key(obj, vs, res);
     auto it = obj_code_hash.find(ok);
-    if (it != obj_code_hash.end()) return it->second;
+    if (it != obj_code_hash.end()) {
+        if (res) hash_to_obj[mix(it->second, vs)] = {obj, res};
+        return it->second;
+    }
     const GnmShader g = parse_shader(obj, vs);
     if (!g.code || !g.code_size) return 0;
     uint64_t h = mix(hash_bytes(g.code, g.code_size), g.fetch && g.fetch_size ? hash_bytes(g.fetch, g.fetch_size) : 0);
@@ -3170,7 +3184,7 @@ uint64_t Renderer::shader_code_hash(const uint8_t* obj, bool vs, uint64_t res) {
     for (uint16_t semantic : g.semantics) h = mix(h, semantic);
     h = mix(h, g.semantics.size()) | 1ull;
     obj_code_hash[ok] = h;
-    hash_to_obj[mix(h, vs)] = {obj, res};
+    if (res) hash_to_obj[mix(h, vs)] = {obj, res};
     return h;
 }
 
@@ -4924,6 +4938,10 @@ void Renderer::start_loader() {
             else if (j.kind == 0) load_buffer(j);
             else load_shader(j);
             ld_ns += now_ns() - t0;
+            {
+                std::lock_guard lk(load_m);
+                load_pending.erase(load_key(j));
+            }
         }
     });
     loader.detach();
