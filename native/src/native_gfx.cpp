@@ -285,7 +285,7 @@ void init() {
 ng::Draw* alloc_draw();
 
 thread_local uint64_t t_capture_dev = 0;
-ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
+ng::Draw* capture(uint64_t dev,uint32_t engine_prim,uint64_t caller=0,bool capture_vertices=true,bool capture_material=true) {
     t_capture_dev = dev;
     auto* d = alloc_draw();
     d->caller = caller ? caller - g_base : 0;
@@ -294,6 +294,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
     d->ps = reinterpret_cast<const uint8_t*>(field<uint64_t>(dev, kPsShader));
     const uint64_t ctx = field<uint64_t>(dev, 0x50);
     d->order = ctx ? field<uint64_t>(ctx, 0x10) : 0;
+    if(capture_material){
     DevState* ds = dev_state(dev);
     CueState* cs = ctx ? cue_state(ctx + 0xC0, false) : nullptr;
     {
@@ -302,7 +303,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
     auto gate=ng::texture_leases().capture();
     auto* leases=nd_texture_leases(dev);
     uint64_t vbsig = 0;
-    if (const uint64_t decl = field<uint64_t>(dev, kVertexDecl)) {
+    if(capture_vertices)if (const uint64_t decl = field<uint64_t>(dev, kVertexDecl)) {
         const uint32_t n = std::min(field<uint32_t>(decl, 0), 16u);
         d->num_vb = n;
         // A vertex declaration describes attributes, not independent resources.
@@ -385,6 +386,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
             }
             d->cb[s][i] = cs ? cs->cb[s][i] : ds->cb[s][i];
         }
+    }
     }
     }
     d->clip = field<uint32_t>(dev, 0x25D0);
@@ -536,7 +538,7 @@ D1_SYSV void r_draw_quads(uint64_t dev, uint32_t prim, uint64_t first, int32_t p
 D1_SYSV void r_draw_inline(uint64_t dev, uint32_t prim, int32_t prims, const void* data, int32_t stride) {
     const uint64_t decl = field<uint64_t>(dev, kVertexDecl);
     if (decl && data) {
-        ng::Draw* d = nr::capture(dev, prim, uint64_t(__builtin_return_address(0)));
+        ng::Draw* d = nr::capture(dev,prim,uint64_t(__builtin_return_address(0)),false);
         d->kind = ng::Draw::Auto;
         d->count = nr::vertex_count(prim, uint32_t(prims));
         d->inline_vertices.assign(static_cast<const uint8_t*>(data),
@@ -559,7 +561,9 @@ D1_SYSV void r_draw_inline(uint64_t dev, uint32_t prim, int32_t prims, const voi
 }
 D1_SYSV void r_clear(uint64_t dev, uint32_t flags) {
     if (flags & 0xFC) {
-        ng::Draw* d = nr::capture(dev, 0);
+        // Native Vulkan attachment clears do not consume a material or
+        // vertex allocation. Do not resolve or pin any of those resources.
+        ng::Draw* d = nr::capture(dev,0,0,false,false);
         d->kind = ng::Draw::Clear;
         d->clear_flags = uint8_t(flags);
         std::memcpy(d->clear_color, reinterpret_cast<const void*>(dev + 0x40), 16);
