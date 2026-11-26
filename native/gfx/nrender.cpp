@@ -382,6 +382,8 @@ struct Stats {
     uint64_t t_wait = 0, t_submit = 0;  // waiting for the GPU (fences), vkQueueSubmit2
     uint64_t t_acquire = 0, t_present_call = 0, t_frame_end = 0, t_cache_save = 0;
     uint64_t max_acquire = 0, max_present_call = 0, max_frame_end = 0, max_cache_save = 0;
+    double gpu_span_ns = 0, gpu_span_max_ns = 0;
+    uint64_t gpu_span_count = 0;
     // engine resources: uses with an unchanged epoch, moves with the same contents, real changes
     uint64_t res_hits = 0, res_moves = 0, res_changed = 0, geo_res_hits = 0, geo_res_moves = 0, geo_res_changed = 0;
     uint64_t res_verify_ok = 0, res_verify_missed = 0;
@@ -441,6 +443,7 @@ struct Sub {
     // occlusion counting (ZPASS_DONE dumps): one query per stretch of draws between two dumps
     // (and render pass boundaries); a dump's counter is the sum of the stretches before it
     VkQueryPool qpool = VK_NULL_HANDLE;
+    VkQueryPool timepool = VK_NULL_HANDLE;
     uint32_t q_used = 0;
     struct ZRec { uint64_t dest; uint32_t boundary; };
     std::vector<ZRec> zrecs;
@@ -482,6 +485,7 @@ struct Swapchain {
     VkExtent2D extent{};
     std::vector<VkImage> images;
     std::vector<VkSemaphore> acquired;  // per frame slot
+    std::vector<uint64_t> acquire_serial; // last submission consuming each acquire semaphore
     std::vector<VkSemaphore> ready;     // per swapchain image
     uint32_t slot = 0;
     bool failed = false;     // no surface / no swapchain support: stop trying
@@ -556,6 +560,7 @@ struct Renderer {
     uint16_t alloc_bindless_view(VkImageView v, uint8_t dim, uint8_t kind);
     void free_bindless_view(uint16_t id, uint8_t dim, uint8_t kind);
     Stats st;
+    uint32_t timestamp_bits = 0; // zero: timing disabled or unsupported
 
     // per-submission recording state
 
@@ -1219,6 +1224,15 @@ bool Renderer::init(const Options& o) {
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = ctx.queue_family;
     vkCreateCommandPool(ctx.device, &pci, nullptr, &pool);
+    if (const char* v = std::getenv("D1_NG_GPU_TIMING"); v && std::atoi(v)) {
+        uint32_t n = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(ctx.gpu, &n, nullptr);
+        std::vector<VkQueueFamilyProperties> families(n);
+        vkGetPhysicalDeviceQueueFamilyProperties(ctx.gpu, &n, families.data());
+        if (ctx.queue_family < n) timestamp_bits = families[ctx.queue_family].timestampValidBits;
+        log("native renderer: GPU submission timestamp timing %s (%u bits, %.3f ns/tick)",
+            timestamp_bits ? "enabled" : "unsupported", timestamp_bits, double(ctx.props.limits.timestampPeriod));
+    }
     // command buffers: enough for a few frames of several submissions each
     subs.resize(256);  // ~30 submissions a frame, a few frames in flight
     res_state.reset(new std::atomic<uint64_t>[256]);
@@ -1425,6 +1439,19 @@ void Renderer::begin_record() {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(sb.cmd, &bi);
+    if (timestamp_bits) {
+        if (!sb.timepool) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = 2;
+            if (vkCreateQueryPool(ctx.device, &qi, nullptr, &sb.timepool) != VK_SUCCESS)
+                sb.timepool = VK_NULL_HANDLE;
+        }
+        if (sb.timepool) {
+            vkCmdResetQueryPool(sb.cmd, sb.timepool, 0, 2);
+            vkCmdWriteTimestamp2(sb.cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, sb.timepool, 0);
+        }
+    }
     rc().dstate.valid = false;
     rc().dstate.stage_valid[0] = rc().dstate.stage_valid[1] = false;
     rc().cmd = sb.cmd;
@@ -1436,7 +1463,9 @@ void Renderer::begin_record() {
 
 void Renderer::submit(const VkSemaphoreSubmitInfo* wait, const VkSemaphoreSubmitInfo* signal) {
     if (rc().cur == UINT32_MAX) return;
-    vkEndCommandBuffer(subs[rc().cur].cmd);
+    Sub& sb = subs[rc().cur];
+    if (sb.timepool) vkCmdWriteTimestamp2(sb.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, sb.timepool, 1);
+    vkEndCommandBuffer(sb.cmd);
     submit_sub(rc().cur, wait, signal);
     rc().cur = UINT32_MAX;
     rc().cmd = VK_NULL_HANDLE;
@@ -1475,10 +1504,10 @@ void Renderer::submit_sub(uint32_t i, const VkSemaphoreSubmitInfo* wait, const V
         static int logged = 0;
         if (logged++ < 5) log("native renderer: vkQueueSubmit2 failed (%d)%s", int(r),
                               r == VK_ERROR_DEVICE_LOST ? ": the GPU device was lost" : "");
-        if (r == VK_ERROR_DEVICE_LOST) {
-            log("native renderer: cannot continue after a lost device");
-            std::_Exit(1);
-        }
+        // A failed submit will never signal its fence or timeline value. Do not
+        // enqueue a fictional in-flight submission and hang the render thread.
+        log("native renderer: cannot continue after failed queue submission");
+        std::_Exit(1);
     }
     sb.serial = serial_next++;
     sb.state = Sub::Inflight;
@@ -1538,6 +1567,18 @@ void Renderer::retire_one() {
     const uint64_t tw = now_ns();
     vkWaitForFences(ctx.device, 1, &sb.fence, VK_TRUE, UINT64_MAX);
     st.t_wait += now_ns() - tw;
+    if (sb.timepool) {
+        uint64_t ticks[2]{};
+        // The submission fence has completed: never add a query wait to the frame.
+        if (vkGetQueryPoolResults(ctx.device, sb.timepool, 0, 2, sizeof(ticks), ticks,
+                                  sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            const uint64_t mask = timestamp_bits >= 64 ? UINT64_MAX : (uint64_t(1) << timestamp_bits) - 1;
+            const double ns = double((ticks[1] - ticks[0]) & mask) * ctx.props.limits.timestampPeriod;
+            st.gpu_span_ns += ns;
+            st.gpu_span_max_ns = std::max(st.gpu_span_max_ns, ns);
+            ++st.gpu_span_count;
+        }
+    }
     write_results(i, sb.serial);
     st.readbacks += sb.readbacks.size();
     sb.readbacks.clear();
@@ -4979,6 +5020,8 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
     if (R.q_on) store_query_predicates();
     R.q_on = false;
     queue_readbacks();
+    if (subs[R.cur].timepool)
+        vkCmdWriteTimestamp2(R.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, subs[R.cur].timepool, 1);
     vkEndCommandBuffer(R.cmd);
     subs[R.cur].state = Sub::Recorded;
     subs[R.cur].copies.clear();
@@ -5391,6 +5434,8 @@ bool Renderer::make_swapchain(uint32_t w, uint32_t h) {
     sc.ready.resize(n);
     for (auto& x : sc.ready) vkCreateSemaphore(ctx.device, &si, nullptr, &x);
     sc.acquired.resize(opt.frames_in_flight + 2);
+    sc.acquire_serial.assign(sc.acquired.size(), 0);
+    sc.slot = 0;
     for (auto& x : sc.acquired) vkCreateSemaphore(ctx.device, &si, nullptr, &x);
     sc.want_w = w, sc.want_h = h, sc.stale = false;
     log("native renderer: swapchain %ux%u, %u images", ext.width, ext.height, n);
@@ -5401,7 +5446,8 @@ void Renderer::destroy_swapchain(bool keep_surface) {
     if (sc.chain || !sc.acquired.empty()) wait_idle(), vkDeviceWaitIdle(ctx.device);
     for (auto x : sc.ready) vkDestroySemaphore(ctx.device, x, nullptr);
     for (auto x : sc.acquired) vkDestroySemaphore(ctx.device, x, nullptr);
-    sc.ready.clear(), sc.acquired.clear(), sc.images.clear();
+    sc.ready.clear(), sc.acquired.clear(), sc.acquire_serial.clear(), sc.images.clear();
+    sc.slot = 0;
     if (sc.chain) vkDestroySwapchainKHR(ctx.device, sc.chain, nullptr);
     sc.chain = VK_NULL_HANDLE;
     if (!keep_surface && sc.surface) vkDestroySurfaceKHR(ctx.instance, sc.surface, nullptr), sc.surface = VK_NULL_HANDLE;
@@ -5428,6 +5474,14 @@ void Renderer::present(uint64_t addr) {
     if (!sc.chain || sc.stale || ww != sc.want_w || wh != sc.want_h)
         if (!make_swapchain(ww, wh)) return;
     const uint32_t slot = sc.slot;
+    // Binary acquire semaphores cannot be reused while a previous GPU wait is
+    // pending. Track actual submission completion rather than assuming cycling
+    // through N frame slots is sufficient.
+    if (sc.acquire_serial[slot] > serial_done) wait_serial(sc.acquire_serial[slot]);
+    // Reserve a command buffer before acquiring an image. If every slot is
+    // recorded but not submitted yet, don't acquire an image we cannot release.
+    begin_record();
+    if (rc().cur == UINT32_MAX) return;
     uint32_t index = 0;
     // (the swapchain and the queue are only used on this thread: the lock is released while
     // presentation may block, so the engine's threads keep recording)
@@ -5439,17 +5493,18 @@ void Renderer::present(uint64_t addr) {
     st.t_acquire += acquire_ns;
     st.max_acquire = std::max(st.max_acquire, acquire_ns);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        submit();
         sc.stale = true;
         return;
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         static int logged = 0;
         if (logged++ < 5) log("native renderer: vkAcquireNextImageKHR failed (%d)", int(r));
+        submit();
         if (r == VK_ERROR_SURFACE_LOST_KHR) destroy_swapchain(false);
         return;
     }
     sc.slot = (slot + 1) % uint32_t(sc.acquired.size());
-    begin_record();
     // sRGB-format sources: copy the bytes into a UNORM image first (a blit would decode them)
     Image* from = src;
     if (const VkFormat uf = unorm_of(src->format); uf != VK_FORMAT_UNDEFINED) {
@@ -5513,6 +5568,7 @@ void Renderer::present(uint64_t addr) {
     signal.semaphore = sc.ready[index];
     signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     submit(&wait, &signal);
+    sc.acquire_serial[slot] = serial_next - 1;
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &sc.ready[index];
@@ -6039,6 +6095,14 @@ void print_stats() {
             double(s.t_present_call) / f / 1e6, double(s.max_present_call) / 1e6,
             double(s.t_frame_end) / f / 1e6, double(s.max_frame_end) / 1e6,
             double(s.t_cache_save) / f / 1e6, double(s.max_cache_save) / 1e6);
+    if (s.gpu_span_count) {
+        const double f = double(std::max<uint64_t>(1, s.frames - s.t_frames));
+        log("native renderer: GPU timestamp spans: %.2f ms summed per frame, %.3f ms mean / %.3f ms max per completed submission (%llu samples; spans may overlap)",
+            s.gpu_span_ns / f / 1e6, s.gpu_span_ns / double(s.gpu_span_count) / 1e6,
+            s.gpu_span_max_ns / 1e6, (unsigned long long)s.gpu_span_count);
+        s.gpu_span_ns = s.gpu_span_max_ns = 0;
+        s.gpu_span_count = 0;
+    }
     if (const double n = double(s.draws - s.t_draws); n > 0)
         log("native renderer: per draw (%.0f draws per frame, %.0f%% recorded in parallel): pipeline %.0f ns, geometry %.0f ns, "
             "descriptors %.0f ns, commands %.0f ns (summed over threads) | pipeline memo %llu hits, %llu misses (%llu by target changes)",
