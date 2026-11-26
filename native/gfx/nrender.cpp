@@ -1135,7 +1135,7 @@ struct Renderer {
     std::mutex mip_m;
     std::unordered_map<uint32_t, StreamHistory> stream_mips;  // bounded epoch history per resource
     StreamMipInfo get_stream_info(uint64_t res, uint64_t obj, const fmt::TSharp& ts, const uint32_t* words);
-    ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res = 0);
+    ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res = 0, Image* prepared_image=nullptr);
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
     Image* upload_texture(const uint32_t* t, uint64_t res = 0, uint64_t obj = 0,
                           const uint8_t* prepared = nullptr, uint64_t prepared_size = 0,
@@ -3479,7 +3479,7 @@ Image* Renderer::target_for(const fmt::TSharp& ts) {
 }
 
 thread_local Image* tv_texture = nullptr;  // (texture_view: the uploaded texture it returned a view of, if any)
-ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res) {
+ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res, Image* prepared_image) {
     tv_texture = nullptr;
     const auto vt = view_type(dim);
     if (!t) return {dummy_views[int(dim) * 3], 0, uint8_t(dim), 0, true};
@@ -3507,12 +3507,15 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
         }
         return view(img, img->is3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, comp, 0, false);
     }
-    auto it = textures.find(tex_key(t, res));
-    Image* img = it != textures.end() ? it->second.get() : nullptr;
-    if(res&&(!img||!img->matches_epoch(t,res))) {
-        auto* exact=historical_texture(tex_key(t,res),t,res);
-        if(img&&!exact)++expired_texture_epochs;
-        img=exact;
+    Image* img=prepared_image;
+    if(!res||!img||!img->matches_epoch(t,res)){
+        auto it=textures.find(tex_key(t,res));
+        img=it!=textures.end()?it->second.get():nullptr;
+        if(res&&(!img||!img->matches_epoch(t,res))){
+            auto* exact=historical_texture(tex_key(t,res),t,res);
+            if(img&&!exact)++expired_texture_epochs;
+            img=exact;
+        }
     }
     const uint8_t fallback_kind = ts.nfmt == 4 ? 1u : ts.nfmt == 5 ? 2u : 0u;
     const ViewHandle fallback{dummy_views[int(dim) * 3 + fallback_kind], 0, uint8_t(dim), fallback_kind, fallback_kind == 0};
@@ -4755,6 +4758,12 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
             uint16_t fmask = 0;
             for (uint32_t msk = dr.active_tex_mask[s]; msk; msk &= msk - 1) {
                 const uint32_t slot = __builtin_ctz(msk);
+                const uint16_t bit=uint16_t(1u<<slot);
+                if(dr.native_tex_ready[s]&bit){
+                    tsig|=uint64_t(dr.tex_dk[s][slot]&0xf)<<(slot*4);
+                    fmask|=dr.tex_filter_mask[s]&bit;
+                    continue;
+                }
                 const uint32_t* T = dr.tex[s][slot];
                 const gcn::TexDim dim = slot_dim(T);
                 const uint64_t tres = dr.tex_res[s][slot];
@@ -5266,7 +5275,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         depth_target(d->depth, false);
     }
     st.t_tgt += now_ns() - t_tgt0;
-    struct Seen { uint64_t key, sub, res; const uint32_t* words; };
+    struct Seen { uint64_t key, sub, res; const uint32_t* words; ViewHandle native; };
     static thread_local std::vector<Seen> seen(1u << 13);
     // A submission can contain several resource-write boundaries. A descriptor
     // seen before one of them must be checked again in the next segment.
@@ -5279,6 +5288,16 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         d->shader_res[1]=d->ps&&opt.res_current?opt.res_current(uint64_t(d->ps)):0;
         d->active_tex_mask[0]=d->tex_mask[0]&shader_slots(shader_tex_mask64(d->vs,true,d->shader_res[0]));
         d->active_tex_mask[1]=d->tex_mask[1]&shader_slots(shader_tex_mask64(d->ps,false,d->shader_res[1]));
+        d->native_tex_ready[0]=d->native_tex_ready[1]=0;
+        d->tex_filter_mask[0]=d->tex_filter_mask[1]=0;
+        auto use_native=[&](int stage,uint32_t slot,const ViewHandle& vh){
+            if(!vh.id)return;
+            const uint16_t bit=uint16_t(1u<<slot);
+            d->native_tex_ready[stage]|=bit;
+            d->tex_view[stage][slot]=vh.id;
+            d->tex_dk[stage][slot]=uint8_t((vh.dim&3)|((vh.kind&3)<<2));
+            if(vh.filterable)d->tex_filter_mask[stage]|=bit;
+        };
         unused_texture_slots+=std::popcount(uint32_t(d->tex_mask[0]&~d->active_tex_mask[0]))+
                               std::popcount(uint32_t(d->tex_mask[1]&~d->active_tex_mask[1]));
         for (int s = 0; s < 2; ++s)
@@ -5289,18 +5308,18 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                     const uint64_t k=hash_bytes(t,32)^res;
                     const size_t home=k&(seen.size()-1);
                     Seen* vacant=nullptr;
-                    bool already=false;
+                    Seen* already=nullptr;
                     // Probe nearby entries instead of repeatedly evicting an
                     // unrelated descriptor that happens to hash to this slot.
                     // Draws own these immutable words for this entire segment.
                     for(size_t p=0;p<4;++p){
                         auto& e=seen[(home+p)&(seen.size()-1)];
                         if(e.sub!=epoch){if(!vacant)vacant=&e;continue;}
-                        if(e.key==k&&e.res==res&&std::memcmp(e.words,t,32)==0){already=true;break;}
+                        if(e.key==k&&e.res==res&&std::memcmp(e.words,t,32)==0){already=&e;break;}
                     }
-                    if(already)continue;
+                    if(already){use_native(s,i,already->native);continue;}
                     if(!vacant)vacant=&seen[home];
-                    *vacant={k,epoch,res,t};
+                    *vacant={k,epoch,res,t,{}};
                     const uint64_t b = fmt::decode_tsharp(t).base;
                     const bool possible_target=!d->tex_res[s][i]&&target_bases.count(b)!=0;
                     if(possible_target)tsharp_bases.insert(b);
@@ -5308,7 +5327,14 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                     // the owner of memory sampled by an earlier draw.
                     const bool is_target=possible_target&&(target_by_base.count(b)||stencil_by_base.count(b));
                     if(!is_target||!target_current(b)){
-                        upload_texture(t, d->tex_res[s][i], d->tex_obj[s][i]);
+                        auto* image=upload_texture(t,res,d->tex_obj[s][i]);
+                        // Registered assets do not alias transient attachments.
+                        // Resolve their native sampled handle once in this
+                        // ordered preparation segment; recording uses it directly.
+                        if(res&&image&&!rc().lr){
+                            vacant->native=texture_view(t,slot_dim(t),res,image);
+                            use_native(s,i,vacant->native);
+                        }
                     }
                 }
     }
@@ -5804,6 +5830,7 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
             d->shader_res[1]=d->ps&&opt.res_current?opt.res_current(uint64_t(d->ps)):0;
             d->active_tex_mask[0]=d->tex_mask[0];
             d->active_tex_mask[1]=d->tex_mask[1];
+            d->native_tex_ready[0]=d->native_tex_ready[1]=0;
         }
     }
     pre_for = nullptr;

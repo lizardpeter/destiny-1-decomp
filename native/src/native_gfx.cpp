@@ -394,6 +394,7 @@ ng::Draw* alloc_draw() {
     d->ires = {};
     d->tex_mask[0] = d->tex_mask[1] = d->smp_mask[0] = d->smp_mask[1] = 0;
     d->tex_filter_mask[0] = d->tex_filter_mask[1] = 0;
+    d->native_tex_ready[0]=d->native_tex_ready[1]=0;
     d->tex_sig[0] = d->tex_sig[1] = d->vb_sig = d->pipe_base_key = 0;
     d->samples_target = false;
     std::memset(d->tex_res, 0, sizeof d->tex_res);
