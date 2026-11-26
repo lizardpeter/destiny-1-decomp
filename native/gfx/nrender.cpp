@@ -1026,6 +1026,7 @@ struct Renderer {
     std::atomic<uint64_t> lr_lists{0}, lr_ns{0}, lr_wait_ns{0}, lr_sub_ns{0};  // (statistics)
     bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late);
     void pre_pass(Draw* const* draws, size_t count);
+    void run_inline(Draw* const* run,size_t n);
     void submit_recorded(const std::vector<uint32_t>& handles);
     void discard_recorded(uint32_t handle);
     Recorder main_rec;
@@ -1267,6 +1268,7 @@ struct Renderer {
     uint32_t rec_threads = 0;   // worker threads (0: everything on the submitting thread)
     uint32_t rec_min_run = 64;  // fewest draws in a pass worth splitting
     uint64_t par_runs = 0, par_draws = 0;
+    uint64_t native_stage_reuse=0,inline_run_draws=0,inline_runs=0;
     void start_workers();
     void run_parallel(Draw* const* run, size_t n);
     VkCommandBuffer secondary(uint32_t worker);
@@ -1288,6 +1290,9 @@ struct Renderer {
         bool parallel = false;
         bool secondary = false; // parent holds Renderer::m while waiting for this worker
         uint64_t t_pipe = 0, t_geo = 0, t_desc = 0, t_cmd = 0, draws = 0, bytes_vtx = 0, bytes_idx = 0, bytes_cb = 0, predicated = 0, memo_tl = 0;
+        const Draw* last_pipeline_draw=nullptr;
+        Pipeline* last_pipeline=nullptr;
+        uint64_t last_pipeline_mask_epoch=0;
         uint64_t chunk_pos = 0, chunk_end = 0;  // (parallel) this worker's slice of the ring
         uint64_t chunk_reserved=0,chunk_payload=0;
         std::vector<Sub::ReCopy> recopy;        // (see Sub::recopy)
@@ -4765,6 +4770,25 @@ void Renderer::masked_stencil_clear(Image* depth, uint32_t value, uint32_t write
 // signatures before the draw loop runs. The run's owner holds m: cache entries,
 // texture lifetime accounting and snapshot view creation are coherent. Workers
 // consume only the resulting IDs, never the attachment or texture maps.
+// Compare only bound slots: pooled Draw storage may contain unused words.
+static bool same_tex_stage(const Draw& a,const Draw& b,unsigned stage,uint16_t mask){
+    if(a.active_tex_mask[stage]!=mask||b.active_tex_mask[stage]!=mask)return false;
+    for(uint32_t m=mask;m;m&=m-1){
+        const auto i=__builtin_ctz(m);
+        if(a.tex_res[stage][i]!=b.tex_res[stage][i]||
+           std::memcmp(a.tex[stage][i],b.tex[stage][i],32)!=0)return false;
+    }
+    return true;
+}
+static bool same_sampler_stage(const Draw& a,const Draw& b,unsigned stage){
+    const auto mask=a.smp_mask[stage];
+    if(mask!=b.smp_mask[stage])return false;
+    for(uint32_t m=mask;m;m&=m-1){
+        const auto i=__builtin_ctz(m);
+        if(std::memcmp(a.smp[stage][i],b.smp[stage][i],16)!=0)return false;
+    }
+    return true;
+}
 void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
     struct TvEntry { uint64_t key = 0, gen = 0, target_gen = 0; ViewHandle vh{}; Image* tex = nullptr; };
     static thread_local std::unique_ptr<TvEntry[]> tvc_ptr;
@@ -4778,6 +4802,7 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
     const uint64_t gen = views_gen.load(std::memory_order_acquire);
     const uint64_t tg = target_views_gen.load(std::memory_order_acquire);
     const uint64_t sub_no = rc().submit_no;
+    const Draw* prior=nullptr;
     for (size_t di = 0; di < count; ++di) {
         Draw& dr = *draws[di];
         if (dr.kind != Draw::Indexed && dr.kind != Draw::Auto) continue;
@@ -4792,7 +4817,12 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
         for (int s = 0; s < 2; ++s) {
             uint64_t tsig = 0;
             uint16_t fmask = 0;
-            for (uint32_t msk = dr.active_tex_mask[s]; msk; msk &= msk - 1) {
+            // Already-resolved native stages have no dynamic target dependencies.
+            if(prior&&dr.native_tex_ready[s]==dr.active_tex_mask[s]&&
+               prior->native_tex_ready[s]==dr.native_tex_ready[s]&&
+               std::memcmp(prior->tex_dk[s],dr.tex_dk[s],sizeof dr.tex_dk[s])==0){
+                tsig=prior->tex_sig[s];fmask=dr.tex_filter_mask[s];
+            }else for (uint32_t msk = dr.active_tex_mask[s]; msk; msk &= msk - 1) {
                 const uint32_t slot = __builtin_ctz(msk);
                 const uint16_t bit=uint16_t(1u<<slot);
                 if(dr.native_tex_ready[s]&bit){
@@ -4841,7 +4871,10 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
             dr.tex_filter_mask[s] = fmask;
             dr.tex_sig[s] = tsig;
 
-            for (uint32_t msk = dr.smp_mask[s]; msk; msk &= msk - 1) {
+            if(prior&&same_sampler_stage(dr,*prior,s)){
+                std::memcpy(dr.smp_lin[s],prior->smp_lin[s],sizeof dr.smp_lin[s]);
+                std::memcpy(dr.smp_near[s],prior->smp_near[s],sizeof dr.smp_near[s]);
+            }else for (uint32_t msk = dr.smp_mask[s]; msk; msk &= msk - 1) {
                 const uint32_t slot = __builtin_ctz(msk);
                 const uint32_t* S = dr.smp[s][slot];
                 const uint64_t key = hash_bytes(S, 16) | 1;
@@ -4855,6 +4888,7 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
                 dr.smp_near[s][slot] = se.near;
             }
         }
+        prior=&dr;
     }
 }
 
@@ -4889,7 +4923,19 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
 
     // 1. Pipeline lookup via lock-free thread-local memo table (invariant across target changes)
     Pipeline* p = nullptr;
-    {
+    const auto mask_epoch=shader_mask_epoch.load(std::memory_order_acquire);
+    const Draw* prev=r.last_pipeline_draw;
+    // Rec is scoped to one fixed-attachment run. Identical adjacent PSO
+    // state needs neither a hash nor a thread-local/global pipeline lookup.
+    if(run_colors&&prev&&r.last_pipeline&&r.last_pipeline_mask_epoch==mask_epoch&&
+       prev->vs==dr.vs&&prev->ps==dr.ps&&
+       prev->shader_res[0]==dr.shader_res[0]&&prev->shader_res[1]==dr.shader_res[1]&&
+       prev->prim==dr.prim&&prev->blend==dr.blend&&prev->target_mask==dr.target_mask&&
+       prev->su_sc_mode==dr.su_sc_mode&&prev->depth_ctl==dr.depth_ctl&&
+       prev->stencil_ctl==dr.stencil_ctl&&prev->vb_sig==dr.vb_sig&&
+       prev->tex_sig[0]==dr.tex_sig[0]&&prev->tex_sig[1]==dr.tex_sig[1]){
+        p=r.last_pipeline;++r.memo_tl;
+    }else{
         struct TlMemo { uint64_t key = 0; Pipeline* p = nullptr; };
         static thread_local std::unique_ptr<TlMemo[]> tlm_ptr;
         if (!tlm_ptr) tlm_ptr = std::make_unique<TlMemo[]>(8192);
@@ -4907,6 +4953,9 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         }
     }
     if (!p) return skip("pipeline");
+    r.last_pipeline_draw=&dr;r.last_pipeline=p;
+    // If translation published a mask, force normal lookup on the next draw.
+    r.last_pipeline_mask_epoch=mask_epoch;
     lap(r.t_pipe);
 
     // 2. Geometry resolution: thread-local fast cache for engine resource buffers (whole buffer
@@ -5317,6 +5366,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     // seen before one of them must be checked again in the next segment.
     static thread_local uint64_t preparation_epoch = 0;
     const uint64_t epoch = ++preparation_epoch;
+    const Draw* prior=nullptr;
     for (size_t di = 0; di < count; ++di) {
         Draw* d = draws[di];
         if(d->kind!=Draw::Indexed&&d->kind!=Draw::Auto)continue;
@@ -5336,7 +5386,19 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         };
         unused_texture_slots+=std::popcount(uint32_t(d->tex_mask[0]&~d->active_tex_mask[0]))+
                               std::popcount(uint32_t(d->tex_mask[1]&~d->active_tex_mask[1]));
-        for (int s = 0; s < 2; ++s)
+        for (int s = 0; s < 2; ++s){
+            const auto mask=d->active_tex_mask[s];
+            // The material is unchanged across adjacent mesh draws.
+            // Copy native bindings as a block rather than hash/probe each
+            // descriptor. Restrict reuse to fully resident registered stages.
+            if(prior&&mask&&prior->native_tex_ready[s]==mask&&same_tex_stage(*d,*prior,s,mask)){
+                d->native_tex_ready[s]=mask;
+                d->tex_filter_mask[s]=prior->tex_filter_mask[s];
+                std::memcpy(d->tex_view[s],prior->tex_view[s],sizeof d->tex_view[s]);
+                std::memcpy(d->tex_dk[s],prior->tex_dk[s],sizeof d->tex_dk[s]);
+                ++native_stage_reuse;
+                continue;
+            }
             for (uint32_t mask = d->active_tex_mask[s]; mask; mask &= mask - 1) {
                     const uint32_t i = __builtin_ctz(mask);
                     const uint32_t* t = d->tex[s][i];
@@ -5373,6 +5435,8 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                         }
                     }
                 }
+        }
+        prior=d;
     }
     flush_uploads();
     if (local_geometry_enabled() && !rc().lr && !(debug_toggles() & 8)) {
@@ -5385,11 +5449,16 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
             const GeometryKey key{r.id, r.base, r.size, 0, 0};
             if (seen_geometry.insert(key).second) copied |= prepare_local_geometry(r);
         };
+        const Draw* prev=nullptr;
         for (size_t di = 0; di < count; ++di) {
             const Draw& d = *draws[di];
             if (d.kind != Draw::Indexed && d.kind != Draw::Auto) continue;
-            if (d.kind == Draw::Indexed) prepare(d.ires);
-            if (d.inline_vertices.empty()) for (const auto& r : d.vres) prepare(r);
+            if (d.kind == Draw::Indexed&&(!prev||prev->kind!=Draw::Indexed||
+                std::memcmp(&d.ires,&prev->ires,sizeof d.ires)!=0))prepare(d.ires);
+            if (d.inline_vertices.empty()&&(!prev||!prev->inline_vertices.empty()||
+                std::memcmp(d.vres,prev->vres,sizeof d.vres)!=0))
+                for (const auto& r : d.vres) prepare(r);
+            prev=&d;
         }
         if (copied) {
             VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -5404,6 +5473,21 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         }
     }
     st.t_pre += now_ns() - tp;
+}
+
+void Renderer::run_inline(Draw* const* run,size_t n){
+    Image* colors[8]{};
+    for(int i=0;i<5;++i)colors[i]=color_target(run[0]->color[i]);
+    Image* depth=depth_target(run[0]->depth);
+    if(!depth&&std::none_of(colors,colors+8,[](Image* x){return x!=nullptr;})){
+        for(size_t i=0;i<n;++i)skip("no target");return;
+    }
+    feedback_snapshots(run,n,colors,depth);
+    resolve_draw_resources(run,n);
+    Rec rec;rec.cmd=rc().cmd;rec.ds=&rc().dstate;
+    for(size_t i=0;i<n;++i)draw(*run[i],rec,colors,depth);
+    merge(rec);
+    ++inline_runs;inline_run_draws+=n;
 }
 
 void Renderer::execute(const std::vector<Draw*>& draws) {
@@ -5460,9 +5544,12 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
         static thread_local EpochCohort cohort;
         cohort.clear();
         size_t end=i;
+        const Draw* prior_epoch_draw=nullptr;
         for(;end<draws.size()&&!memory_write(draws[end]);++end){
             const Draw& dr=*draws[end];
             if(dr.kind!=Draw::Indexed&&dr.kind!=Draw::Auto)continue;
+            if(prior_epoch_draw&&std::memcmp(dr.tex_mask,prior_epoch_draw->tex_mask,sizeof dr.tex_mask)==0&&
+               std::memcmp(dr.tex_res,prior_epoch_draw->tex_res,sizeof dr.tex_res)==0)continue;
             bool conflict=false;
             for(unsigned stage=0;stage<2&&!conflict;++stage)
                 for(uint32_t mask=dr.tex_mask[stage];mask;mask&=mask-1){
@@ -5473,6 +5560,7 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
                 if(end==i){++texture_draw_epoch_conflicts;continue;}
                 ++texture_cohort_splits;break;
             }
+            prior_epoch_draw=&dr;
         }
         // Any preceding inline rendering must finish before preparation
         // records texture or geometry transfer commands.
@@ -5501,7 +5589,27 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
                 run_parallel(draws.data() + i, j - i);
                 i = j - 1;
             } else {
-                draw(*d);
+                // Short runs with only registered sampled resources have no
+                // framebuffer feedback. Prepare and record them as one native
+                // inline run, rather than rebuilding attachment state per draw.
+                auto safe=[](const Draw& x){
+                    for(unsigned stage=0;stage<2;++stage)
+                        for(uint32_t m=x.active_tex_mask[stage];m;m&=m-1)
+                            if(!x.tex_res[stage][__builtin_ctz(m)])return false;
+                    return true;
+                };
+                size_t k=i+1;
+                if(!debug&&st.frames!=passlog_frame&&safe(*d)){
+                    while(k<end){
+                        const Draw& x=*draws[k];
+                        if((x.kind!=Draw::Indexed&&x.kind!=Draw::Auto)||
+                           std::memcmp(x.color,d->color,sizeof x.color)!=0||
+                           std::memcmp(x.depth,d->depth,sizeof x.depth)!=0||!safe(x))break;
+                        ++k;
+                    }
+                }
+                if(k-i>1){run_inline(draws.data()+i,k-i);i=k-1;}
+                else draw(*d);
             }
             break;
         }
