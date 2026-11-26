@@ -2487,6 +2487,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     sf.width = ts.width, sf.height = ts.height, sf.pitch = ts.pitch;
     sf.depth = is3d ? ts.depth : 1;
     sf.layers = layers;
+    sf.stored_layers=cube?ts.depth*6u:(ts.type==12||ts.type==13)?ts.depth:1u;
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
     const uint64_t cur_bytes = cur_is_low ? sf.total_size : (streamed ? sf.mips[0].size : sf.total_size);
@@ -5471,6 +5472,7 @@ void Renderer::load_texture(const LoadJob& j) {
     sf.depth = is3d ? ts.depth : 1;
     sf.layers = (ts.type == 13 || ts.type == 12 || cube) ? ts.last_array + 1 : 1;
     if (cube) sf.layers = std::max(6u, sf.layers - sf.layers % 6);
+    sf.stored_layers=cube?ts.depth*6u:(ts.type==12||ts.type==13)?ts.depth:1u;
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
     if(j.mapping.empty()||j.size!=sf.total_size||!sf.total_size||sf.total_size>(128ull<<20))return;
@@ -6658,6 +6660,7 @@ void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj) {
     sf.depth=ts.type==10?ts.depth:1;
     sf.layers=(ts.type==12||ts.type==13||ts.type==11)?ts.last_array+1:1;
     if(ts.type==11)sf.layers=std::max(6u,sf.layers-sf.layers%6);
+    sf.stored_layers=ts.type==11?ts.depth*6u:(ts.type==12||ts.type==13)?ts.depth:1u;
     sf.levels=std::min(ts.last_level+1,tiling::kMaxMips);
     tiling::layout(sf);
     j.base=ts.base;j.size=sf.total_size;

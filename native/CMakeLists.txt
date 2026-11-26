@@ -297,3 +297,6 @@ add_test(NAME native-epoch-cohort COMMAND native-epoch-cohort-test)
 add_executable(native-shader-slots-test tests/native_shader_slots_test.cpp)
 target_include_directories(native-shader-slots-test PRIVATE gfx)
 add_test(NAME native-shader-slots COMMAND native-shader-slots-test)
+
+add_executable(tiling-layout-contract-test gfx/tests/tiling_layout_contract_test.cpp gfx/tiling.cpp)
+add_test(NAME tiling-layout-contract COMMAND tiling-layout-contract-test)

@@ -285,6 +285,13 @@ void detile_reference(const Surface& s, uint32_t lv, const uint8_t* tiled, uint8
     if (s.block) w = (w + 3) / 4, h = (h + 3) / 4;
     const uint32_t slices = std::max(1u, s.depth >> lv) * s.layers;
     const uint8_t* base = tiled + ml.offset;
+    if(mi.array==LinearGeneral||mi.array==LinearAligned){
+        for(uint32_t z=0;z<slices;++z)
+            for(uint32_t y=0;y<h;++y)
+                std::memcpy(linear+((uint64_t(z)*h+y)*w)*bytes,
+                    base+((uint64_t(z)*ml.height+y)*ml.pitch)*bytes,uint64_t(w)*bytes);
+        return;
+    }
     const bool micro = ml.micro || !macro_tiled(mi.array);
     const Macro m = micro ? Macro{} : macro_params(s.tile_mode, s.bpp, s.samples);
     for (uint32_t z = 0; z < slices; ++z)
@@ -304,9 +311,14 @@ void layout(Surface& s) {
     const bool macro = macro_tiled(mi.array);
     s.total_size = 0;
     const Macro m = macro ? macro_params(s.tile_mode, s.bpp, s.samples) : Macro{};
+    uint32_t base_pitch=s.pitch?s.pitch:s.width;
+    uint32_t physical_layers=std::max(s.layers,s.stored_layers);
+    if(s.pow2)physical_layers=std::bit_ceil(physical_layers);
     for (uint32_t lv = 0; lv < s.levels && lv < kMaxMips; ++lv) {
-        uint32_t w = std::max(1u, (lv == 0 && s.pitch ? s.pitch : s.width) >> lv);
-        if (lv > 0 && s.pitch) w = std::max(1u, s.width >> lv);
+        // F85CB0 uses max(1, descriptor base pitch >> mip), before
+        // converting texels to BC elements. F89BD0 accumulates the
+        // padded physical slice count, not just the visible array range.
+        uint32_t w=std::max(1u,base_pitch>>lv);
         uint32_t h = std::max(1u, s.height >> lv);
         if (s.block) w = (w + 3) / 4, h = (h + 3) / 4;
         w = std::max(w, 1u), h = std::max(h, 1u);
@@ -316,7 +328,10 @@ void layout(Surface& s) {
         ml.thickness = 1;
         ml.micro = false;
         uint64_t size;
-        if (mi.array == LinearAligned || mi.array == LinearGeneral) {
+        if(mi.array==LinearGeneral){
+            ml.pitch=w;ml.height=h;
+            size=(uint64_t(w)*h*s.samples*s.bpp+7)/8;
+        }else if(mi.array==LinearAligned){
             const uint32_t bytes = std::max(1u, (s.bpp + 7) / 8);
             const uint32_t pitch_align = std::max(8u, 64u / bytes);
             uint32_t p = (w + pitch_align - 1) & ~(pitch_align - 1);
@@ -341,7 +356,8 @@ void layout(Surface& s) {
             }
             ml.pitch = p, ml.height = hh;
         }
-        uint32_t slices = d * s.layers;
+        if(lv==0&&!s.pitch)base_pitch=ml.pitch*(s.block?4u:1u);
+        uint32_t slices=d*physical_layers;
         slices += (0u - slices) & (ml.thickness - 1);
         ml.size = size * slices;
         ml.offset = s.total_size;

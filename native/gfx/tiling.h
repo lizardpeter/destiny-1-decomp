@@ -21,6 +21,7 @@ struct Surface {
     uint32_t bpp = 32;           // bits per element (texel or block)
     uint32_t width = 1, height = 1, depth = 1;  // texels
     uint32_t layers = 1, levels = 1, samples = 1;
+    uint32_t stored_layers = 0; // descriptor allocation layers, before POW2_PAD; 0 = layers
     bool block = false;          // 4x4 block compressed
     bool pow2 = false;           // T# POW2_PAD: mips padded to powers of two
     uint32_t pitch = 0;          // texels; 0 = from width
