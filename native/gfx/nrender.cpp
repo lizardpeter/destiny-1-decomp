@@ -3256,11 +3256,6 @@ void Renderer::fill_missing_mips(uint32_t first, uint8_t* staging, const std::ve
 }
 
 // ---------------------------------------------------------------------------- geometry cache
-static bool local_geometry_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("D1_NG_LOCAL_GEOMETRY"); return !v || std::atoi(v) != 0; }();
-    return enabled;
-}
-
 bool Renderer::geo_alloc(uint64_t size, int& block, uint64_t& off, bool device_local) {
     std::lock_guard lk(geo_block_m);
     size = (size + 255) & ~255ull;
@@ -3429,7 +3424,7 @@ bool Renderer::geo_get(uint64_t addr, uint64_t size, int index_size, uint32_t in
 // in it, so a move does not make a new entry.
 GeoEntry* Renderer::geo_lookup_res(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase,
                                        const uint8_t* snapshot, uint64_t object, const MappingSpans* mapping) {
-    const GeometryKey key{local_geometry_enabled() ? res : res >> 32, addr-rbase, size, uint32_t(index_size), index_count};
+    const GeometryKey key{res, addr-rbase, size, uint32_t(index_size), index_count};
     GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
     std::unique_lock shard_lock(sh.m);
     if(snapshot && (!opt.res_current || opt.res_current(object)!=res ||
@@ -5812,7 +5807,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     flush_uploads();
     const uint64_t t_geometry=now_ns();
     t_pre_views+=t_geometry-t_views;
-    if (local_geometry_enabled() && !rc().lr && !(debug_toggles() & 8)) {
+    if (!rc().lr && !(debug_toggles() & 8)) {
         // Prepare each exact resource epoch/range once per ordered segment, before
         // any graphics secondary begins. Different versions remain distinct.
         static thread_local SegmentTable<GeometryKey,Draw::NativeGeometry,GeometryKeyHash> seen_geometry;
@@ -6087,7 +6082,7 @@ void Renderer::load_buffer(const LoadJob& j) {
     if (j.base < 0x10000 || !j.size || j.size >= (64ull << 20) || j.mapping.empty()) return;
     if(!opt.res_current||opt.res_current(j.obj)!=j.res){++ld_stale;return;}
     {
-        const GeometryKey key{local_geometry_enabled()?j.res:j.res>>32,0,j.size,0,0};
+        const GeometryKey key{j.res,0,j.size,0,0};
         auto& sh=geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
         std::lock_guard lk(sh.m);
         const auto it=sh.map.find(key);
@@ -6099,7 +6094,7 @@ void Renderer::load_buffer(const LoadJob& j) {
     snapshot.resize(j.size);
     if(!guest_copy_current_spans(j.base,j.size,j.mapping,snapshot.data()) ||
        opt.res_current(j.obj)!=j.res){++ld_stale;return;}
-    if(local_geometry_enabled()) {
+    {
         // Early speculative recording is not part of the ordered upload cohort.
         if(list_rec)return;
         std::lock_guard lk(m);
@@ -6118,7 +6113,6 @@ void Renderer::load_buffer(const LoadJob& j) {
         }
         return;
     }
-    if (geo_lookup_res(j.base,j.size,0,0,j.res,j.base,snapshot.data(),j.obj,&j.mapping)) ++ld_buf;
 }
 
 void Renderer::load_texture(const LoadJob& j) {
