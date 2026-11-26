@@ -1,11 +1,11 @@
 # d1-native — Destiny 1 running natively on an x86-64 host
 
-Prototype of the standalone path described in `docs/findings-log.md` (2026-10-12): the
-PS4 CPU is x86-64, so the game's own machine code runs directly on the host. This
-program loads the original `eboot.bin` plus the two game-shipped modules
-(`sce_module/libc.prx`, `sce_module/libSceFios2.prx`), links them together, and
-replaces the PS4 firmware with host code. Decompiled functions from
-`src/` can later replace guest functions one at a time.
+Transitional native PC port: the original x86-64 game machine code still runs directly
+on the host. The PC executable requires its own Vulkan renderer; no external console
+renderer or null-GPU interpreter is compiled in. The retail loader still needs the
+original `eboot.bin`, `sce_module/libc.prx` and `sce_module/libSceFios2.prx`. Recovered
+functions are being migrated into independently compiled native code. This is not yet
+a source-complete standalone game. See `docs/native-platform-migration.md`.
 
 No game files are in this repository. You need your own decrypted 01.33 eboot,
 `sce_module/` and the `/app0` tree (packages etc.).
@@ -65,7 +65,7 @@ How the Windows port works (`src/os_win.cpp`, `src/os.h`):
 ### Linux
 
 ```bash
-cmake -S native -B build/native && cmake --build build/native -j     # null GPU
+cmake -S native -B build/native && cmake --build build/native -j     # native Vulkan
 cargo build --release --manifest-path backend/Cargo.toml
 cp backend/target/release/d1-backend build/native/
 build/native/d1-native            # or: --game /path/to/CUSA00219 --data ./data
@@ -117,10 +117,10 @@ Native renderer (`native/gfx`):
 | env | effect |
 |---|---|
 | `D1_GPU=<n>` | use the n-th Vulkan device |
-| `D1_NG_EVERY=<n>` / `D1_NG_EVERY_WORLD=<s>` / `D1_NG_EVERY_STATE=<state>` | draw every n-th frame only (software rendering); from `<s>` seconds in the world (or in the given state, e.g. `setup:orbit`), every frame. `D1_NG_EVERY=100000` skips drawing until then: rendered checks of a late screen at headless speed |
+| Legacy frame skipping | Removed: all submitted frames execute on the native renderer; no fabricated occlusion results |
 | `D1_NG_NOCACHE=1` | no geometry cache and no texture change tracking |
-| `D1_ND=0` | turn the native device layer off: the engine's Gnm / Gnmx calls build PS4 command buffers again and the emulated GPU answers fences, labels and occlusion from them (default: no Gnm command buffers at all, see docs/gpu-device-sync.md). `D1_ND_LOG=1` logs the first lists and submissions |
-| `D1_NG_EARLY_RECORD=1` | experimental: record eligible write-free lists on engine threads before submission; default: record in actual submission order on the GPU queue thread. Parallel secondary command recording remains enabled on the default path. |
+| Native device | Required; startup fails if the native renderer or required device hooks cannot be installed. The retail submit boundary associates engine record addresses with native lists, not packet tokens |
+| Early recording | Retail device adapter now records only in actual submit order, including the original close-time completion labels. Parallel native secondary command recording remains enabled |
 | `D1_ND_RES=0` | the engine's GPU resources (textures, vertex and index buffers) are tracked by write-protecting their memory again, instead of by the engine's own resource events (default: kept per resource and epoch, see docs/gpu-resources.md). The log's "engine resources" line counts uses, moves with the same contents and real changes |
 | `D1_NG_PREFETCH=0` | engine resources are uploaded at their first draw instead of on the renderer's loader thread when the engine binds or moves them (default). The log's "loader" line counts uploads ahead of use, moves kept and work dropped because the resource changed again |
 | `D1_NG_DYNAMIC_COPY=0` | memory that is no engine resource (dynamic vertex / index buffers, dynamic textures, small render targets the CPU rewrites) is write-tracked again instead of following the engine's own write announcements (texture unlocks, copy-queue writes); default: nothing is write-protected, 0 write faults |
@@ -139,6 +139,7 @@ Native renderer (`native/gfx`):
 | `D1_NG_PENDING_STATS=1` | log the pending draw / constant event lookups per submission |
 | `D1_NG_FRAMES_IN_FLIGHT=<n>` | frames the CPU may record ahead of the GPU (default 2) |
 | `D1_NG_GPU_TIMING=1` | optional GPU submission timestamp spans, collected after fences complete; logs summed/mean/max spans (not utilization, spans can overlap). |
+| `D1_PC_LIBC_LEAVES=0` | diagnostic A/B only: use the original libc exports instead of the 19 native memory/string leaf replacements; allocator/stdio/exception ABI still uses the original module |
 | `D1_NATIVE_FRAME_TRACE=1` | optional scheduler instrumentation: observe published 0x591D40 frame records, including follow-up steps and aggregate timing channels; reports every 10 seconds. |
 | `D1_NATIVE_FIXED_TICK=1` | experimental fixed-step path: preserve the original accumulator period and temporarily suppress the forced one-primary-step branch during timing calculation. Not the default; animation, physics, networking, and stage scheduling need live validation. |
 | `D1_NG_READBACK=<pixels>` | largest never-sampled render target written back to guest memory for the CPU (default 4096, 0 off); `D1_NG_LOG_READBACK=1` lists the decisions |
@@ -164,7 +165,7 @@ Native renderer (`native/gfx`):
 | TLS | `src/runtime.cpp` | PS4 code reads its TCB with `mov r64, fs:[0]` (2,542 sites); the loader rewrites the prefix to GS and each guest thread gets its own TCB with the static TLS block below it |
 | guest frames | `src/runtime.cpp` | guest code walks frame-pointer chains (allocation call-stack capture); calls into the guest start from a terminal frame |
 | kernel | `src/hle_kernel.cpp`, `src/hle_pthread.cpp` | memory (direct memory is a sparse memfd so aliases share pages), time, files (`/app0` → `--app0`), modules, threads, mutex/cond/rwlock, semaphores, event flags |
-| GPU | `src/hle_gpu.cpp` | event queues, video out (flip status/events, vblank), Gnm submit. Without the renderer a null GPU walks PM4 command buffers performing only their memory effects (EOP/EOS fences, WRITE_DATA, DMA_DATA) and raises the EOP interrupt. |
+| GPU | `src/hle_gpu.cpp` | Retail event/flip ABI adapter; native Vulkan only. No PM4 interpreter or external renderer bridge. |
 | audio | `src/hle_audio.cpp` | paced silent audio out; AJM codec jobs complete with silence |
 | input / services / net | `src/hle_input.cpp`, `src/hle_services.cpp`, `src/hle_net.cpp` | one connected pad, user/system services, libSceLibcInternal subset, network reported as unavailable |
 | game hooks | `src/hooks.cpp` | eboot-specific patches (01.33 offsets only) |
