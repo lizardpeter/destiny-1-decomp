@@ -12,6 +12,7 @@
 // blocks. Flips blit the video-out target into the window's swapchain.
 #include "nrender.h"
 #include "../src/native_ranges.h"
+#include "../src/host_memory.h"
 
 #include <algorithm>
 #include <array>
@@ -42,10 +43,6 @@
 
 namespace d1 {
 void log(const char* fmt, ...);
-uint64_t guest_region_extent(uint64_t addr);  // bytes from addr to the end of its guest mapping
-uint64_t guest_mapping_identity(uint64_t addr, uint64_t size);
-bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
-                                 void (*write)(void*, void*), void* context);
 }
 
 namespace d1::ng {
