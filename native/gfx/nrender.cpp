@@ -818,6 +818,9 @@ struct Renderer {
             dma_texture_check(d->caller, d->count);
         }
         if (ranges.empty()) return;
+        // A later draw may bind the same constant address after its contents
+        // were rewritten. Do not reuse the earlier draw's copied stage table.
+        if (include_writes) rc().dstate.stage_valid[0] = rc().dstate.stage_valid[1] = false;
         // Preserve actual copy order above. Only the subsequent notification
         // ranges are merged; visit the native image table once per list.
         std::sort(ranges.begin(), ranges.end());
@@ -4586,8 +4589,11 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
                 }
                 off = L.off, size = L.size;
             } else if (c.addr >= 0x10000 && !(c.addr & kLateCb)) {
-                off = rec_ring(r, std::max<uint64_t>(c.size, 16), 16);
-                if (off != UINT64_MAX) std::memcpy(ring.map + off, reinterpret_cast<const void*>(c.addr), c.size);
+                off = rec_ring(r, size, 16);
+                if (off != UINT64_MAX) {
+                    std::memcpy(ring.map + off, reinterpret_cast<const void*>(c.addr), c.size);
+                    if (size > c.size) std::memset(ring.map + off + c.size, 0, size - c.size);
+                }
                 r.bytes_cb += c.size;
                 note_copy(0, c.addr, c.size);
                 if (off != UINT64_MAX && c.addr < 0xD00000000ull) r.recopy.push_back({c.addr, off, c.size, 0});
