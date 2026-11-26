@@ -33,7 +33,7 @@ private:
         Task task;
         Callback callback;
         Result result;
-        bool done = false;
+        bool done = false, callback_finished = false, retire_after_callback = false;
     };
     std::mutex m_;
     std::condition_variable work_, complete_, callback_ready_;
@@ -77,7 +77,10 @@ private:
             op->result = r; op->done = true;
             const bool callback = bool(op->callback);
             if (callback) callbacks_.splice(callbacks_.end(), in_flight);
-            else if (--pending_ == 0) idle_.notify_all();
+            else {
+                op->callback_finished = true;
+                if (--pending_ == 0) idle_.notify_all();
+            }
             lock.unlock();
             complete_.notify_all();
             if (callback) callback_ready_.notify_one();
@@ -93,6 +96,8 @@ private:
             lock.unlock();
             op->callback(id, op->result);
             lock.lock();
+            op->callback_finished = true;
+            if (op->retire_after_callback) ops_.erase(id);
             if (--pending_ == 0) idle_.notify_all();
         }
     }
@@ -109,7 +114,7 @@ private:
         ec.clear();
         auto it = files_.find(file);
         if (!op->task && it == files_.end()) { ec = error(std::errc::bad_file_descriptor); return 0; }
-        if (stopping_ || next_op_ > 0x0fffffffu || ops_.size() >= limit_) { ec = error(std::errc::resource_unavailable_try_again); return 0; }
+        if (stopping_ || next_op_ > 0x0fffffffu || (ops_.size() >= limit_ || pending_ >= limit_)) { ec = error(std::errc::resource_unavailable_try_again); return 0; }
         if (!op->task) op->file = it->second;
         const Id id = next_op_++;
         ops_.emplace(id, op);
@@ -207,6 +212,19 @@ public:
         auto it = ops_.find(id);
         if (it == ops_.end() || !it->second->done) return false;
         result = it->second->result; return true;
+    }
+    // Transitional retail early-delete path: wait for the transfer, but retain
+    // the public result until an already-scheduled callback has consumed it.
+    // Never wait for another callback on the dispatcher itself.
+    bool delete_operation(Id id) {
+        std::unique_lock lock(m_);
+        auto it = ops_.find(id);
+        if (it == ops_.end()) return false;
+        auto op = it->second;
+        complete_.wait(lock, [&] { return op->done; });
+        if (op->callback_finished) ops_.erase(id);
+        else op->retire_after_callback = true;
+        return true;
     }
     bool forget(Id id) {
         std::lock_guard lock(m_);
