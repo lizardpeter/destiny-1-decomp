@@ -4399,7 +4399,7 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
     for (size_t k = 0; k < n; ++k) {
         const Draw& dr = *run[k];
         for (int st2 = 0; st2 < 2; ++st2)
-            for (uint32_t msk = dr.active_tex_mask[st2]; msk; msk &= msk - 1) {
+            for (uint32_t msk = dr.active_tex_mask[st2]&~dr.native_tex_ready[st2]; msk; msk &= msk - 1) {
                 const uint32_t slot = __builtin_ctz(msk);
                 if (dr.tex_res[st2][slot] != 0) continue;  // registered textures are never render targets
                 const uint32_t* t = dr.tex[st2][slot];
@@ -4543,6 +4543,7 @@ uint32_t Renderer::run_writes(const Draw* const* run, size_t n) {
             if (wm && (dr.stencil_ctl & 0xFFFFFF)) w |= 1u << 9;
         }
         if (dr.kind == Draw::Clear || dr.clear_flags) w = 0x3FF;
+        if(w==0x3ff)break;
     }
     return w;
 }
@@ -6023,6 +6024,10 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
             feedback_snapshots(items.data() + i, j - i, colors, depth);
             resolve_draw_resources(items.data() + i, j - i);
             begin_pass(colors, depth);
+            // The early recorder shares Rec across attachment runs; the
+            // adjacent PSO fast path is valid only inside the current run.
+            run_rec.last_pipeline_draw=nullptr;
+            run_rec.last_pipeline=nullptr;
             lk.unlock();
             for (size_t k = i; k < j; ++k) draw(*items[k], run_rec, colors, depth);
             relock();
@@ -7339,6 +7344,10 @@ void print_stats() {
         log("native renderer: target generation bumps: new/changed binding %llu, same-size alias %llu, new color %llu, new depth %llu, CPU rewrite %llu",
             (unsigned long long)g->gen_why[0], (unsigned long long)g->gen_why[1], (unsigned long long)g->gen_why[2],
             (unsigned long long)g->gen_why[3], (unsigned long long)g->gen_why[4]);
+    log("native renderer: hot path reuse: %llu unchanged native material stages, %llu inline draws in %llu fixed-attachment runs",
+        (unsigned long long)g->native_stage_reuse,(unsigned long long)g->inline_run_draws,
+        (unsigned long long)g->inline_runs);
+    g->native_stage_reuse=g->inline_run_draws=g->inline_runs=0;
     s.memo_hits = s.memo_misses = s.memo_gen = 0, g->par_draws = g->par_runs = 0;
     if (const double f = double(s.frames - s.t_frames); f > 0 && g->list_rec)
         log("native renderer: lists recorded on the engine's threads: %.1f per frame, %.2f ms per frame of their time "
