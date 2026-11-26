@@ -661,7 +661,19 @@ struct Renderer {
     }
     // pipeline() key without the parts that need the shared maps; ambiguous = a T# names an
     // address whose sampled image changes kind (then only pipeline() under the lock decides)
-    uint64_t pipe_key(const Draw& dr, Image* const* colors, Image* depth) const;
+    static uint64_t color_format_signature(Image* const* colors) {
+        uint64_t sig=0;
+        for(unsigned i=0;i<8;++i)
+            if(colors[i])sig=mix(sig,uint64_t(colors[i]->format)<<(i*4)|(i+1));
+        return sig;
+    }
+    static uint64_t depth_format_signature(const Image* depth) {
+        return depth?(uint64_t(depth->format)|(uint64_t(depth->stencil)<<16)):0;
+    }
+    uint64_t pipe_key(const Draw& dr,uint64_t color_signature,uint64_t depth_signature) const;
+    uint64_t pipe_key(const Draw& dr,Image* const* colors,Image* depth) const {
+        return pipe_key(dr,color_format_signature(colors),depth_format_signature(depth));
+    }
     // what a pipeline sees of a render target sampled as a texture: dimensionality and kind
     static uint32_t target_attrs(const Image* i) {
         if (!i) return 0;
@@ -719,6 +731,7 @@ struct Renderer {
         uint32_t stage_table[2][32]{};
         uint32_t stage_table_dword[2]{};
         bool stage_valid[2]{};
+        uint16_t cb_valid_mask[2]{};
         Draw::Cb cb_bound[2][16]{};
     };
     // What one recording (a submission's command buffer) is in the middle of: the main
@@ -1375,6 +1388,9 @@ struct Renderer {
         DrawState* ds = nullptr;
         bool parallel = false;
         bool secondary = false; // parent holds Renderer::m while waiting for this worker
+        bool fixed_inline_pass = false, inline_pass_started = false;
+        bool target_signature_valid = false;
+        uint64_t target_color_signature=0,target_depth_signature=0;
         uint64_t t_pipe = 0, t_geo = 0, t_desc = 0, t_cmd = 0, draws = 0, bytes_vtx = 0, bytes_idx = 0, bytes_cb = 0, predicated = 0, memo_tl = 0;
         const Draw* last_pipeline_draw=nullptr;
         Pipeline* last_pipeline=nullptr;
@@ -4149,7 +4165,7 @@ gcn::TexDim slot_dim(const uint32_t* t) {
 // formats (dr.vb_sig), target formats and its pre-resolved 4-bit per-slot (TexDim, tex_kind)
 // signatures (dr.tex_sig[0..1]). Because dr.tex_sig already incorporates resolved render-target
 // dimensions and integer kinds, pipe_key is invariant across render-target rebinds.
-uint64_t Renderer::pipe_key(const Draw& dr, Image* const* colors, Image* depth) const {
+uint64_t Renderer::pipe_key(const Draw& dr,uint64_t color_signature,uint64_t depth_signature) const {
     // Mask dr.tex_sig[0..1] to the active texture slots actually sampled by dr.vs and dr.ps,
     // and exclude dr.tex_mask[0..1] so leftover textures in unused device slots never cause misses.
     uint64_t k = mix(mix(shader_object_key(dr.vs, true, dr.shader_res[0]),
@@ -4159,12 +4175,7 @@ uint64_t Renderer::pipe_key(const Draw& dr, Image* const* colors, Image* depth) 
     const uint64_t tsig0 = dr.tex_sig[0] & shader_tex_mask64(dr.vs, true, dr.shader_res[0]);
     const uint64_t tsig1 = dr.ps ? (dr.tex_sig[1] & shader_tex_mask64(dr.ps, false, dr.shader_res[1])) : 0;
     k = mix(mix(k, tsig0), tsig1);
-    uint64_t cpack = 0;
-    for (int i = 0; i < 8; ++i)
-        if (colors[i]) cpack = mix(cpack, uint64_t(colors[i]->format) << (i * 4) | (i + 1));
-    k = mix(k, cpack);
-    k = mix(k, depth ? (uint64_t(depth->format) | (uint64_t(depth->stencil) << 16)) : 0);
-    return k;
+    return mix(mix(k,color_signature),depth_signature);
 }
 
 Pipeline* Renderer::pipeline(const Draw& dr, Image* const* colors, Image* depth) {
@@ -5138,15 +5149,16 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     if (!dr.vs || uint64_t(dr.vs) < 0x10000 || (dr.ps && uint64_t(dr.ps) < 0x10000)) {
         return skip("no shader");
     }
-    Image* colors[8] = {};
-    Image* depth = nullptr;
-    if (run_colors) {
-        std::copy(run_colors, run_colors + 8, colors), depth = run_depth;
-    } else {
-        for (int i = 0; i < 5; ++i) colors[i] = color_target(dr.color[i]);
-        depth = depth_target(dr.depth);
+    // All callers prepare a fixed native attachment set before recording.
+    // Never reconstruct or copy console attachment state in the draw loop.
+    Image* const* colors=run_colors;
+    Image* depth=run_depth;
+    if(!r.target_signature_valid){
+        if(!colors||(!depth&&std::none_of(colors,colors+8,[](Image* x){return x!=nullptr;})))return skip("no target");
+        r.target_color_signature=color_format_signature(colors);
+        r.target_depth_signature=depth_format_signature(depth);
+        r.target_signature_valid=true;
     }
-    if (!depth && std::none_of(colors, colors + 8, [](Image* x) { return x != nullptr; })) return skip("no target");
 
     // 1. Pipeline lookup via lock-free thread-local memo table (invariant across target changes)
     Pipeline* p = nullptr;
@@ -5167,7 +5179,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         static thread_local std::unique_ptr<TlMemo[]> tlm_ptr;
         if (!tlm_ptr) tlm_ptr = std::make_unique<TlMemo[]>(8192);
         TlMemo* const tlm = tlm_ptr.get();
-        const uint64_t k = pipe_key(dr, colors, depth);
+        const uint64_t k = pipe_key(dr,r.target_color_signature,r.target_depth_signature);
         TlMemo& e = tlm[k & 8191];
         if (e.key == k && e.p) {
             p = e.p;
@@ -5367,6 +5379,19 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     // stage's active slots changed since the previous draw.
     DrawState& ds = *r.ds;
     bool push_dirty = !ds.valid;
+    // The CPU table may be partially changed before an allocation or an
+    // index check fails. A skipped draw must not leave it marked as the
+    // table currently bound in the Vulkan command buffer.
+    struct StageCommit {
+        DrawState& state;
+        bool committed=false;
+        ~StageCommit(){
+            if(!committed){
+                state.valid=false;
+                state.stage_valid[0]=state.stage_valid[1]=false;
+            }
+        }
+    } stage_commit{ds};
     for (int s = 0; s < 2; ++s) {
         const Shader* sh = s ? p->ps : p->vs;
         if (!sh) continue;
@@ -5376,11 +5401,12 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         if (!(cb_m | tex_m | smp_m)) continue;
 
         bool stage_dirty = !ds.stage_valid[s];
+        if(stage_dirty)ds.cb_valid_mask[s]=0;
         // Constant buffers used by this shader stage
         for (uint32_t m = cb_m; m; m &= m - 1) {
             const uint32_t slot = __builtin_ctz(m);
             const auto& c = dr.cb[s][slot];
-            if (ds.stage_valid[s] && ds.cb_bound[s][slot].addr == c.addr && ds.cb_bound[s][slot].size == c.size)
+            if ((ds.cb_valid_mask[s]&(1u<<slot)) && ds.cb_bound[s][slot].addr == c.addr && ds.cb_bound[s][slot].size == c.size)
                 continue;
             uint64_t off;
             uint32_t size = std::max(16u, (c.size + 15) & ~15u);
@@ -5410,6 +5436,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
             if (off == UINT64_MAX) return skip("ring full");
             const uint32_t dw_off = uint32_t(off >> 2);
             ds.cb_bound[s][slot] = c;
+            ds.cb_valid_mask[s]|=uint16_t(1u<<slot);
             if (ds.stage_table[s][slot] != dw_off) {
                 ds.stage_table[s][slot] = dw_off;
                 stage_dirty = true;
@@ -5494,7 +5521,10 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     }
     if (!count) return;
 
-    if (!r.parallel) begin_pass(colors, depth);
+    if(!r.parallel&&(!r.fixed_inline_pass||!r.inline_pass_started||!rc().in_pass)){
+        begin_pass(colors,depth);
+        r.inline_pass_started=true;
+    }
     if (!r.parallel && st.frames == passlog_frame && !passlog.empty()) {
         auto& pl = passlog.back();
         if (!pl.draws++) {
@@ -5507,6 +5537,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipeline), ds.pipe = p->pipeline;
     if (push_dirty)
         vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, ds.stage_table_dword);
+    stage_commit.committed=true;
     if (!ds.valid) ds.vmask = 0;
     // Only visit used bindings. Most meshes consume far fewer than 16
     // streams; never read the uninitialized entries in vbufs/voffs/vsizes.
@@ -5848,7 +5879,7 @@ void Renderer::run_inline(Draw* const* run,size_t n){
     }
     feedback_snapshots(run,n,colors,depth);
     resolve_draw_resources(run,n);
-    Rec rec;rec.cmd=rc().cmd;rec.ds=&rc().dstate;
+    Rec rec;rec.cmd=rc().cmd;rec.ds=&rc().dstate;rec.fixed_inline_pass=true;
     for(size_t i=0;i<n;){
         size_t used=1;
         draw(*run[i],rec,colors,depth,run+i+1,n-i-1,&used);
