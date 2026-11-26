@@ -149,3 +149,11 @@ add_test(NAME pc-paths COMMAND pc-paths-test "${CMAKE_CURRENT_BINARY_DIR}/pc-pat
 add_executable(pc-mount-test tests/pc_mount_test.cpp)
 target_include_directories(pc-mount-test PRIVATE src)
 add_test(NAME pc-mount COMMAND pc-mount-test)
+
+add_executable(pc-service-test tests/pc_service_test.cpp)
+target_include_directories(pc-service-test PRIVATE src)
+target_link_libraries(pc-service-test PRIVATE Threads::Threads)
+add_test(NAME pc-service COMMAND pc-service-test "${CMAKE_CURRENT_BINARY_DIR}/pc-service-test-dir")
+add_executable(fios-contract-test tests/fios_contract_test.cpp)
+target_include_directories(fios-contract-test PRIVATE src)
+add_test(NAME fios-contract COMMAND fios-contract-test)
