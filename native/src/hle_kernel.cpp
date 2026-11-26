@@ -79,7 +79,7 @@ static std::mutex g_mem_mutex;
 static bool g_dmem = false;
 static constexpr uint64_t kDirectMemSize = 0x150000000ull;  // 5.25 GiB, retail game budget
 static uint64_t g_dmem_next = 0;
-struct Region { uint64_t size; int prot; bool direct; uint64_t phys; char name[32]; };
+struct Region { uint64_t size; int prot; bool direct; uint64_t phys; char name[32]; uint64_t identity = 0; };
 static std::map<uint64_t, Region> g_regions;  // start -> region
 static std::atomic<uint64_t> g_regions_gen{1};
 static uint64_t g_va_next = 0x400000000ull;
@@ -147,8 +147,8 @@ static int32_t sceKernelMapDirectMemory(void** addr, uint64_t len, int prot, int
                     (unsigned long long)len, p, (unsigned long long)va, reg.name);
         }
     Region r{len, prot, true, uint64_t(phys), {}};
+    r.identity = g_regions_gen.fetch_add(1, std::memory_order_release) + 1;
     g_regions[reinterpret_cast<uint64_t>(p)] = r;
-    g_regions_gen.fetch_add(1, std::memory_order_release);
     gpu_on_map(reinterpret_cast<uint64_t>(p), len);
     return SCE_OK;
 }
@@ -172,8 +172,8 @@ static int32_t sceKernelMapNamedFlexibleMemory(void** addr, uint64_t len, int pr
     *addr = p;
     Region r{len, prot, false, 0, {}};
     if (name) std::strncpy(r.name, name, 31);
+    r.identity = g_regions_gen.fetch_add(1, std::memory_order_release) + 1;
     g_regions[reinterpret_cast<uint64_t>(p)] = r;
-    g_regions_gen.fetch_add(1, std::memory_order_release);
     gpu_on_map(reinterpret_cast<uint64_t>(p), len);
     return SCE_OK;
 }
@@ -236,8 +236,28 @@ void for_each_guest_region(void (*fn)(uint64_t addr, uint64_t size)) {
 void register_native_host_region(uint64_t base, uint64_t size) {
     if (!base || !size || size > UINT64_MAX - base) return;
     std::lock_guard lk(g_mem_mutex);
-    g_regions[base] = Region{size, 3, false, 0, "native_arena"};
-    g_regions_gen.fetch_add(1, std::memory_order_release);
+    const uint64_t identity = g_regions_gen.fetch_add(1, std::memory_order_release) + 1;
+    g_regions[base] = Region{size, 3, false, 0, "native_arena", identity};
+}
+
+// A delayed GPU result belongs to the mapping that existed when it was
+// recorded, not to a future allocation that happens to reuse that address.
+// Lock only on the asynchronous result path, not on ordinary draw lookups.
+uint64_t guest_mapping_identity(uint64_t addr, uint64_t size) {
+    std::lock_guard lk(g_mem_mutex);
+    const auto* r = region_of(addr);
+    if (!r || !size || size > r->second.size - (addr - r->first)) return 0;
+    return r->second.identity;
+}
+bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
+                                 void (*write)(void*, void*), void* context) {
+    if (!identity || !size || !write) return false;
+    std::lock_guard lk(g_mem_mutex);
+    const auto* r = region_of(addr);
+    if (!r || r->second.identity != identity || size > r->second.size - (addr - r->first) ||
+        !(host_prot(r->second.prot) & os::kWrite)) return false;
+    write(reinterpret_cast<void*>(addr), context);
+    return true;
 }
 
 uint64_t guest_region_extent(uint64_t addr) {
