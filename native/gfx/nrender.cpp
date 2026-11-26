@@ -2490,6 +2490,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     sf.stored_layers=cube?ts.depth*6u:(ts.type==12||ts.type==13)?ts.depth:1u;
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
+    if(opt.compare_layout&&!rc().lr)opt.compare_layout(t,sf);
     const uint64_t cur_bytes = cur_is_low ? sf.total_size : (streamed ? sf.mips[0].size : sf.total_size);
     if(prepared ? prepared_source_size!=cur_bytes : !guest_readable_range(ts.base,cur_bytes)){
         ++texture_range_rejects;

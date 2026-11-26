@@ -37,6 +37,7 @@
 #include "native_asset_suballocation.h"
 #include "../gfx/native_resource_move.h"
 #include "../gfx/native_texture_constructor.h"
+#include "../gfx/tiling.h"
 #include "native_record_registry.h"
 #include "../gfx/native_record_fifo.h"
 #include "../gfx/native_cbm_contract.h"
@@ -1114,6 +1115,56 @@ D1_SYSV uint32_t calculate_footprint(uint64_t* bytes,uint32_t* alignment,void* d
     // instead of consuming a potentially incomplete request.
     if(status)return original_footprint(bytes,alignment,descriptor);
     return footprint(*bytes,*alignment,words,seed,calculate_layout);
+}
+// Opt-in differential, executed only on the ordinary ordered renderer
+// path. The original leaf is the oracle, never the renderer's source of
+// layout information. Deduplicate descriptor shapes to bound diagnostics.
+void compare_native_layout(const uint32_t* w,const tiling::Surface& s){
+    static std::mutex m;
+    static std::unordered_set<uint64_t> seen;
+    static uint64_t checked=0,failed=0,oracle_errors=0;
+    const uint32_t kind=w[3]>>28;
+    if(kind<8||kind>13)return;
+    uint64_t key=0;
+    for(unsigned i=1;i<8;++i)key=(key^uint64_t(i==1?w[i]&0xfff00000u:w[i]))*0x9e3779b97f4a7c15ull;
+    std::lock_guard lk(m);
+    if(seen.size()>=32768||!seen.insert(key).second)return;
+    LayoutInput seed{};
+    const uint32_t tile=(w[3]>>20)&31;
+    const uint32_t table_word=nr::eb<uint32_t>(0x16C7880+uint64_t(tile)*4);
+    if(prepare(seed,w,0,0,table_word,calculate_layout)){
+        ++oracle_errors;return;
+    }
+    uint64_t off=0;
+    const uint64_t layers=slice_count(w);
+    const uint32_t scale=s.block?4:1;
+    bool mismatch=false;
+    for(uint32_t lv=0;lv<s.levels&&lv<tiling::kMaxMips;++lv){
+        auto in=seed;
+        in.width=std::max(1u,seed.width>>lv);
+        in.height=std::max(1u,seed.height>>lv);
+        in.depth=std::max(1u,seed.depth>>lv);
+        in.base_pitch=lv?((w[4]>>13)&0x3fff)+1:0;
+        in.mip=lv;
+        LayoutOutput out{};
+        if(calculate_layout(out,in)){++oracle_errors;return;}
+        const uint64_t size=(uint64_t(out.words[4])|(uint64_t(out.words[5])<<32))*layers;
+        const auto& n=s.mips[lv];
+        const uint32_t pitch=out.words[0]/scale,height=out.words[1]/scale;
+        if(n.pitch!=pitch||n.height!=height||n.size!=size||n.offset!=off){
+            if(failed<48&&!mismatch)
+                log("native layout differential: tile %u dfmt %u %ux%u basepitch %u layers %llu mip %u | native p/h %u/%u off/size %llu/%llu | original p/h %u/%u off/size %llu/%llu mode %u",
+                    tile,(w[1]>>20)&63,s.width,s.height,s.pitch,(unsigned long long)layers,lv,
+                    n.pitch,n.height,(unsigned long long)n.offset,(unsigned long long)n.size,
+                    pitch,height,(unsigned long long)off,(unsigned long long)size,out.words[6]);
+            mismatch=true;
+        }
+        off+=size;
+    }
+    ++checked;if(mismatch)++failed;
+    if((checked&(checked-1))==0)
+        log("native layout differential: %llu unique descriptors, %llu mismatched, %llu original errors",
+            (unsigned long long)checked,(unsigned long long)failed,(unsigned long long)oracle_errors);
 }
 uint64_t build(void* p,const Request& q){
     return construct(p,q,
@@ -2372,6 +2423,7 @@ bool native_gfx_install() {
     opt.frames_dir = getenv("D1_NG_FRAMES");
     opt.no_cull = getenv("D1_NG_NOCULL") != nullptr;
     opt.dump_targets = getenv("D1_NG_TARGETS") != nullptr;
+    if(getenv("D1_NG_COMPARE_LAYOUT"))opt.compare_layout=&nd::texture_constructor::compare_native_layout;
     const Settings& st = settings();
     opt.present_mode = st.vsync == "on" ? "Fifo" : st.vsync == "off-tearing" ? "Immediate" : "Mailbox";
     static std::string cache_file;

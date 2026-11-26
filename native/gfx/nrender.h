@@ -7,6 +7,7 @@
 #include <vector>
 #include "../src/native_mapping_contract.h"
 
+namespace d1::tiling { struct Surface; }
 namespace d1::ng {
 
 constexpr int kStages = 2;  // 0 = vertex, 1 = pixel
@@ -92,6 +93,8 @@ struct Options {
     uint64_t (*version)(uint64_t addr, uint64_t size) = nullptr;
     void (*describe)(uint64_t addr, char* out, size_t n) = nullptr;
     uint64_t (*res_current)(uint64_t obj) = nullptr;
+    // Optional original-layout differential diagnostics; never supplies production layout.
+    void (*compare_layout)(const uint32_t* descriptor,const tiling::Surface& native_layout) = nullptr;
 };
 
 bool init(const Options& opt);
