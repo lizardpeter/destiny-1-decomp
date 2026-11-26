@@ -1131,9 +1131,31 @@ struct Renderer {
         fmt::TSharp low_layout{};
         std::array<uint32_t,8> low_words{};
     };
-    struct StreamHistory {std::array<StreamMipInfo,4> entries{};};
+    struct StreamHistory {
+        std::vector<StreamMipInfo> entries;
+        const StreamMipInfo* find(uint64_t epoch)const{
+            for(auto it=entries.rbegin();it!=entries.rend();++it)
+                if(it->epoch==epoch)return &*it;
+            return nullptr;
+        }
+        // Caller holds mip_m and either capture or publication gate.
+        void publish(const StreamMipInfo& info){
+            for(auto& entry:entries)if(entry.epoch==info.epoch){
+                if(!entry.from_callback||info.from_callback)entry=info;
+                return;
+            }
+            if(entries.size()>=4){
+                uint64_t newest=0;
+                for(const auto& entry:entries)newest=std::max(newest,entry.epoch);
+                std::erase_if(entries,[&](const auto& entry){
+                    return entry.epoch!=newest&&!texture_leases().pinned(entry.epoch);
+                });
+            }
+            entries.push_back(info);
+        }
+    };
     std::mutex mip_m;
-    std::unordered_map<uint32_t, StreamHistory> stream_mips;  // bounded epoch history per resource
+    std::unordered_map<uint32_t, StreamHistory> stream_mips;
     StreamMipInfo get_stream_info(uint64_t res, uint64_t obj, const fmt::TSharp& ts, const uint32_t* words);
     ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res = 0, Image* prepared_image=nullptr);
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
@@ -2390,13 +2412,12 @@ Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res,uint64_t obj,cons
     info.full_d=uint16_t(ts.type==10?ts.depth:1);
     info.full_mips=uint8_t(std::min(ts.last_level+1,tiling::kMaxMips));
     if(!res)return info;
-    const uint32_t rid=uint32_t(res>>32),slot=uint32_t(res)&3;
+    const uint32_t rid=uint32_t(res>>32);
     {
         std::lock_guard lk(mip_m);
         auto it=stream_mips.find(rid);
         if(it!=stream_mips.end()){
-            const auto& cached=it->second.entries[slot];
-            if(cached.epoch==res)return cached;
+            if(const auto* cached=it->second.find(res))return *cached;
         }
     }
     // A draw captured an old epoch. Never attach today's mutable tag
@@ -2423,9 +2444,9 @@ Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res,uint64_t obj,cons
             else if(ts.last_level+1==tm)info.hi_base=ts.base;
         }else info.low_base=ts.base;
         std::lock_guard lk(mip_m);
-        auto& cached=stream_mips[rid].entries[slot];
-        if(cached.epoch==res&&cached.from_callback)return cached;
-        cached=info;
+        auto& history=stream_mips[rid];
+        if(const auto* cached=history.find(res);cached&&cached->from_callback)return *cached;
+        history.publish(info);
     }else if(thi){
         // Invalid authored split metadata does not imply contiguous storage.
         // Avoid treating the isolated top mip as a complete mip allocation.
@@ -3441,6 +3462,21 @@ void Renderer::trim_texture_history(bool all){
 }
 void Renderer::evict_textures() {
     trim_texture_history();
+    // Reclaim native stream metadata independently from GPU images. Keep
+    // every pending command-list lease, plus recent metadata for live assets.
+    {
+        auto gate=texture_leases().retire();
+        std::lock_guard lk(mip_m);
+        for(auto it=stream_mips.begin();it!=stream_mips.end();){
+            auto& entries=it->second.entries;
+            std::erase_if(entries,[&](const StreamMipInfo& entry){
+                if(texture_leases().pinned(entry.epoch))return false;
+                return !entry.obj||!opt.res_current||
+                       uint32_t(opt.res_current(entry.obj)>>32)!=it->first;
+            });
+            if(entries.empty())it=stream_mips.erase(it);else ++it;
+        }
+    }
     // Use frame count (st.frames), NOT submit_seq (which increments ~28 times per frame).
     // Registered engine textures stay alive in their single persistent VkImage for as long as
     // their handle in the engine's resource registry still resolves to them.
@@ -6906,18 +6942,17 @@ void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64
     {
         std::lock_guard lk(g->mip_m);
         if(g->opt.res_current(obj)!=res)return;
-        auto& history=g->stream_mips[uint32_t(res>>32)].entries;
+        auto& history=g->stream_mips[uint32_t(res>>32)];
         if(!info.low_layout.base&&low_base){
             // Recover a previously captured physical layout for the same
             // allocation address, not the current high descriptor's pitch.
             uint64_t newest=0;
-            for(const auto& prior:history)
+            for(const auto& prior:history.entries)
                 if(prior.epoch<res&&prior.epoch>newest&&prior.low_layout.base==low_base){
                     info.low_layout=prior.low_layout;info.low_words=prior.low_words;newest=prior.epoch;
                 }
         }
-        auto& slot=history[uint32_t(res)&3];
-        if(slot.epoch<=res)slot=info;
+        history.publish(info);
     }
     if(!tsharp)return;
     if(!info.has_hi||info.full_mips<2){prefetch_texture(tsharp,res,obj);return;}
