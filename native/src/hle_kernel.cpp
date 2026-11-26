@@ -397,6 +397,23 @@ static bool readable_span_locked(uint64_t addr,MappingSpan& span){
     span={r->first,r->second.size,r->second.identity};
     return true;
 }
+bool guest_capture_read_spans(uint64_t addr,uint64_t size,MappingSpans& spans){
+    std::lock_guard lk(g_mem_mutex);
+    return capture_mapping_spans(addr,size,spans,readable_span_locked);
+}
+bool guest_copy_current_spans(uint64_t addr,uint64_t size,const MappingSpans& spans,void* destination){
+    if(!destination)return false;
+    std::lock_guard lk(g_mem_mutex);
+    if(!validate_mapping_spans(addr,size,spans,readable_span_locked))return false;
+    std::memcpy(destination,reinterpret_cast<const void*>(addr),size);
+    return true;
+}
+bool guest_matches_current_spans(uint64_t addr,uint64_t size,const MappingSpans& spans,const void* snapshot){
+    if(!snapshot)return false;
+    std::lock_guard lk(g_mem_mutex);
+    return validate_mapping_spans(addr,size,spans,readable_span_locked)&&
+           std::memcmp(reinterpret_cast<const void*>(addr),snapshot,size)==0;
+}
 bool guest_readable_range(uint64_t addr,uint64_t size){
     if(!size||size>UINT64_MAX-addr)return false;
     std::lock_guard lk(g_mem_mutex);

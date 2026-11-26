@@ -540,7 +540,7 @@ struct Renderer {
         uint32_t vfirst = 0, vlast = 0;
     };
     bool geo_alloc(uint64_t size, int& block, uint64_t& off, bool device_local = false);
-    bool prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot=nullptr, uint64_t object=0, uint64_t mapping=0);
+    bool prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot=nullptr, uint64_t object=0, const MappingSpans* mapping=nullptr);
     Buffer* geometry_staging(uint64_t bytes, StagingSpan& span);
     void geo_free_now(int block, uint64_t off, uint64_t size);
     void geo_free_later(int block, uint64_t off, uint64_t size);
@@ -550,7 +550,7 @@ struct Renderer {
     GeoEntry* geo_lookup(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase);
     static thread_local GeoHit geo_hit_out;  // (geo_lookup's result, copied while its shard is locked)
     GeoEntry* geo_lookup_res(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase,
-                             const uint8_t* snapshot=nullptr, uint64_t object=0, uint64_t mapping=0);
+                             const uint8_t* snapshot=nullptr, uint64_t object=0, const MappingSpans* mapping=nullptr);
     void evict_geo();
     uint64_t pcache_saved_pipelines = 0;
     uint64_t pcache_last_attempt_ns = 0;
@@ -776,7 +776,7 @@ struct Renderer {
     Recorder up_rec;  // uploads and target set-up for lists recorded on engine threads
     Recorder* pre_for = nullptr;  // the list whose textures pre_pass is preparing (in the upload slot)
     // the loader thread: engine resources prepared when the engine binds or moves them
-    struct LoadJob { uint8_t kind; uint32_t t[8]; uint64_t base, size, res, obj; uint64_t mapping=0; };  // kind: 0 buf, 1 tex, 2 vs, 3 ps
+    struct LoadJob { uint8_t kind; uint32_t t[8]; uint64_t base, size, res, obj; MappingSpans mapping; };  // kind: 0 buf, 1 tex, 2 vs, 3 ps
     std::mutex load_m;
     std::condition_variable load_cv;
     std::deque<LoadJob> load_q;
@@ -2954,7 +2954,7 @@ Buffer* Renderer::geometry_staging(uint64_t bytes, StagingSpan& span) {
     return &sb.geo_staging.back();
 }
 
-bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot, uint64_t object, uint64_t mapping) {
+bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot, uint64_t object, const MappingSpans* mapping) {
     if (!res.id || res.base < 0x10000 || !res.size || res.size >= (64ull << 20) ||
         rc().cur == UINT32_MAX || (rc().lr&&!snapshot)) return false;
     const GeometryKey key{res.id, 0, res.size, 0, 0};
@@ -2963,10 +2963,14 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
     GeoEntry& e = sh.map[key];
     e.last_used = submit_seq.load(std::memory_order_relaxed);
     if (e.valid && e.res == res.id) return false; // already resident (including mapped fallback)
-    if(!snapshot)mapping=guest_mapping_identity(res.base,res.size);
-    if(!mapping)return false;
-    if(snapshot && (!opt.res_current || opt.res_current(object)!=res.id ||
-                    guest_mapping_identity(res.base,res.size)!=mapping))return false;
+    MappingSpans local;
+    if(!snapshot){
+        if(!guest_capture_read_spans(res.base,res.size,local))return false;
+        mapping=&local;
+    }
+    if(!mapping||mapping->empty())return false;
+    if(snapshot&&(!opt.res_current||opt.res_current(object)!=res.id||
+                   !guest_matches_current_spans(res.base,res.size,*mapping,snapshot)))return false;
     int block = -1;
     uint64_t off = 0;
     if (!geo_alloc(res.size, block, off, true)) return false;
@@ -2978,11 +2982,10 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
     }
     auto* dst = staging->map + span.offset;
     const bool copied = snapshot ? (std::memcpy(dst,snapshot,res.size),true) :
-        guest_copy_current_mapping(res.base,res.size,mapping,dst);
+        guest_copy_current_spans(res.base,res.size,*mapping,dst);
     std::memset(dst + res.size, 0, span.size - res.size);
-    if (!copied || (snapshot ?
-        (!guest_matches_current_mapping(res.base,res.size,mapping,snapshot)||opt.res_current(object)!=res.id) :
-        guest_mapping_identity(res.base,res.size)!=mapping)) {
+    if(!copied||!guest_matches_current_spans(res.base,res.size,*mapping,dst)||
+       (snapshot&&opt.res_current(object)!=res.id)){
         // No GPU command references this span yet; return it to the page.
         subs[rc().cur].geo_staging_used = span.offset;
         geo_free_now(block, off, res.size);
@@ -3016,17 +3019,23 @@ bool Renderer::geo_get(uint64_t addr, uint64_t size, int index_size, uint32_t in
 // event (a move keeps the contents), never write-tracked. Keyed by the resource and the offset
 // in it, so a move does not make a new entry.
 GeoEntry* Renderer::geo_lookup_res(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase,
-                                       const uint8_t* snapshot, uint64_t object, uint64_t mapping) {
+                                       const uint8_t* snapshot, uint64_t object, const MappingSpans* mapping) {
     const GeometryKey key{local_geometry_enabled() ? res : res >> 32, addr-rbase, size, uint32_t(index_size), index_count};
     GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
     std::unique_lock shard_lock(sh.m);
     if(snapshot && (!opt.res_current || opt.res_current(object)!=res ||
-                   !guest_matches_current_mapping(addr,size,mapping,snapshot)))return nullptr;
+                   (!mapping||!guest_matches_current_spans(addr,size,*mapping,snapshot))))return nullptr;
     const void* source=snapshot?static_cast<const void*>(snapshot):reinterpret_cast<const void*>(addr);
     GeoEntry& e = sh.map[key];
     e.last_used = submit_seq.load(std::memory_order_relaxed);
-    const uint64_t ext = guest_region_extent(addr);
-    if (!ext || ext < size) return nullptr;
+    static const bool verify_res=std::getenv("D1_NG_GEO_VERIFY")!=nullptr;
+    if(e.valid&&e.res==res&&!verify_res){
+        __atomic_fetch_add(&st.geo_hits,1,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&st.geo_res_hits,1,__ATOMIC_RELAXED);
+        geo_hit_out={geo_blocks[size_t(e.block)].buf.buf,e.off,e.size,e.vfirst,e.vlast};
+        return &e;
+    }
+    if(!guest_readable_range(addr,size))return nullptr;
     if (e.valid) {
         if (e.res == res) {
             // D1_NG_GEO_VERIFY: (diagnostics) unchanged really? (a write the engine did not announce)
@@ -4776,7 +4785,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
             if (src >= dr.inline_vertices.size()) return skip("inline vertex offset");
             size = std::min<uint64_t>(size, dr.inline_vertices.size() - src);
             src += uint64_t(dr.inline_vertices.data());
-        } else if (base < 0x10000 || guest_region_extent(src) < size) {
+        } else if (base < 0x10000 || !guest_readable_range(src,size)) {
             const uint64_t zsz = std::max<uint64_t>(stride ? stride : 16, 16);
             const uint64_t off = rec_ring(r, zsz, 16);
             if (off == UINT64_MAX) return skip("ring full");
@@ -5237,7 +5246,7 @@ void Renderer::start_loader() {
 }
 
 void Renderer::load_buffer(const LoadJob& j) {
-    if (j.base < 0x10000 || !j.size || j.size >= (64ull << 20) || !j.mapping) return;
+    if (j.base < 0x10000 || !j.size || j.size >= (64ull << 20) || j.mapping.empty()) return;
     if(!opt.res_current||opt.res_current(j.obj)!=j.res){++ld_stale;return;}
     {
         const GeometryKey key{local_geometry_enabled()?j.res:j.res>>32,0,j.size,0,0};
@@ -5250,20 +5259,20 @@ void Renderer::load_buffer(const LoadJob& j) {
     // not at dequeue, so a reused virtual address cannot feed an old job.
     static thread_local std::vector<uint8_t> snapshot;
     snapshot.resize(j.size);
-    if(!guest_copy_current_mapping(j.base,j.size,j.mapping,snapshot.data()) ||
+    if(!guest_copy_current_spans(j.base,j.size,j.mapping,snapshot.data()) ||
        opt.res_current(j.obj)!=j.res){++ld_stale;return;}
     if(local_geometry_enabled()) {
         // Early speculative recording is not part of the ordered upload cohort.
         if(list_rec)return;
         std::lock_guard lk(m);
-        if(opt.res_current(j.obj)!=j.res || guest_mapping_identity(j.base,j.size)!=j.mapping){++ld_stale;return;}
+        if(opt.res_current(j.obj)!=j.res || !guest_matches_current_spans(j.base,j.size,j.mapping,snapshot.data())){++ld_stale;return;}
         Recorder* const previous=tr;
         struct Restore {Recorder* p;~Restore(){tr=p;}} restore{previous};
         tr=&up_rec;
         up_rec.lr=true;
         if(up_rec.cur==UINT32_MAX)up_rec.submit_no=submit_seq.load(),begin_record();
         if(up_rec.cur==UINT32_MAX)return;
-        if(prepare_local_geometry({j.res,j.base,j.size},snapshot.data(),j.obj,j.mapping)){
+        if(prepare_local_geometry({j.res,j.base,j.size},snapshot.data(),j.obj,&j.mapping)){
             // Same graphics queue; execute() submits the shared upload slot
             // before recording the next ordered draw submission.
             barrier();
@@ -5271,7 +5280,7 @@ void Renderer::load_buffer(const LoadJob& j) {
         }
         return;
     }
-    if (geo_lookup_res(j.base,j.size,0,0,j.res,j.base,snapshot.data(),j.obj,j.mapping)) ++ld_buf;
+    if (geo_lookup_res(j.base,j.size,0,0,j.res,j.base,snapshot.data(),j.obj,&j.mapping)) ++ld_buf;
 }
 
 void Renderer::load_texture(const LoadJob& j) {
@@ -5294,7 +5303,7 @@ void Renderer::load_texture(const LoadJob& j) {
     if (cube) sf.layers = std::max(6u, sf.layers - sf.layers % 6);
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
-    if (!j.mapping||!sf.total_size||sf.total_size>(128ull<<20))return;
+    if(j.mapping.empty()||j.size!=sf.total_size||!sf.total_size||sf.total_size>(128ull<<20))return;
     const uint64_t key = tex_key(t, j.res);
     {
         std::lock_guard lk(m);
@@ -5306,12 +5315,12 @@ void Renderer::load_texture(const LoadJob& j) {
     // delayed past the original package's mapping lifetime.
     static thread_local std::vector<uint8_t> source;
     source.resize(sf.total_size);
-    if(!guest_copy_current_mapping(ts.base,sf.total_size,j.mapping,source.data())||
+    if(!guest_copy_current_spans(ts.base,sf.total_size,j.mapping,source.data())||
        opt.res_current(j.obj)!=j.res){++ld_stale;return;}
     const uint64_t content = hash_bytes(source.data(),sf.total_size);
     {
         std::lock_guard lk(m);
-        if (opt.res_current(j.obj)!=j.res||!guest_matches_current_mapping(ts.base,sf.total_size,j.mapping,source.data())) { ++ld_stale; return; }
+        if (opt.res_current(j.obj)!=j.res||!guest_matches_current_spans(ts.base,sf.total_size,j.mapping,source.data())) { ++ld_stale; return; }
         auto it = textures.find(key);
         if (it != textures.end() && it->second && !it->second->stale) {
             Image* img = it->second.get();
@@ -5352,7 +5361,7 @@ void Renderer::load_texture(const LoadJob& j) {
     if (up_rec.cur == UINT32_MAX) return;
     // Recheck the resource epoch after acquiring m. For a normal surface the
     // upload consumes the already-detiled CPU scratch; streaming uses its own ranges.
-    if(opt.res_current(j.obj)!=j.res||!guest_matches_current_mapping(ts.base,sf.total_size,j.mapping,source.data())){
+    if(opt.res_current(j.obj)!=j.res||!guest_matches_current_spans(ts.base,sf.total_size,j.mapping,source.data())){
         ++ld_stale;return;
     }
     if (upload_texture(t,j.res,j.obj,scratch.data(),total,sf.total_size,content)) ++ld_tex;
@@ -6446,11 +6455,25 @@ void fill_late(const LateCb& l, uint64_t src, uint32_t size) {
 }
 void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj) {
     if (!g || !res || !g->load_on) return;
-    Renderer::LoadJob j{1, {}, 0, 0, res, obj};
-    std::memcpy(j.t, tsharp, 32);
-    j.base=fmt::decode_tsharp(j.t).base;
-    j.mapping=guest_mapping_identity(j.base,1);
-    if(j.mapping)g->prefetch(j);
+    Renderer::LoadJob j{1,{},0,0,res,obj};
+    std::memcpy(j.t,tsharp,32);
+    const auto ts=fmt::decode_tsharp(j.t);
+    const auto fi=fmt::data_format(ts.dfmt);
+    if(!ts.base||!fi.bpp||fi.bpp==96||ts.width>16384||ts.height>16384)return;
+    if(ts.type!=10&&ts.type!=12&&ts.type!=13){
+        const auto info=g->get_stream_info(res,obj,ts);
+        if(!info.valid||(info.has_hi&&info.full_mips>1))return;
+    }
+    tiling::Surface sf;
+    sf.tile_mode=ts.tiling;sf.bpp=fi.bpp;sf.block=fi.block;sf.pow2=ts.pow2;
+    sf.width=ts.width;sf.height=ts.height;sf.pitch=ts.pitch;
+    sf.depth=ts.type==10?ts.depth:1;
+    sf.layers=(ts.type==12||ts.type==13||ts.type==11)?ts.last_array+1:1;
+    if(ts.type==11)sf.layers=std::max(6u,sf.layers-sf.layers%6);
+    sf.levels=std::min(ts.last_level+1,tiling::kMaxMips);
+    tiling::layout(sf);
+    j.base=ts.base;j.size=sf.total_size;
+    if(j.size&&j.size<=(128ull<<20)&&guest_capture_read_spans(j.base,j.size,j.mapping))g->prefetch(j);
 }
 void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64_t low_base,uint64_t hi_base,
                          const uint32_t* low_descriptor){
@@ -6503,8 +6526,8 @@ void prefetch_shader_pair(const uint8_t* vs_obj, const uint8_t* ps_obj) {
 }
 void prefetch_buffer(uint64_t base, uint64_t size, uint64_t res, uint64_t obj) {
     if (!g || !res || !g->load_on || !size || size >= (64ull<<20)) return;
-    const uint64_t mapping=guest_mapping_identity(base,size);
-    if(mapping)g->prefetch({0, {}, base, size, res, obj, mapping});
+    Renderer::LoadJob j{0,{},base,size,res,obj};
+    if(guest_capture_read_spans(base,size,j.mapping))g->prefetch(j);
 }
 void prefetch_shader(const uint8_t* shader, bool vs, uint64_t res, uint64_t obj) {
     if (!g || !res || !shader) return;
