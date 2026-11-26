@@ -46,6 +46,7 @@ namespace d1 {
 void* hook_eboot_function(uint64_t off, const void* host);  // hooks.cpp
 bool replace_eboot_function(uint64_t off, const void* host);  // hooks.cpp
 uint64_t guest_region_extent(uint64_t addr);                // hle_kernel.cpp
+void register_native_host_region(uint64_t base, uint64_t size);
 uint64_t gpu_flip_count();                                  // hle_gpu.cpp
 uint64_t gpu_queue_wait_ns();                               // hle_gpu.cpp
 
@@ -887,6 +888,7 @@ uint8_t* arena_chunk() {
             if (p) os::release(p, kArenaSize);
         }
         if (!g_arena) { log("nd: no command-buffer arena below 1 TiB"); return nullptr; }
+        register_native_host_region(uint64_t(g_arena), kArenaSize);
         for (uint32_t i = uint32_t(kArenaSize / kArenaChunk); i-- > 0;) g_arena_free.push_back(i);
         log("nd: command-buffer arena at %p (%llu MiB)", (void*)g_arena, (unsigned long long)(kArenaSize >> 20));
     }
@@ -912,9 +914,7 @@ D1_SYSV void* s_alloc(uint64_t cb, uint32_t bytes, uint32_t align_log2) {
         static uint8_t* cur = nullptr;
         static size_t used = 0;
         if (!cur || used + need > kArenaChunk) {
-            g_global_alloc_m.unlock();
             uint8_t* ch = arena_chunk();
-            g_global_alloc_m.lock();
             if (!ch) return nullptr;
             g_global_alloc.push_back(ch), cur = ch, used = 0;
         }
@@ -1010,9 +1010,31 @@ std::deque<std::pair<uint64_t, std::vector<uint8_t*>>> g_retired;
 void retire_chunks(std::vector<uint8_t*>&& cs) {
     const uint64_t now = gpu_flip_count();
     std::lock_guard lk(g_retired_m);
-    while (!g_retired.empty() && g_retired.front().first + 3 <= now) {
-        for (uint8_t* c : g_retired.front().second) arena_free(c);
-        g_retired.pop_front();
+    // Constants can remain inherited across arbitrarily many flips. Do not
+    // recycle their backing chunks solely because three frames have elapsed.
+    // Other captured pointers retain the existing conservative grace period;
+    // full capture ownership will replace it in the native allocator.
+    auto inherited = [](uint8_t* chunk) {
+        const uint64_t base = uint64_t(chunk);
+        for (int s = 0; s < ng::kStages; ++s)
+            for (int i = 0; i < 16; ++i) {
+                const uint64_t addr = nr::g_ce[s][i].addr;
+                if (nr::g_ce_known[s][i] && addr >= base && addr - base < kArenaChunk)
+                    return true;
+            }
+        return false;
+    };
+    for (auto it = g_retired.begin(); it != g_retired.end();) {
+        if (it->first + 3 > now) break;
+        auto& chunks = it->second;
+        for (size_t i = 0; i < chunks.size();) {
+            if (inherited(chunks[i])) { ++i; continue; }
+            arena_free(chunks[i]);
+            chunks[i] = chunks.back();
+            chunks.pop_back();
+        }
+        if (chunks.empty()) it = g_retired.erase(it);
+        else ++it;
     }
     if (!cs.empty()) g_retired.emplace_back(now, std::move(cs));
 }
