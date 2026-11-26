@@ -37,7 +37,6 @@
 #include "native_asset_suballocation.h"
 #include "../gfx/native_resource_move.h"
 #include "../gfx/native_texture_constructor.h"
-#include "../gfx/tiling.h"
 #include "native_record_registry.h"
 #include "../gfx/native_record_fifo.h"
 #include "../gfx/native_cbm_contract.h"
@@ -2423,7 +2422,7 @@ bool native_gfx_install() {
     opt.frames_dir = getenv("D1_NG_FRAMES");
     opt.no_cull = getenv("D1_NG_NOCULL") != nullptr;
     opt.dump_targets = getenv("D1_NG_TARGETS") != nullptr;
-    if(getenv("D1_NG_COMPARE_LAYOUT"))opt.compare_layout=&nd::texture_constructor::compare_native_layout;
+    if(getenv("D1_NG_COMPARE_LAYOUT"))opt.compare_layout=&resev::texture_constructor::compare_native_layout;
     const Settings& st = settings();
     opt.present_mode = st.vsync == "on" ? "Fifo" : st.vsync == "off-tearing" ? "Immediate" : "Mailbox";
     static std::string cache_file;
