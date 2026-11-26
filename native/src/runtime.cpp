@@ -432,12 +432,7 @@ void link_all() {
 
     std::map<std::string, void*> thunk_cache;  // key importer|nid|lib
     size_t n_game = 0, n_hle = 0, n_unimpl = 0, n_obj = 0, n_native_libc = 0;
-    const char* leaf_mode = getenv("D1_PC_LIBC_LEAVES");
-    const bool native_leaves = !leaf_mode || std::atoi(leaf_mode) != 0;
-    const char* math_mode = getenv("D1_PC_LIBC_MATH");
-    const bool native_math = !math_mode || std::atoi(math_mode) != 0;
     const bool trace_fios = getenv("D1_FIOS_TRACE") != nullptr;
-    const bool native_fios = native_fios_enabled();
     std::set<std::string> fios_nids;
     size_t n_native_fios = 0;
     for (auto& m : mods) {
@@ -472,8 +467,8 @@ void link_all() {
                 }
                 const bool is_object = (s.info & 0xF) == 1;
                 std::string key = m.name + "|" + nid + "|" + lib;
-                void* leaf = native_leaves && lib == "libc" && !is_object ? native_libc_leaf(nid, native_math) : nullptr;
-                if (native_fios && lib == "libSceFios2") {
+                void* leaf = lib == "libc" && !is_object ? native_libc_leaf(nid, true) : nullptr;
+                if (lib == "libSceFios2") {
                     auto* target = is_object ? nullptr : native_fios_import(nid);
                     if (!target) throw std::runtime_error(m.name + ": uncovered native FIOS import " + nid);
                     // The original PRX is absent in this mode. Do not silently
@@ -504,20 +499,6 @@ void link_all() {
                     ++n_native_libc;
                 } else if (auto ex = exports.find({nid, lib}); ex != exports.end()) {
                     value = ex->second;
-                    // Only instrument original FIOS function imports. Keep data
-                    // relocations and all other original exports untouched.
-                    if (trace_fios && lib == "libSceFios2" && !is_object && r.type == 7) {
-                        auto& t = thunk_cache[key];
-                        if (!t) {
-                            auto nm = names.find(nid);
-                            auto* ii = new ImportInfo{nm != names.end() ? nm->second : nid, lib, m.name,
-                                                      reinterpret_cast<void*>(value)};
-                            ii->fios_trace = true;
-                            g_imports.push_back(ii);
-                            t = make_thunk(g_imports.size() - 1, ii->target, true);
-                        }
-                        value = reinterpret_cast<uint64_t>(t);
-                    }
                     ++n_game;
                 } else if (auto h = hle.find(nid); h != hle.end()) {
                     if (h->second->object) {
@@ -563,7 +544,7 @@ void link_all() {
             m.name.c_str(), m.base, m.size, m.entry ? describe_addr(m.entry).c_str() : "-",
             m.init ? describe_addr(m.init).c_str() : "-", m.tls_modid, m.tls_memsz, p);
     }
-    if (native_fios) {
+    {
         if (fios_nids.size() != 25) throw std::runtime_error("native FIOS: unexpected import closure size (expected 25 distinct NIDs)");
         log("native FIOS: linked %zu distinct NIDs, %zu relocations without original PRX", fios_nids.size(), n_native_fios);
     }
