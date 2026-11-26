@@ -45,5 +45,36 @@ int main(){
     check(calls==1&&shared.bytes()==1024);
     shared.prune([](uint64_t){return false;});
     check(shared.bytes()==0);
-    std::puts("native geometry: exact epoch, failed capture, pressure, pin/consumer ownership and 8000 concurrent acquisitions passed");
+    // A pending claim must reserve budget, but cannot serialize unrelated
+    // asset ingestion or be reclaimed by the retirement path.
+    GeometrySources independent(128);
+    std::atomic<bool> entered{false},release{false},ready{false};
+    std::thread slow([&]{
+        auto source=independent.capture(old,[&](uint8_t* p,uint64_t n){
+            entered.store(true,std::memory_order_release);
+            while(!release.load(std::memory_order_acquire))std::this_thread::yield();
+            std::memset(p,0x19,n);return true;
+        });
+        check(source&&source->at(0)==0x19);
+    });
+    while(!entered.load(std::memory_order_acquire))std::this_thread::yield();
+    independent.prune([](uint64_t){return false;});
+    check(independent.bytes()==64);
+    std::thread fast([&]{
+        auto source=independent.capture(other,[](uint8_t* p,uint64_t n){std::memset(p,0x25,n);return true;});
+        check(source&&source->at(0)==0x25);
+        ready.store(true,std::memory_order_release);
+    });
+    while(!ready.load(std::memory_order_acquire))std::this_thread::yield();
+    check(independent.bytes()==128);
+    release.store(true,std::memory_order_release);
+    slow.join();fast.join();
+    check(independent.get(old)->at(0)==0x19&&independent.get(other)->at(0)==0x25);
+    independent.prune([](uint64_t){return false;});
+    check(independent.bytes()==0);
+    // A throwing reader releases its reservation and permits a retry.
+    check(!independent.capture(old,[](uint8_t*,uint64_t)->bool{throw 1;}));
+    check(independent.bytes()==0);
+    check(bool(independent.capture(old,[](uint8_t* p,uint64_t n){std::memset(p,0,n);return true;})));
+    std::puts("native geometry: exact epochs, failed capture, pressure, pin/consumer ownership, independent pending claims and 8000 concurrent acquisitions passed");
 }
