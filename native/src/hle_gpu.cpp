@@ -18,15 +18,9 @@
 
 #include "hle.h"
 #include "os.h"
-#include "render_bridge.h"
+#include "frame_telemetry.h"
 #include "runtime.h"
 #include "settings.h"
-
-#ifdef D1_RENDERER_SHADPS4
-static constexpr bool kHaveRenderer = true;
-#else
-static constexpr bool kHaveRenderer = false;
-#endif
 
 namespace d1 {
 
@@ -171,37 +165,10 @@ static int32_t sceKernelAddGpuExceptionEvent(Equeue* q, void* udata) {
 }
 HLE("sceKernelAddGpuExceptionEvent", sceKernelAddGpuExceptionEvent)
 
-static bool g_gpu_real = false;
-static bool gpu_real() { return kHaveRenderer && g_gpu_real; }
-static bool g_late = false;
-static double g_late_secs = 0;
-static render::Callbacks g_late_cb{};
-static bool builders_real() { return kHaveRenderer && (g_gpu_real || g_late); }
-static void maybe_attach_renderer();
-
-static int g_render_every = 0;
-static bool g_render_async = false;
-static int g_frame_mode = -1;
-static uint64_t g_frame_no = 0;
-static bool frame_rendered() {
-    if (!gpu_real() || (g_render_every <= 1 && !g_render_async)) return true;
-    if (g_frame_mode < 0) {
-        bool draw;
-        if (g_render_async) draw = render::idle();
-        else if (!(draw = g_frame_no % uint64_t(g_render_every) == 0)) render::wait_idle();
-        g_frame_mode = draw ? 1 : 0;
-    }
-    return g_frame_mode == 1;
-}
-static void frame_end() {
-    g_frame_mode = -1;
-    ++g_frame_no;
-}
-
 bool native_gfx_active();
 bool native_gfx_on_fault(void* uc, void* addr);
 void native_gfx_on_unmap(uint64_t addr, uint64_t size);
-bool gpu_active() { return gpu_real() || native_gfx_active(); }
+bool gpu_active() { return native_gfx_active(); }
 
 void native_gfx_flip(void* addr, uint32_t width, uint32_t height);
 
@@ -213,7 +180,15 @@ struct FlipStatus {
     int32_t gc_queue_num, flip_pending_num, current_buffer;
     uint32_t reserved1;
 };
-using BufferAttribute = render::VoAttr;
+// Retail ABI layout; translated here, never exposed to the native frontend.
+struct BufferAttribute {
+    uint32_t pixel_format, tiling_mode;
+    int32_t aspect_ratio;
+    uint32_t width, height, pitch_in_pixel;
+    uint32_t option, reserved0;
+    uint64_t reserved1;
+};
+static_assert(sizeof(BufferAttribute) == 40);
 static struct VideoOutPort {
     std::mutex m;
     FlipStatus status{0, 0, 0, -1, 0, 0, 0, 0, -1, 0};
@@ -242,7 +217,6 @@ static int32_t sceVideoOutRegisterBuffers(int32_t, int32_t start, void* const* a
     for (int i = 0; i < num && start + i < 16; ++i) g_vo.buffers[start + i] = addrs[i];
     if (attr) g_vo.attr = *attr;
     g_vo.registered = std::max(g_vo.registered, start + num);
-    if (gpu_real() && attr) render::register_buffers(start, addrs, num, *attr);
     log("video out: %d buffers registered, %ux%u pitch %u format %#x tiling %u", num, g_vo.attr.width,
         g_vo.attr.height, g_vo.attr.pitch_in_pixel, g_vo.attr.pixel_format, g_vo.attr.tiling_mode);
     return 0;
@@ -357,13 +331,6 @@ void push_flip(int32_t buf, int64_t arg);
 }
 static int32_t sceVideoOutSubmitFlip(int32_t, int32_t index, int32_t, int64_t arg) {
     note_guest_frame();
-    if (gpu_real() && frame_rendered()) {
-        frame_end();
-        { std::lock_guard lk(g_vo.m); ++g_vo.status.flip_pending_num; }
-        render::cpu_flip(index, arg);
-        return SCE_OK;
-    }
-    if (gpu_real()) frame_end();
     if (gpuq::enabled()) {
         { std::lock_guard lk(g_vo.m); ++g_vo.status.flip_pending_num; }
         gpuq::push_flip(index, arg);
@@ -535,7 +502,7 @@ std::atomic<uint64_t> wait_ns{0};
 
 bool enabled() {
     static const bool on = [] { const char* v = getenv("D1_NG_ASYNC"); return !v || std::atoi(v) != 0; }();
-    return on && !gpu_real() && native_gfx_active();
+    return on && native_gfx_active();
 }
 void run(Job& j) {
     if (j.native) {
@@ -638,10 +605,6 @@ static int32_t submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* dcb
 
 static int32_t sceGnmSubmitCommandBuffers(uint32_t count, uint32_t* const* dcbs, const uint32_t* dcb_sizes,
                                           uint32_t* const* ccbs, const uint32_t* ccb_sizes) {
-    if (gpu_real() && frame_rendered()) {
-        render::submit(count, dcbs, dcb_sizes, ccbs, ccb_sizes);
-        return SCE_OK;
-    }
     return submit(count, dcbs, dcb_sizes);
 }
 HLE("sceGnmSubmitCommandBuffers", sceGnmSubmitCommandBuffers)
@@ -649,16 +612,6 @@ static int32_t sceGnmSubmitAndFlipCommandBuffers(uint32_t count, uint32_t* const
                                                  uint32_t* const* ccbs, const uint32_t* ccb_sizes, uint32_t,
                                                  uint32_t buf, uint32_t, int64_t arg) {
     note_guest_frame();
-    maybe_attach_renderer();
-    if (gpu_real() && frame_rendered()) {
-        frame_end();
-        {
-            std::lock_guard lk(g_vo.m);
-            ++g_vo.status.flip_pending_num;
-            ++g_vo.status.gc_queue_num;
-        }
-        return render::submit_and_flip(count, dcbs, dcb_sizes, ccbs, ccb_sizes, buf, arg);
-    }
     if (gpuq::enabled()) {
         { std::lock_guard lk(g_vo.m); ++g_vo.status.flip_pending_num; ++g_vo.status.gc_queue_num; }
         gpuq::push_submit_and_flip(count, dcbs, dcb_sizes, int32_t(buf), arg);
@@ -666,16 +619,11 @@ static int32_t sceGnmSubmitAndFlipCommandBuffers(uint32_t count, uint32_t* const
     }
     submit(count, dcbs, dcb_sizes);
     if (buf < 16) native_gfx_flip(g_vo.buffers[buf], g_vo.attr.width, g_vo.attr.height);
-    if (gpu_real()) {
-        frame_end();
-        if (buf < 16) g_vo.labels[buf] = 1;
-    }
     do_flip(int32_t(buf), arg);
     return SCE_OK;
 }
 HLE("sceGnmSubmitAndFlipCommandBuffers", sceGnmSubmitAndFlipCommandBuffers)
 static int32_t sceGnmSubmitDone() {
-    if (gpu_real()) render::submit_done();
     return SCE_OK;
 }
 HLE("sceGnmSubmitDone", sceGnmSubmitDone)
@@ -695,34 +643,31 @@ static void write_nop(uint32_t* p, uint32_t n) {
     std::memset(p + 1, 0, (n - 1) * 4);
 }
 static uint32_t sceGnmDrawInitDefaultHardwareState(uint32_t* cmd, uint32_t size) {
-    if (builders_real()) return render::draw_init_default_hw_state(cmd, size);
     if (size < 0x100) return 0;
     write_nop(cmd, 0x100);
     return 0x100;
 }
 HLE("sceGnmDrawInitDefaultHardwareState", sceGnmDrawInitDefaultHardwareState)
 static uint32_t sceGnmDispatchInitDefaultHardwareState(uint32_t* cmd, uint32_t size) {
-    if (builders_real()) return render::dispatch_init_default_hw_state(cmd, size);
     if (size < 0x100) return 0;
     write_nop(cmd, 0x100);
     return 0x100;
 }
 HLE("sceGnmDispatchInitDefaultHardwareState", sceGnmDispatchInitDefaultHardwareState)
 
-#define D1_SHADER_SETTER(NAME, CALL, ...)                                   \
+#define D1_SHADER_SETTER(NAME, ...)                                   \
     static int32_t NAME(uint32_t* cmd, uint32_t size, const uint32_t* regs __VA_OPT__(, ) __VA_ARGS__) { \
-        if (builders_real()) return CALL;                                   \
         if (!cmd) return -1;                                                \
         write_nop(cmd, size);                                               \
         return SCE_OK;                                                      \
     }
-D1_SHADER_SETTER(sceGnmSetPsShader, render::set_ps_shader(cmd, size, regs))
-D1_SHADER_SETTER(sceGnmSetCsShader, render::set_cs_shader(cmd, size, regs))
-D1_SHADER_SETTER(sceGnmSetGsShader, render::set_gs_shader(cmd, size, regs))
-D1_SHADER_SETTER(sceGnmSetVsShader, render::set_vs_shader(cmd, size, regs, mod), uint32_t mod)
-D1_SHADER_SETTER(sceGnmSetEsShader, render::set_es_shader(cmd, size, regs, mod), uint32_t mod)
-D1_SHADER_SETTER(sceGnmSetLsShader, render::set_ls_shader(cmd, size, regs, mod), uint32_t mod)
-D1_SHADER_SETTER(sceGnmSetHsShader, render::set_hs_shader(cmd, size, regs, param), uint32_t param)
+D1_SHADER_SETTER(sceGnmSetPsShader)
+D1_SHADER_SETTER(sceGnmSetCsShader)
+D1_SHADER_SETTER(sceGnmSetGsShader)
+D1_SHADER_SETTER(sceGnmSetVsShader, uint32_t mod)
+D1_SHADER_SETTER(sceGnmSetEsShader, uint32_t mod)
+D1_SHADER_SETTER(sceGnmSetLsShader, uint32_t mod)
+D1_SHADER_SETTER(sceGnmSetHsShader, uint32_t param)
 #undef D1_SHADER_SETTER
 HLE("sceGnmSetPsShader", sceGnmSetPsShader)
 HLE("sceGnmSetVsShader", sceGnmSetVsShader)
@@ -732,107 +677,25 @@ HLE("sceGnmSetGsShader", sceGnmSetGsShader)
 HLE("sceGnmSetHsShader", sceGnmSetHsShader)
 HLE("sceGnmSetLsShader", sceGnmSetLsShader)
 static int32_t sceGnmInsertWaitFlipDone(uint32_t* cmd, uint32_t size, int32_t, uint32_t buf) {
-    if (gpu_real()) return render::insert_wait_flip_done(cmd, size, buf);
-    if (builders_real() && size == 7 && buf < 16) {
-        const uint64_t a = reinterpret_cast<uint64_t>(&g_vo.labels[buf]) & ~3ull;
-        const uint32_t pkt[7] = {0xC0053C00u, 0x13u, uint32_t(a), uint32_t(a >> 32), 0u, 0xFFFFFFFFu, 10u};
-        std::memcpy(cmd, pkt, sizeof pkt);
-        return SCE_OK;
-    }
     write_nop(cmd, size);
     return SCE_OK;
 }
 HLE("sceGnmInsertWaitFlipDone", sceGnmInsertWaitFlipDone)
 
-void gpu_init() {
-    if (!kHaveRenderer) return;
-    render::Callbacks cb{};
-    cb.eop = signal_eop;
-    cb.flip = do_flip;
-    cb.labels = g_vo.labels;
-    if (uint64_t pp = rt().modules[0].proc_param) cb.sdk_version = uint32_t(*reinterpret_cast<const uint64_t*>(pp + 0x10));
-    const Settings& st = settings();
-    cb.window_width = st.window_width;
-    cb.window_height = st.window_height;
-    cb.fullscreen = st.fullscreen;
-    cb.overlay = st.overlay;
-    static const std::string cache_dir = rt().data_root + "/shader_cache";
-    cb.cache_dir = cache_dir.c_str();
-    cb.present_mode = st.vsync == "on" ? "Fifo" : st.vsync == "off-tearing" ? "Immediate" : "Mailbox";
-    if (const char* v = getenv("D1_RENDER_EVERY")) g_render_every = std::max(0, std::atoi(v));
-    if (const char* v = getenv("D1_RENDER_ASYNC")) g_render_async = v[0] == '1';
-    if (g_render_every > 1 || g_render_async)
-        log("GPU: drawing %s (the other frames go through the null GPU)",
-            g_render_async ? "whenever the renderer is idle" : ("every " + std::to_string(g_render_every) + "th frame").c_str());
-    if (const char* v = getenv("D1_RENDERER_LATE")) {
-        g_late = true;
-        g_late_secs = std::atof(v);
-        g_late_cb = cb;
-        log("GPU: null GPU until %.0f s into activity:in_world, then the renderer (D1_RENDERER_LATE)", g_late_secs);
-        return;
-    }
-    g_gpu_real = render::init(cb);
-    if (!g_gpu_real) log("GPU: null GPU (nothing is drawn)");
-}
-
-void for_each_guest_region(void (*fn)(uint64_t addr, uint64_t size));
-
-static void maybe_attach_renderer() {
-    if (!g_late || g_gpu_real) return;
-    static std::chrono::steady_clock::time_point t_world{};
-    static const char* want = getenv("D1_RENDERER_LATE_STATE") ? getenv("D1_RENDERER_LATE_STATE") : "activity:in_world";
-    const char* st = game_state();
-    if (!st || std::strncmp(st, want, std::strlen(want)) != 0) {
-        t_world = {};
-        return;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    if (t_world == std::chrono::steady_clock::time_point{}) t_world = now;
-    if (std::chrono::duration<double>(now - t_world).count() < g_late_secs) return;
-    g_late = false;
-    if (!render::init(g_late_cb)) {
-        log("GPU: late renderer start failed; staying on the null GPU");
-        return;
-    }
-    for_each_guest_region([](uint64_t a, uint64_t n) { render::on_map(a, n); });
-    {
-        std::lock_guard lk(g_vo.m);
-        if (g_vo.registered > 0) {
-            void* addrs[16];
-            for (int i = 0; i < g_vo.registered && i < 16; ++i) addrs[i] = g_vo.buffers[i];
-            render::register_buffers(0, addrs, g_vo.registered, g_vo.attr);
-        }
-    }
-    g_gpu_real = true;
-    log("GPU: renderer started (late attach)");
-}
-
 void gpu_on_map(uint64_t addr, uint64_t size) {
     native_gfx_on_unmap(addr, size);
-    if (gpu_real()) render::on_map(addr, size);
 }
 void gpu_on_unmap(uint64_t addr, uint64_t size) {
     native_gfx_on_unmap(addr, size);
-    if (gpu_real()) render::on_unmap(addr, size);
 }
 bool native_gfx_research_fault(void* uc, void* addr);
 bool gpu_on_fault(void* uc, void* addr) {
     if (native_gfx_research_fault(uc, addr)) return true;
     if (native_gfx_on_fault(uc, addr)) return true;
-    if (!gpu_real()) return false;
-    const uint64_t t0 = now_ns();
-    if (!render::on_fault(uc, addr)) return false;
-    auto& p = render::perf();
-    ++p.faults;
-    p.fault_ns += now_ns() - t0;
-    return true;
+    return false;
 }
 
 void print_gpu_summary() {
-    if (gpu_real()) {
-        render::print_summary();
-        return;
-    }
     log("null GPU: %llu packets, %llu flips", g_packets.load(), g_frames.load());
     for (int op = 0; op < 256; ++op)
         if (g_op_counts[op]) log("  PM4 op %#04x x%llu", op, g_op_counts[op]);
