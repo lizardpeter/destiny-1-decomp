@@ -841,7 +841,7 @@ struct Renderer {
     };
     std::mutex load_m;
     std::condition_variable load_cv;
-    std::deque<LoadJob> load_q;
+    std::deque<LoadJob> load_q,texture_q; // independent FIFO for latency-sensitive texture ingestion
     std::unordered_set<uint64_t> load_pending; // speculative work only; first use remains authoritative
     static uint64_t load_key(const LoadJob& j) {
         uint64_t h=mix(mix(mix(j.kind,j.res),j.obj),mix(j.base,j.size));
@@ -867,12 +867,13 @@ struct Renderer {
         {
             std::lock_guard lk(load_m);
             if (!load_pending.insert(load_key(j)).second) return;
-            if (load_q.size() >= 20000) {
-                load_pending.erase(load_key(load_q.front()));
-                load_q.pop_front();
-                ++ld_dropped; // draws upload anything that was dropped
+            if(load_q.size()+texture_q.size()>=20000){
+                auto& drop=load_q.empty()?texture_q:load_q;
+                load_pending.erase(load_key(drop.front()));
+                drop.pop_front();
+                ++ld_dropped;
             }
-            load_q.push_back(j);
+            (j.kind==1||j.kind==4?texture_q:load_q).push_back(j);
         }
         load_cv.notify_one();
     }
@@ -2609,7 +2610,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                         ts.width==smi.full_w&&ts.height==smi.full_h&&ts.last_level+1==smi.full_mips;
     const bool streamed=split_resource&&!top_only;
     if(prepared&&(!res||streamed))return nullptr; // prepared jobs describe one contiguous registered surface
-    if(split_prepared&&(!streamed||prepared))return nullptr;
+    if(split_prepared&&(!split_resource||prepared))return nullptr;
     if (streamed) {
         // 7D4480 constructs a half-size low descriptor (BC dimensions may be
         // rounded up to four) or a full-size high descriptor.
@@ -3024,7 +3025,8 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         if (ok && res) {
             img->res_val = res, img->res_obj = smi.obj ? smi.obj : obj;
             img->src_addr=ts.base;img->src_size=cur_bytes;img->version=~0ull;
-            img->content=prepared?prepared_hash:hash_bytes(primary_source.data(),cur_bytes);
+            img->content=prepared?prepared_hash:split_prepared?
+                hash_bytes(split_prepared->front().tiled.data(),cur_bytes):hash_bytes(primary_source.data(),cur_bytes);
             if(top_only)++top_only_uploads;
         } else if (ok && (opt.watch || dynamic_copy)) {
             const uint64_t tw = now_ns();
@@ -5902,13 +5904,18 @@ void Renderer::start_loader() {
     load_on = (!v || std::atoi(v) != 0) && opt.res_current != nullptr;
     if (!load_on) return;
     loader = std::thread([this] {
+        unsigned consecutive_textures=0;
         for (;;) {
             LoadJob j;
             {
                 std::unique_lock lk(load_m);
-                load_cv.wait(lk, [&] { return !load_q.empty(); });
-                j = load_q.front();
-                load_q.pop_front();
+                load_cv.wait(lk,[&]{return !load_q.empty()||!texture_q.empty();});
+                // Texture streaming must not sit behind thousands of vertex
+                // buffer jobs. Bound the preference so shaders/buffers progress.
+                const bool texture=!texture_q.empty()&&(load_q.empty()||consecutive_textures<3);
+                auto& queue=texture?texture_q:load_q;
+                j=std::move(queue.front());queue.pop_front();
+                consecutive_textures=texture?std::min(3u,consecutive_textures+1):0;
             }
             const uint64_t t0 = now_ns();
             if (opt.res_current(j.obj) != j.res) ++ld_stale;
@@ -6125,7 +6132,7 @@ void Renderer::load_split_texture(const LoadJob& j){
     };
     if(high){
         if(ts.base!=info.hi_base||j.low_base!=info.low_base||
-           !prepare(j.low,j.low_base,j.low_size,j.low_mapping,info.full_mips-1,1)||
+           (info.low_base&&!prepare(j.low,j.low_base,j.low_size,j.low_mapping,info.full_mips-1,1))||
            !prepare(j.t,j.base,j.size,j.mapping,1,0))return;
     }else if(ts.base!=info.low_base||ts.last_level+1!=info.full_mips-1||
               !prepare(j.t,j.base,j.size,j.mapping,info.full_mips-1,1))return;
@@ -7329,12 +7336,12 @@ void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64
     }
     if(!tsharp)return;
     if(!info.has_hi||info.full_mips<2){prefetch_texture(tsharp,res,obj);return;}
-    if(!g->load_on||!info.valid||!info.low_base||g->opt.res_current(obj)!=res)return;
+    if(!g->load_on||!info.valid||(!info.low_base&&!info.hi_base)||g->opt.res_current(obj)!=res)return;
     Renderer::LoadJob job{4,{},0,0,res,obj};
     std::memcpy(job.t,tsharp,32);
     const auto ts=fmt::decode_tsharp(job.t);
     const bool high=ts.last_level+1==info.full_mips;
-    if(high?(ts.base!=info.hi_base||!info.low_words[0]):
+    if(high?(ts.base!=info.hi_base||(info.low_base&&!info.low_words[0])):
              (ts.base!=info.low_base||ts.last_level+1!=info.full_mips-1))return;
     auto span=[&](const uint32_t* words,uint32_t levels,uint64_t& base,uint64_t& size,MappingSpans& mapping){
         tiling::Surface sf;
@@ -7344,7 +7351,7 @@ void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64
         return size&&size<=(128ull<<20)&&guest_capture_read_spans(base,size,mapping);
     };
     if(!span(job.t,high?1:info.full_mips-1,job.base,job.size,job.mapping))return;
-    if(high){
+    if(high&&info.low_base){
         std::memcpy(job.low,info.low_words.data(),32);
         if(!span(job.low,info.full_mips-1,job.low_base,job.low_size,job.low_mapping))return;
     }
@@ -7714,7 +7721,7 @@ void print_stats() {
         size_t q;
         {
             std::lock_guard lk(g->load_m);
-            q = g->load_q.size();
+            q = g->load_q.size()+g->texture_q.size();
         }
         log("native renderer: loader: %llu textures and %llu buffers uploaded ahead of use, %llu moves kept, %llu already done, "
             "%llu dropped as changed again, %llu over the queue limit | %.1f ms of loader time, %zu queued",
