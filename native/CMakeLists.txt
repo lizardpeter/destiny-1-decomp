@@ -162,3 +162,8 @@ add_executable(pc-libc-math-test tests/pc_libc_math_test.cpp)
 target_include_directories(pc-libc-math-test PRIVATE src)
 target_compile_options(pc-libc-math-test PRIVATE -frounding-math)
 add_test(NAME pc-libc-math COMMAND pc-libc-math-test)
+
+add_executable(pc-staging-test tests/pc_staging_test.cpp)
+target_include_directories(pc-staging-test PRIVATE src)
+target_link_libraries(pc-staging-test PRIVATE Threads::Threads)
+add_test(NAME pc-staging COMMAND pc-staging-test "${CMAKE_CURRENT_BINARY_DIR}/pc-staging-test.bin")
