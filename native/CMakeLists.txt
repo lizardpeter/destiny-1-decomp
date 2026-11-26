@@ -293,3 +293,7 @@ add_test(NAME native-texture-identity COMMAND native-texture-identity-test)
 add_executable(native-epoch-cohort-test tests/native_epoch_cohort_test.cpp)
 target_include_directories(native-epoch-cohort-test PRIVATE gfx)
 add_test(NAME native-epoch-cohort COMMAND native-epoch-cohort-test)
+
+add_executable(native-shader-slots-test tests/native_shader_slots_test.cpp)
+target_include_directories(native-shader-slots-test PRIVATE gfx)
+add_test(NAME native-shader-slots COMMAND native-shader-slots-test)

@@ -17,6 +17,7 @@
 #include "native_descriptor_slots.h"
 #include "native_texture_identity.h"
 #include "native_epoch_cohort.h"
+#include "native_shader_slots.h"
 #include "../src/native_ranges.h"
 #include "../src/host_memory.h"
 
@@ -936,7 +937,7 @@ struct Renderer {
     uint64_t dma_tex_hits = 0, feedback_draws = 0, readback_stale = 0, cpu_stale = 0;
     uint64_t texture_range_rejects=0, split_partial_kept=0, split_descriptor_rejects=0, texture_upload_failures=0;
     uint64_t resident_descriptor_hits=0,readback_unused_skipped=0,split_layout_guesses=0,expired_texture_epochs=0;
-    uint64_t texture_cohort_splits=0,texture_draw_epoch_conflicts=0;
+    uint64_t texture_cohort_splits=0,texture_draw_epoch_conflicts=0,unused_texture_slots=0;
     std::atomic<uint64_t> expired_gpu_results{0};
     // The GPU's results reached guest memory (a readback): copies made from that memory (a
     // texture over a render target's memory, e.g. glyphs drawn into a cache texture) are stale.
@@ -4272,7 +4273,7 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
     for (size_t k = 0; k < n; ++k) {
         const Draw& dr = *run[k];
         for (int st2 = 0; st2 < 2; ++st2)
-            for (uint32_t msk = dr.tex_mask[st2]; msk; msk &= msk - 1) {
+            for (uint32_t msk = dr.active_tex_mask[st2]; msk; msk &= msk - 1) {
                 const uint32_t slot = __builtin_ctz(msk);
                 if (dr.tex_res[st2][slot] != 0) continue;  // registered textures are never render targets
                 const uint32_t* t = dr.tex[st2][slot];
@@ -4659,8 +4660,8 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
     for (size_t di = 0; di < count; ++di) {
         Draw& dr = *draws[di];
         if (dr.kind != Draw::Indexed && dr.kind != Draw::Auto) continue;
-        dr.shader_res[0] = dr.vs && opt.res_current ? opt.res_current(uint64_t(dr.vs)) : 0;
-        dr.shader_res[1] = dr.ps && opt.res_current ? opt.res_current(uint64_t(dr.ps)) : 0;
+        // The shader identity and sampled-slot set were selected in
+        // pre_pass. Keep the same selection for feedback and resolution.
         if (!dr.vb_sig) {
             uint64_t vsig = 0;
             for (uint32_t i = 0; i < 16; ++i)
@@ -4670,7 +4671,7 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
         for (int s = 0; s < 2; ++s) {
             uint64_t tsig = 0;
             uint16_t fmask = 0;
-            for (uint32_t msk = dr.tex_mask[s]; msk; msk &= msk - 1) {
+            for (uint32_t msk = dr.active_tex_mask[s]; msk; msk &= msk - 1) {
                 const uint32_t slot = __builtin_ctz(msk);
                 const uint32_t* T = dr.tex[s][slot];
                 const gcn::TexDim dim = slot_dim(T);
@@ -5191,9 +5192,15 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     const uint64_t epoch = ++preparation_epoch;
     for (size_t di = 0; di < count; ++di) {
         Draw* d = draws[di];
-        if (d->kind != Draw::Indexed && d->kind != Draw::Auto) continue;
+        if(d->kind!=Draw::Indexed&&d->kind!=Draw::Auto)continue;
+        d->shader_res[0]=d->vs&&opt.res_current?opt.res_current(uint64_t(d->vs)):0;
+        d->shader_res[1]=d->ps&&opt.res_current?opt.res_current(uint64_t(d->ps)):0;
+        d->active_tex_mask[0]=d->tex_mask[0]&shader_slots(shader_tex_mask64(d->vs,true,d->shader_res[0]));
+        d->active_tex_mask[1]=d->tex_mask[1]&shader_slots(shader_tex_mask64(d->ps,false,d->shader_res[1]));
+        unused_texture_slots+=std::popcount(uint32_t(d->tex_mask[0]&~d->active_tex_mask[0]))+
+                              std::popcount(uint32_t(d->tex_mask[1]&~d->active_tex_mask[1]));
         for (int s = 0; s < 2; ++s)
-            for (uint32_t mask = d->tex_mask[s]; mask; mask &= mask - 1) {
+            for (uint32_t mask = d->active_tex_mask[s]; mask; mask &= mask - 1) {
                     const uint32_t i = __builtin_ctz(mask);
                     const uint32_t* t = d->tex[s][i];
                     const uint64_t k = hash_bytes(t, 32) ^ d->tex_res[s][i];
@@ -7003,6 +7010,8 @@ void print_stats() {
             double(g->texture_history_bytes)/1048576.0,(unsigned long long)g->texture_history_hits,
             (unsigned long long)g->texture_history_drops);
         g->texture_history_hits=g->texture_history_drops=0;
+        log("native renderer: unused bound texture slots avoided %llu",(unsigned long long)g->unused_texture_slots);
+        g->unused_texture_slots=0;
         {
             std::lock_guard dl(g->bindless_m);
             uint32_t live=0,peak=0,binding=0;

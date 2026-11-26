@@ -41,6 +41,7 @@ struct Draw {
     uint32_t tex[kStages][16][8] = {};
     uint32_t smp[kStages][16][4] = {};
     uint16_t tex_mask[kStages] = {}, smp_mask[kStages] = {};
+    uint16_t active_tex_mask[kStages] = {}; // published translator mask, intersected with captured bindings
     const uint32_t* T(int s, uint32_t i) const { return (tex_mask[s] >> (i & 15) & 1) ? tex[s][i & 15] : nullptr; }
     const uint32_t* S(int s, uint32_t i) const { return (smp_mask[s] >> (i & 15) & 1) ? smp[s][i & 15] : nullptr; }
     struct Cb { uint64_t addr; uint32_t size; } cb[kStages][16] = {};
