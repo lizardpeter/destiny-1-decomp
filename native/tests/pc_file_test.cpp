@@ -10,7 +10,7 @@ static void require(bool b) { if (!b) { std::fputs("native file service regressi
 int main(int argc, char** argv) {
     require(argc == 2);
     const std::filesystem::path path = argv[1];
-    std::filesystem::remove(path);
+    // Exclusive creation below refuses to overwrite an existing test path.
     std::error_code ec;
     {
         Queue q(4, 128);
@@ -42,12 +42,17 @@ int main(int argc, char** argv) {
         require(!f->write_at(0, nullptr, 1));
         require(f->seek(0, File::Origin::begin).bytes == 0);
         require(f->read(actual.data(), actual.size()).bytes == actual.size() && actual == model);
-        // Sparse file beyond 4 GiB verifies 64-bit positions.
+        // Verify 64-bit positions without allocating a huge non-sparse Windows file.
         constexpr uint64_t large = (1ull << 32) + 17;
+        require(f->seek(large, File::Origin::begin).bytes == large);
+        require(f->tell() == large);
+#ifndef _WIN32
         unsigned char v = 73, out = 0;
         require(f->write_at(large, &v, 1).bytes == 1);
         require(f->size().bytes == large + 1);
         require(f->read_at(large, &out, 1).bytes == 1 && out == v);
+#endif
+        require(f->seek(0, File::Origin::begin).bytes == 0);
         require(!f->sync());
         // Each async write owns its own snapshot; each job uses disjoint offsets.
         std::atomic<unsigned> callbacks{0};
