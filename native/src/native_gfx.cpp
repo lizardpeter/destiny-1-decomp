@@ -597,7 +597,14 @@ D1_SYSV uint64_t allocate(uint64_t bytes,uint32_t tag,uint8_t top,int32_t index)
     const bool growable=nr::eb<uint8_t>(0x1AF9CE8)!=0;
     const auto a=asset_suballocation::allocate(s,bytes,top!=0,growable);
     if(a.path==asset_suballocation::Path::fallback)return original_alloc(bytes,tag,top,index);
-    if(a.path==asset_suballocation::Path::grow_low){
+    if(a.path==asset_suballocation::Path::grow_high){
+        // Preserve the original padding and used-side mutation even if
+        // the following physical/host commit fails.
+        store(r,0x50,field<uint64_t>(r,0x50)+a.padding);
+        store(r,0x48,s.high_backed);
+        if(!commit(r+8,a.growth,1))return 0;
+        store(r,0x38,s.committed+a.growth);
+    } else if(a.path==asset_suballocation::Path::grow_low){
         if(!commit(r+8,a.growth,0))return 0;
         store(r,0x38,s.committed+a.growth);
     }

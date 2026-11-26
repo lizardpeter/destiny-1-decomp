@@ -30,6 +30,13 @@ int main(){
                                 s.high_used=h.used;
                                 auto r=release(s,h.address,n*a,true,true,false,true);
                                 check(r.handled&&r.success&&!r.dirty&&r.used==hu*a);
+                            }else if(n<=cap-lo-hi){
+                                check(h.path==Path::grow_high&&h.growth==n*a);
+                                check(h.padding==(hi-hu)*a&&h.used==(hi+n)*a);
+                                check(h.address==b+(cap-hi-n)*a);
+                                State next{b,h.low_backed,h.high_backed,s.capacity,s.committed+h.growth,s.low_used,h.used};
+                                auto r=release(next,h.address,n*a,true,true,false,true);
+                                check(r.handled&&r.success&&!r.dirty&&r.used==hi*a);
                             }else check(h.path==Path::fallback);
                             ++cases;
                         }
@@ -41,6 +48,12 @@ int main(){
     auto dirty=release(s,b,128,true,true,false,true);
     check(dirty.handled&&dirty.success&&dirty.dirty);
     check(!release(s,b+2*a,128,true,true,false,false).handled);
+    State grow{b,a,a,4*a,2*a,128,128};
+    auto high=allocate(grow,a,false,true);
+    check(high.path==Path::grow_low&&high.growth==a);
+    high=allocate(grow,a,true,true);
+    check(high.path==Path::grow_high&&high.padding==a-128&&high.growth==a);
+    check(high.address==b+2*a&&high.used==2*a);
     State broken=s;broken.committed=1;
     check(allocate(broken,128,false,true).path==Path::fallback);
     std::printf("native asset suballocation: %llu layout cases passed\n",(unsigned long long)cases);

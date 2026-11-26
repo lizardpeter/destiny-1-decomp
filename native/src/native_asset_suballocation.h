@@ -9,10 +9,10 @@ struct State {
     uint64_t base=0, low_backed=0, high_backed=0, capacity=0;
     uint64_t committed=0, low_used=0, high_used=0;
 };
-enum class Path { fallback, ready, grow_low };
+enum class Path { fallback, ready, grow_low, grow_high };
 struct Allocation {
     Path path=Path::fallback;
-    uint64_t address=0, low_backed=0, high_backed=0, used=0, growth=0;
+    uint64_t address=0, low_backed=0, high_backed=0, used=0, growth=0, padding=0;
 };
 constexpr bool valid(const State& s) {
     return s.base&&s.base<asset_region::address_limit&&s.capacity<=asset_region::address_limit-s.base&&
@@ -28,11 +28,21 @@ constexpr Allocation allocate(const State& s,uint64_t bytes,bool top,bool growab
             s.low_backed,s.high_backed,(top?s.high_used:s.low_used)+bytes,0};
     }
     if(top) {
-        // GPU region top growth has a separate padding ledger at +0x50.
-        // Existing backed space needs none of that machinery.
-        if(bytes>s.high_backed-s.high_used)return {};
-        return {Path::ready,s.base+s.capacity-s.high_used-bytes,
-            s.low_backed,s.high_backed,s.high_used+bytes,0};
+        const uint64_t slack=s.high_backed-s.high_used;
+        if(bytes<=slack)
+            return {Path::ready,s.base+s.capacity-s.high_used-bytes,
+                s.low_backed,s.high_backed,s.high_used+bytes,0};
+        // 0xB2CA4..0xB2CB3: GPU region discards the entire remaining
+        // high-side slack into its padding ledger before committing.
+        // Handle a single successful growth only; full-backed redistribution
+        // and multi-iteration exhaustion retain the original slow path.
+        const uint64_t gap=s.capacity-s.committed;
+        if(bytes>gap)return {};
+        const uint64_t rounded=(bytes+asset_region::alignment-1)&~(asset_region::alignment-1);
+        const uint64_t growth=rounded<gap?rounded:gap;
+        if(growth<bytes||(growth&(asset_region::alignment-1)))return {};
+        return {Path::grow_high,s.base+s.capacity-s.high_backed-bytes,
+            s.low_backed,s.high_backed+growth,s.high_backed+bytes,growth,slack};
     }
     if(bytes>s.capacity-s.low_used-s.high_used)return {};
     const uint64_t end=s.low_used+bytes;
