@@ -11,6 +11,7 @@
 // points at one samples it directly. Device memory for images is suballocated from large
 // blocks. Flips blit the video-out target into the window's swapchain.
 #include "nrender.h"
+#include "../src/native_ranges.h"
 
 #include <algorithm>
 #include <array>
@@ -804,7 +805,7 @@ struct Renderer {
                 const uint64_t n = d->inline_vertices.size();
                 if (n && d->caller >= 0x10000 && guest_region_extent(d->caller) >= n) {
                     std::memcpy(reinterpret_cast<void*>(d->caller), d->inline_vertices.data(), n);
-                    ranges.emplace_back(d->caller, d->caller + n);
+                    ranges.emplace_back(d->caller, n);
                     dma_texture_check(d->caller, n);
                 }
                 continue;
@@ -817,7 +818,7 @@ struct Renderer {
                 std::memmove(reinterpret_cast<void*>(d->caller), reinterpret_cast<const void*>(d->index_addr), d->count);
             } else continue;
             if (!d->count) continue;
-            ranges.emplace_back(d->caller, d->caller + d->count);
+            ranges.emplace_back(d->caller, d->count);
             dma_texture_check(d->caller, d->count);
         }
         if (ranges.empty()) return;
@@ -826,24 +827,12 @@ struct Renderer {
         if (include_writes) rc().dstate.stage_valid[0] = rc().dstate.stage_valid[1] = false;
         // Preserve actual copy order above. Only the subsequent notification
         // ranges are merged; visit the native image table once per list.
-        std::sort(ranges.begin(), ranges.end());
-        size_t last = 0;
-        for (size_t i = 1; i < ranges.size(); ++i) {
-            if (ranges[i].first <= ranges[last].second)
-                ranges[last].second = std::max(ranges[last].second, ranges[i].second);
-            else ranges[++last] = ranges[i];
-        }
-        ranges.resize(last + 1);
+        ranges = native_ranges::merged_writes(ranges);
         if (dynamic_copy) {
             std::lock_guard dl(dyn_m);
             for (const auto& [a, e] : ranges) dyn_q.emplace_back(a, e - a);
         }
-        auto overlaps = [&](uint64_t a, uint64_t n) {
-            if (!n) return false;
-            auto it = std::upper_bound(ranges.begin(), ranges.end(), std::make_pair(a, UINT64_MAX));
-            return (it != ranges.end() && it->first < a + n) ||
-                   (it != ranges.begin() && std::prev(it)->second > a);
-        };
+        auto overlaps = [&](uint64_t a, uint64_t n) { return native_ranges::overlaps(ranges, a, n); };
         bool changed = false;
         for (auto& [key, img] : textures) {
             if (!img || img->stale) continue;
@@ -886,53 +875,35 @@ struct Renderer {
             std::lock_guard lk(dyn_m);
             q.swap(dyn_q);
         }
-        // any texture copy over memory the CPU wrote is stale, engine resources included: the
-        // engine writes some resource textures itself (lock / unlock), with no resource event
-        if (!q.empty() && !textures.empty()) {
-            std::vector<std::pair<uint64_t, uint64_t>> r;  // (start, end), sorted and merged
-            for (auto [a, n] : q) r.push_back({a, a + std::max<uint64_t>(n, 1)});
-            std::sort(r.begin(), r.end());
-            size_t k = 0;
-            for (size_t i = 1; i < r.size(); ++i)
-                if (r[i].first <= r[k].second) r[k].second = std::max(r[k].second, r[i].second);
-                else r[++k] = r[i];
-            r.resize(k + 1);
-            for (auto& [key, img] : textures) {
-                if (!img || img->stale) continue;
-                auto overlaps = [&](uint64_t a, uint64_t n) {
-                    if (!n) return false;
-                    auto it = std::upper_bound(r.begin(), r.end(), std::make_pair(a, UINT64_MAX));
-                    return (it != r.end() && it->first < a + n) || (it != r.begin() && std::prev(it)->second > a);
-                };
-                if (!overlaps(img->src_addr, img->src_size) &&
-                    !(img->low_loaded && overlaps(img->low_base, img->low_size)) &&
-                    !(img->hi_loaded && overlaps(img->hi_base, img->hi_size))) continue;
-                const uint64_t a = img->src_addr;
-                img->stale = true, ++cpu_stale, ++views_gen;
-                static int told = 0;
-                if (told++ < 30 && std::getenv("D1_NG_LOG_DYN"))
-                    log("native renderer: CPU write into texture %#llx %ux%u fmt %d (%s): copied again", (unsigned long long)a, img->w,
-                        img->h, int(img->format), img->res_val ? "engine resource" : "dynamic");
-            }
+        if (q.empty()) return;
+        dyn_events += q.size();
+        const auto ranges = native_ranges::merged_writes(q);
+        auto overlaps = [&](uint64_t base, uint64_t size) { return native_ranges::overlaps(ranges, base, size); };
+        // A notification can overlap multiple nested watched allocations.
+        // A predecessor lookup at the write address misses earlier, wider
+        // intervals. Visit each watched range once against the merged writes.
+        for (auto& [base, entry] : dyn_mem) {
+            if (!overlaps(base, std::max<uint64_t>(entry.first, 1))) continue;
+            ++entry.second;
+            ++dyn_bumps;
+            if (dyn_targets.count(base)) ++dyn_target_bumps;
         }
-        for (auto [a, n] : q) {
-            ++dyn_events;
-            const uint64_t end = a + std::max<uint64_t>(n, 1);
-            auto it = dyn_mem.upper_bound(a);
-            if (it != dyn_mem.begin()) --it;
-            for (; it != dyn_mem.end() && it->first < end; ++it)
-                if (it->first + std::max<uint64_t>(it->second.first, 1) > a) {
-                    ++it->second.second, ++dyn_bumps;
-                    if (dyn_targets.count(it->first)) {
-                        ++dyn_target_bumps;
-                        static const bool log_t = std::getenv("D1_NG_LOG_DYN") != nullptr;
-                        static int told = 0;
-                        if (log_t && told++ < 60)
-                            log("native renderer: CPU write %#llx +%llu marks render target %#llx (+%llu) rewritten", (unsigned long long)a,
-                                (unsigned long long)n, (unsigned long long)it->first, (unsigned long long)it->second.first);
-                    }
-                }
+        bool changed = false;
+        for (auto& [key, img] : textures) {
+            if (!img || img->stale) continue;
+            if (!overlaps(img->src_addr, img->src_size) &&
+                !(img->low_loaded && overlaps(img->low_base, img->low_size)) &&
+                !(img->hi_loaded && overlaps(img->hi_base, img->hi_size))) continue;
+            img->stale = true;
+            ++cpu_stale;
+            changed = true;
+            static int told = 0;
+            if (std::getenv("D1_NG_LOG_DYN") && told++ < 30)
+                log("native renderer: CPU write into texture %#llx %ux%u fmt %d (%s): copied again",
+                    (unsigned long long)img->src_addr, img->w, img->h, int(img->format),
+                    img->res_val ? "engine resource" : "dynamic");
         }
+        if (changed) ++views_gen;
     }
     // write tracking, or (dynamic_copy) the generation of the range
     uint64_t mem_watch(uint64_t base, uint64_t size) {
