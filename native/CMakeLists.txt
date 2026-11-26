@@ -247,3 +247,7 @@ set_tests_properties(native-record-fifo PROPERTIES TIMEOUT 60)
 add_executable(native-mapping-contract-test tests/native_mapping_contract_test.cpp)
 target_include_directories(native-mapping-contract-test PRIVATE src)
 add_test(NAME native-mapping-contract COMMAND native-mapping-contract-test)
+
+add_executable(native-resource-binding-test tests/native_resource_binding_test.cpp)
+target_include_directories(native-resource-binding-test PRIVATE gfx)
+add_test(NAME native-resource-binding COMMAND native-resource-binding-test)

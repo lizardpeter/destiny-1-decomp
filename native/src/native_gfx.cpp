@@ -38,6 +38,7 @@
 #include "native_submission.h"
 #include "../gfx/native_close_contract.h"
 #include "../gfx/native_resource_identity.h"
+#include "../gfx/native_resource_binding.h"
 #include "runtime.h"
 #include "tiling.h"
 
@@ -239,10 +240,10 @@ void prefetch(uint32_t type, uint64_t o) {
     }
     if (type >= 1 && type <= 3) {
         ng::prefetch_texture(reinterpret_cast<const uint32_t*>(o), res, o);
-    } else if (type == 4) ng::prefetch_buffer(field<uint64_t>(o, 0x28), field<uint32_t>(o, 0), res, o);
-    else if (type == 6) {
-        const uint32_t isz = field<uint32_t>(o, 0x38);
-        ng::prefetch_buffer(field<uint64_t>(o, 0x30), uint64_t(field<uint32_t>(o, 0x3C)) * (isz ? 4 : 2), res, o);
+    } else if(type==4||type==6) {
+        const auto b=type==4?ng::binding::vertex_source(reinterpret_cast<const void*>(o)):
+                             ng::binding::index_source(reinterpret_cast<const void*>(o));
+        ng::prefetch_buffer(b.base,b.size,res,o);
     }
 }
 void event(uint32_t type, uint32_t handle, bool insert) {
@@ -546,17 +547,42 @@ D1_SYSV void h_pool_free(uint32_t value) {
     if(retiring)registry->end_pool_retire(pool);
 }
 uint64_t tex_base(const uint32_t* t) { return (uint64_t(t[0]) | uint64_t(t[1] & 0xFF) << 32) << 8; }
-using SetFn = D1_SYSV uint64_t (*)(uint32_t, uint32_t, uint64_t);
+// Both switch dispatchers and their leaves define AL, not full RAX.
+using SetFn = D1_SYSV bool (*)(uint32_t, uint32_t, uint64_t);
 SetFn o_bind, o_rebind;
-D1_SYSV uint64_t h_bind(uint32_t type, uint32_t handle, uint64_t addr) {
-    const uint64_t r = o_bind(type, handle, addr);
-    nr::resreg::event(type, handle, true);
-    return r;
+bool native_bind_enabled() {
+    static const bool enabled=[] {
+        const char* v=std::getenv("D1_PC_NATIVE_BIND");
+        return v&&std::atoi(v)!=0;
+    }();
+    return enabled;
 }
-D1_SYSV uint64_t h_rebind(uint32_t type, uint32_t handle, uint64_t addr) {
-    const uint64_t r = o_rebind(type, handle, addr);
-    nr::resreg::event(type, handle, true);
-    return r;
+bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint) {
+    if(native_bind_enabled()) {
+        using namespace ng::binding;
+        const bool supported=(type>=1&&type<=4)||type==6||type==8||type==18;
+        if(supported) {
+            const uint64_t obj=handle==UINT32_MAX?0:nr::resolve_handle_safe(handle);
+            const auto result=apply(type,repoint,reinterpret_cast<void*>(obj),addr);
+            if(result!=Result::bound)return false;
+            if(type!=18) {
+                // Publish once from the already resolved object. Geometry
+                // creation takes a native byte range directly from this event.
+                nr::resreg::touch(obj,true,handle);
+                nr::resreg::prefetch(type,obj);
+            }
+            return true;
+        }
+    }
+    const bool ok=(repoint?o_rebind:o_bind)(type,handle,addr);
+    if(ok)nr::resreg::event(type,handle,true);
+    return ok;
+}
+D1_SYSV bool h_bind(uint32_t type,uint32_t handle,uint64_t addr) {
+    return resource_bind(type,handle,addr,false);
+}
+D1_SYSV bool h_rebind(uint32_t type,uint32_t handle,uint64_t addr) {
+    return resource_bind(type,handle,addr,true);
 }
 using RelFn = D1_SYSV void (*)(uint32_t, uint32_t);
 RelFn o_release;
