@@ -36,6 +36,7 @@
 #include "native_asset_region.h"
 #include "native_asset_suballocation.h"
 #include "../gfx/native_resource_move.h"
+#include "../gfx/native_pool_contract.h"
 #include "../gfx/native_texture_constructor.h"
 #include "../gfx/native_small_surface_layout.h"
 #include "native_record_registry.h"
@@ -695,8 +696,24 @@ PoolFreeFn o_pool_free;
 D1_SYSV void h_pool_free(uint32_t value) {
     const uint32_t pool=value&0x3FFFu;
     auto* registry=nr::resreg::g_registry;
+    const auto root=[] {return nr::eb<uint64_t>(0x1a238b8);};
+    // No-op release is not a lifetime event.
+    if(!ng::pool::occupied(root(),pool))return;
     const bool retiring=registry&&registry->begin_pool_retire(pool);
-    o_pool_free(value);
+    static const bool native=[]{
+        const char* v=std::getenv("D1_PC_NATIVE_POOL_DESTROY");
+        return !v||std::atoi(v)!=0;
+    }();
+    if(native){
+        using Notify=D1_SYSV void(*)(uint32_t,uint32_t);
+        using Free=D1_SYSV void(*)(uint64_t);
+        using ReleaseTag=D1_SYSV void(*)(uint32_t);
+        ng::pool::destroy(value,root,[](uint32_t i,uint16_t kind){
+            if(auto cb=nr::eb<uint64_t>(0x1a238f0))reinterpret_cast<Notify>(cb)(i,kind);
+            if(auto cb=nr::eb<uint64_t>(0x1a238f8))reinterpret_cast<Notify>(cb)(i,kind);
+        },[](uint64_t p){reinterpret_cast<Free>(nr::g_base+0x75860)(p);},
+          [](uint16_t tag){reinterpret_cast<ReleaseTag>(nr::g_base+0xaf8f0)(tag);});
+    }else o_pool_free(value);
     if(retiring)registry->end_pool_retire(pool);
 }
 uint64_t tex_base(const uint32_t* t) { return (uint64_t(t[0]) | uint64_t(t[1] & 0xFF) << 32) << 8; }
@@ -974,11 +991,9 @@ using Two = D1_SYSV void (*)(uint64_t, uint64_t);
 Two o_copy, o_swap;
 namespace relocation {
 using Unary=D1_SYSV void(*)(uint64_t);
-using PoolLookup=D1_SYSV uint64_t(*)(uint32_t);
 using ClockFn=D1_SYSV uint32_t(*)();
 using Query=D1_SYSV uint64_t(*)(uint32_t,uint32_t,uint32_t,uint32_t);
 using Split=D1_SYSV uint64_t(*)(uint64_t,uint32_t,uint32_t,uint32_t*);
-using SetDatum=D1_SYSV void(*)(uint32_t,uint64_t,uint32_t);
 using SizeFn=D1_SYSV uint64_t(*)(uint32_t*);
 using Link=D1_SYSV void(*)(uint32_t,uint16_t);
 using Finalize=D1_SYSV void(*)(uint32_t,uint32_t,uint32_t);
@@ -1090,14 +1105,14 @@ void swap(uint32_t a,uint32_t b){
     using namespace ng::move;
     if(a==UINT32_MAX)return;
     const uint32_t source_id=primary(b);
-    leaf<PoolLookup>(0x6FB60)(pool_index(a));
-    leaf<PoolLookup>(0x6FB60)(pool_index(b));
+    // 6FB60 only reads the pool occupancy and returns a pointer.
+    // The original caller discards both results; no native call is necessary.
     const uint64_t source=datum(b), delta=query(a,b,1);
     const uint64_t destination=source+delta;
     const uint32_t destination_id=primary(a);
     const auto bytes=leaf<SizeFn>(0x6DBD0)(&a);
-    leaf<SetDatum>(0x6F5A0)(a,destination,relocation_flags(bytes));
-    leaf<SetDatum>(0x6F5A0)(b,source,relocation_flags(delta));
+    ng::pool::set_datum(nr::eb<uint64_t>(0x1a23898),a,destination,relocation_flags(bytes));
+    ng::pool::set_datum(nr::eb<uint64_t>(0x1a23898),b,source,relocation_flags(delta));
     const uint64_t e1=entry(source_id),e2=entry(destination_id);
     ng::binding::store(reinterpret_cast<void*>(e2),0,destination);
     leaf<Link>(0xDE1E0)(destination_id,container_index(source_id));
