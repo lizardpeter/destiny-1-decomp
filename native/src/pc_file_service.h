@@ -29,6 +29,9 @@ public:
     Queue::Id read_staged(Queue::Id id, uint64_t off, uint64_t n, Queue::Delivery delivery, Queue::Callback cb, std::error_code& ec) {
         return queue_.read_staged(id, off, n, std::move(delivery), std::move(cb), ec);
     }
+    Queue::Id submit_task(Queue::Task task, Queue::Callback cb, std::error_code& ec) {
+        return queue_.submit_task(std::move(task), std::move(cb), ec);
+    }
     uint64_t staging_bytes() const { return queue_.staging_bytes(); }
     Result wait(Queue::Id id) { return queue_.wait(id); }
     bool poll(Queue::Id id, Result& result) { return queue_.poll(id, result); }
