@@ -1,6 +1,7 @@
 // Linker, import thunks, call tracing, TLS and crash reporting.
 #include "runtime.h"
 #include "fios_imports.h"
+#include "guest_call4_asm.h"
 
 #include "os.h"
 #if D1_WINDOWS
@@ -251,23 +252,6 @@ d1_call_guest:
     mov %rsi, %rdi
     mov %rdx, %rsi
     mov %rcx, %rdx
-    call *%rax
-    mov %rbx, %rsp
-    pop %rbx
-    pop %rbp
-    ret
-    .globl d1_call_guest4
-d1_call_guest4:
-    push %rbp
-    push %rbx
-    mov %rsp, %rbx
-    and $-16, %rsp
-    lea d1_root_frame(%rip), %rbp
-    mov %rdi, %rax
-    mov %rsi, %rdi
-    mov %rdx, %rsi
-    mov %rcx, %rdx
-    mov %r8, %rcx
     call *%rax
     mov %rbx, %rsp
     pop %rbx
