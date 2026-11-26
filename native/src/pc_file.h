@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -23,6 +24,9 @@ struct Result {
 };
 inline std::error_code error(std::errc e) { return std::make_error_code(e); }
 inline std::error_code os_error() { return {errno, std::generic_category()}; }
+inline bool valid_range(uint64_t offset, uint64_t size) {
+    return offset <= uint64_t(INT64_MAX) && size <= uint64_t(INT64_MAX) - offset && size <= SIZE_MAX;
+}
 enum class Access { read, write, read_write };
 struct OpenOptions {
     Access access = Access::read;
@@ -37,8 +41,7 @@ class File {
     Result transfer(bool write, void* dst, const void* src, uint64_t size, uint64_t offset) {
         if ((write && access_ == Access::read) || (!write && access_ == Access::write))
             return {0, error(std::errc::bad_file_descriptor)};
-        constexpr uint64_t max_offset = uint64_t(INT64_MAX);
-        if (offset > max_offset || size > max_offset - offset || size > SIZE_MAX ||
+        if (!valid_range(offset, size) ||
             (size && !(write ? src : dst))) return {0, error(std::errc::invalid_argument)};
 #ifdef _WIN32
         // CRT positional I/O is implemented as seek + transfer under a per-file lock.
@@ -88,8 +91,17 @@ public:
         const int fd = ::open(path.c_str(), flags | O_CLOEXEC, 0644);
 #endif
         if (fd < 0) { ec = os_error(); return {}; }
-        auto f = std::shared_ptr<File>(new File(fd, options.access));
-        return f;
+        File* raw;
+        try { raw = new File(fd, options.access); }
+        catch (...) {
+#ifdef _WIN32
+            _close(fd);
+#else
+            ::close(fd);
+#endif
+            throw;
+        }
+        return std::shared_ptr<File>(raw);
     }
     Result read_at(uint64_t offset, void* dst, uint64_t size) { return transfer(false, dst, nullptr, size, offset); }
     Result write_at(uint64_t offset, const void* src, uint64_t size) { return transfer(true, nullptr, src, size, offset); }
