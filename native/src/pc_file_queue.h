@@ -3,7 +3,7 @@
 #include "pc_io_budget.h"
 #include <span>
 #include <condition_variable>
-#include <deque>
+#include <list>
 #include <functional>
 #include <thread>
 #include <unordered_map>
@@ -12,8 +12,9 @@
 namespace d1::pc_io {
 // Accepted work retains its file independently of the public handle. The
 // caller must keep read buffers alive until completion. Writes own a snapshot.
-// A completion callback executes outside service locks, after publishing result.
-// Callbacks must not destroy this service or wait for work on this same pool.
+// A dedicated serial callback thread executes after result publication, outside
+// service locks. Callbacks may wait for I/O, but must not destroy this service
+// or wait for a future callback on the same dispatcher. Delivery runs on I/O workers.
 class Queue {
 public:
     using Id = uint32_t;
@@ -33,21 +34,25 @@ private:
         bool done = false;
     };
     std::mutex m_;
-    std::condition_variable work_, complete_;
+    std::condition_variable work_, complete_, callback_ready_;
     std::unordered_map<Id, std::shared_ptr<File>> files_;
     std::unordered_map<Id, std::shared_ptr<Op>> ops_;
-    std::deque<std::pair<Id, std::shared_ptr<Op>>> jobs_;
+    using Jobs = std::list<std::pair<Id, std::shared_ptr<Op>>>;
+    Jobs jobs_, callbacks_;
     std::vector<std::thread> workers_;
+    std::thread callback_thread_;
     Id next_file_ = 1, next_op_ = 1;
     size_t limit_;
     ByteBudget budget_;
-    bool stopping_ = false;
+    bool stopping_ = false, callbacks_stopping_ = false;
     void worker() {
         for (;;) {
             std::unique_lock lock(m_);
             work_.wait(lock, [&] { return stopping_ || !jobs_.empty(); });
             if (jobs_.empty()) return;
-            auto [id, op] = std::move(jobs_.front()); jobs_.pop_front();
+            Jobs in_flight;
+            in_flight.splice(in_flight.end(), jobs_, jobs_.begin());
+            auto& op = in_flight.front().second;
             lock.unlock();
             Result r;
             if (op->write) r = op->file->write_at(op->offset, op->bytes.data(), op->size);
@@ -63,10 +68,31 @@ private:
             op->storage.reset();
             lock.lock();
             op->result = r; op->done = true;
+            const bool callback = bool(op->callback);
+            if (callback) callbacks_.splice(callbacks_.end(), in_flight);
             lock.unlock();
             complete_.notify_all();
-            if (op->callback) op->callback(id, r);
+            if (callback) callback_ready_.notify_one();
         }
+    }
+    void dispatch_callbacks() {
+        for (;;) {
+            std::unique_lock lock(m_);
+            callback_ready_.wait(lock, [&] { return callbacks_stopping_ || !callbacks_.empty(); });
+            if (callbacks_.empty()) return;
+            auto [id, op] = std::move(callbacks_.front());
+            callbacks_.pop_front();
+            lock.unlock();
+            op->callback(id, op->result);
+        }
+    }
+    void stop() {
+        { std::lock_guard lock(m_); stopping_ = true; }
+        work_.notify_all();
+        for (auto& t : workers_) if (t.joinable()) t.join();
+        { std::lock_guard lock(m_); callbacks_stopping_ = true; }
+        callback_ready_.notify_all();
+        if (callback_thread_.joinable()) callback_thread_.join();
     }
     Id submit(Id file, std::shared_ptr<Op> op, std::error_code& ec) {
         std::lock_guard lock(m_);
@@ -86,21 +112,16 @@ public:
     explicit Queue(unsigned workers = 2, size_t max_operations = 1024, uint64_t max_bytes = 256ull << 20)
         : limit_(max_operations), budget_(max_bytes) {
         try {
+            callback_thread_ = std::thread([this] { dispatch_callbacks(); });
             for (unsigned i = 0; i < std::max(1u, workers); ++i) workers_.emplace_back([this] { worker(); });
         } catch (...) {
-            { std::lock_guard lock(m_); stopping_ = true; }
-            work_.notify_all();
-            for (auto& t : workers_) t.join();
+            stop();
             throw;
         }
     }
     Queue(const Queue&) = delete;
     Queue& operator=(const Queue&) = delete;
-    ~Queue() {
-        { std::lock_guard lock(m_); stopping_ = true; }
-        work_.notify_all();
-        for (auto& t : workers_) t.join();
-    }
+    ~Queue() { stop(); }
     Id open(const std::filesystem::path& path, OpenOptions options, std::error_code& ec) {
         auto file = File::open(path, options, ec);
         if (!file) return 0;
