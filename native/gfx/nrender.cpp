@@ -579,6 +579,8 @@ struct Renderer {
     GeoShard geo_shards[64];
     GeometrySources geometry_sources;
     std::atomic<bool> geometry_source_pressure{false};
+    std::atomic<uint64_t> geometry_source_requests{0},geometry_source_rejects{0};
+    std::atomic<uint64_t> geometry_owned_range_reads{0},geometry_current_range_reads{0},geometry_range_rejects{0};
     void capture_geometry(const Draw::Res& res,bool cpu_required);
     std::mutex geo_block_m;
     uint64_t geo_bytes = 0;
@@ -3356,6 +3358,7 @@ void Renderer::capture_geometry(const Draw::Res& res,bool cpu_required){
         if(i!=sh.map.end()&&i->second.valid&&i->second.res==res.id)return;
     }
     const GeometryKey key{res.id,res.base,res.size,0,0};
+    ++geometry_source_requests;
     if(!geometry_sources.capture(key,[&](uint8_t* dst,uint64_t bytes){
         MappingSpans spans;
         return opt.res_current&&opt.res_current(res.object)==res.id&&
@@ -3363,7 +3366,10 @@ void Renderer::capture_geometry(const Draw::Res& res,bool cpu_required){
                guest_copy_current_spans(res.base,bytes,spans,dst)&&
                opt.res_current(res.object)==res.id&&
                guest_matches_current_spans(res.base,bytes,spans,dst);
-    })) geometry_source_pressure.store(true,std::memory_order_relaxed);
+    })){
+        ++geometry_source_rejects;
+        geometry_source_pressure.store(true,std::memory_order_relaxed);
+    }
 }
 
 bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot, uint64_t object, const MappingSpans* mapping,GeoHit* prepared) {
@@ -3375,6 +3381,7 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
     GeoEntry& e = sh.map[key];
     e.last_used = submit_seq.load(std::memory_order_relaxed);
     if(e.valid&&e.res==res.id){
+        __atomic_fetch_add(&st.geo_res_hits,1,__ATOMIC_RELAXED);
         if(prepared)*prepared={geo_blocks[size_t(e.block)].buf.buf,e.off,e.size,e.vfirst,e.vlast};
         return false;
     }
@@ -3443,21 +3450,25 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
 // caller copies into the ring). Buffers the game keeps rewriting are not cached for a while.
 bool Renderer::read_geometry_range(const Draw::Res& res,uint64_t address,uint64_t size,void* out){
     if(!size)return true;
-    if(address<0x10000||size>(64ull<<20))return false;
+    const auto reject=[&]{++geometry_range_rejects;return false;};
+    if(address<0x10000||size>(64ull<<20))return reject();
     if(res.id){
-        if(address<res.base||address-res.base>res.size||size>res.size-(address-res.base))return false;
+        if(address<res.base||address-res.base>res.size||size>res.size-(address-res.base))return reject();
         if(auto retained=geometry_sources.get({res.id,res.base,res.size,0,0})){
             std::memcpy(out,retained->data()+(address-res.base),size);
+            ++geometry_owned_range_reads;
             return true;
         }
         // No immutable snapshot: the address may only be used while the
         // same resource epoch still owns it. Never read a recycled pool.
-        if(!opt.res_current||!res.object||opt.res_current(res.object)!=res.id)return false;
+        if(!opt.res_current||!res.object||opt.res_current(res.object)!=res.id)return reject();
     }
     MappingSpans spans;
     if(!guest_capture_read_spans(address,size,spans)||
-       !guest_copy_current_spans(address,size,spans,out))return false;
-    return !res.id||opt.res_current(res.object)==res.id;
+       !guest_copy_current_spans(address,size,spans,out))return reject();
+    if(res.id&&opt.res_current(res.object)!=res.id)return reject();
+    if(res.id)++geometry_current_range_reads;
+    return true;
 }
 bool Renderer::geo_get(uint64_t addr,uint64_t size,int index_size,uint32_t index_count,GeoHit& hit){
     auto* entry=geo_lookup(addr,size,index_size,index_count);
@@ -6046,13 +6057,14 @@ void Renderer::load_buffer(const LoadJob& j) {
     // Only the first claimant copies from the original allocation; the
     // copy and mapping validation are outside the renderer mutex.
     const GeometryKey key{j.res,j.base,j.size,0,0};
+    ++geometry_source_requests;
     const auto source=geometry_sources.capture(key,[&](uint8_t* dst,uint64_t bytes){
         return opt.res_current(j.obj)==j.res&&
                guest_copy_current_spans(j.base,bytes,j.mapping,dst)&&
                opt.res_current(j.obj)==j.res&&
                guest_matches_current_spans(j.base,bytes,j.mapping,dst);
     });
-    if(!source){geometry_source_pressure.store(true,std::memory_order_relaxed);++ld_stale;return;}
+    if(!source){++geometry_source_rejects;geometry_source_pressure.store(true,std::memory_order_relaxed);++ld_stale;return;}
     if(list_rec)return;
     std::lock_guard lk(m);
     if(opt.res_current(j.obj)!=j.res&&!texture_leases().pinned(j.res)){++ld_stale;return;}
@@ -7878,6 +7890,13 @@ void print_stats() {
     g->t_pre_writes=g->t_pre_views=g->t_pre_geometry=g->t_run_feedback=g->t_run_resolve=g->t_run_worker_wall=g->t_run_worker_wait=0;
     log("native renderer: %llu prepared native geometry bindings consumed without recording-thread resource lookup",(unsigned long long)g->native_geometry_bindings);
     g->native_geometry_bindings=0;
+    log("native renderer: geometry source ownership %.1f MiB, %llu requests, %llu rejected | CPU slices: %llu retained, %llu current, %llu rejected",
+        double(g->geometry_sources.bytes())/1048576.0,
+        (unsigned long long)g->geometry_source_requests.exchange(0),
+        (unsigned long long)g->geometry_source_rejects.exchange(0),
+        (unsigned long long)g->geometry_owned_range_reads.exchange(0),
+        (unsigned long long)g->geometry_current_range_reads.exchange(0),
+        (unsigned long long)g->geometry_range_rejects.exchange(0));
     log("native renderer: grouped queue submissions %llu, driver calls avoided %llu",(unsigned long long)g->grouped_submissions,(unsigned long long)g->queue_calls_saved);
     g->grouped_submissions=g->queue_calls_saved=0;
     g->native_stage_reuse=g->inline_run_draws=g->inline_runs=0;
