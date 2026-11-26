@@ -33,6 +33,7 @@
 #include "hle.h"
 #include "os.h"
 #include "frame_telemetry.h"
+#include "host_memory.h"
 #include "runtime.h"
 #include "tiling.h"
 
@@ -47,11 +48,6 @@ namespace d1 {
 
 void* hook_eboot_function(uint64_t off, const void* host);  // hooks.cpp
 bool replace_eboot_function(uint64_t off, const void* host);  // hooks.cpp
-uint64_t guest_region_extent(uint64_t addr);                // hle_kernel.cpp
-uint64_t guest_mapping_identity(uint64_t addr, uint64_t size);
-bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
-                                 void (*write)(void*, void*), void* context);
-void register_native_host_region(uint64_t base, uint64_t size);
 uint64_t gpu_flip_count();                                  // hle_gpu.cpp
 uint64_t gpu_queue_wait_ns();                               // hle_gpu.cpp
 
