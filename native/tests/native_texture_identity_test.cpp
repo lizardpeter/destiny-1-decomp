@@ -64,5 +64,35 @@ int main(){
         check(registry.pinned(7)&&registry.pinned(8)&&!registry.pinned(9));
     }
     check(!registry.pinned(7)&&!registry.pinned(8));
+    // A single epoch may expose multiple source layouts. Each distinct
+    // source needs preparation, while every view-only alias shares a lease.
+    {
+        const uint64_t epoch=(uint64_t(77)<<32)|3;
+        uint32_t first[8]{1,0xabc00007,0x1234,0x90230000,0x55,6,7,8};
+        uint32_t alias[8],other[8];
+        for(unsigned i=0;i<8;++i)alias[i]=other[i]=first[i];
+        alias[1]^=0x12300;alias[3]^=0x1234;
+        other[0]+=1;other[2]+=1;
+        TextureLeaseSet a(registry);
+        {
+            auto guard=registry.capture();
+            check(a.pin_source(first,epoch));
+            check(!a.pin_source(alias,epoch));
+            check(a.pin_source(other,epoch));
+            check(!a.pin_source(first,epoch)); // exact-set hit after memo collision
+            check(!a.pin_source(other,epoch));
+            check(!a.pin_source(first,0));
+            check(a.pin_source(first,epoch+1));
+        }
+        check(registry.pinned(epoch)&&registry.pinned(epoch+1));
+        {
+            TextureLeaseSet b(registry);
+            auto guard=registry.capture();
+            check(b.pin_source(first,epoch));
+        }
+        check(registry.pinned(epoch));
+    }
+    check(!registry.pinned((uint64_t(77)<<32)|3));
+    check(!registry.pinned((uint64_t(77)<<32)|4));
     std::puts("split descriptor identity and independent source layout checks passed");
 }
