@@ -1223,8 +1223,14 @@ struct Renderer {
     void prune_sources(){
         std::lock_guard lk(source_m);
         for(auto it=captured_sources.begin();it!=captured_sources.end();){
-            if(texture_leases().pinned(it->first.epoch)){++it;continue;}
-            if(it->second.owned){captured_source_bytes-=it->second.owned->size;it->second.owned.reset();}
+            // Only owned CPU bytes require a lease check. A live GPU token
+            // is retained anyway; an empty entry has no bytes to protect.
+            // Avoid taking the registry mutex for every resident texture.
+            if(it->second.owned){
+                if(texture_leases().pinned(it->first.epoch)){++it;continue;}
+                captured_source_bytes-=it->second.owned->size;
+                it->second.owned.reset();
+            }
             if(!ImageLifetime<Image>::resolve(it->second.ready))it=captured_sources.erase(it);
             else ++it;
         }
@@ -3645,7 +3651,7 @@ void Renderer::trim_texture_history(bool all){
     for(auto it=texture_history.begin();it!=texture_history.end();){
         auto& list=it->second;
         for(auto p=list.begin();p!=list.end();){
-            if(all||(!(*p)->captured()&&((*p)->last_frame+120<st.frames||texture_history_bytes>budget))){
+            if(all||(((*p)->last_frame+120<st.frames||texture_history_bytes>budget)&&!(*p)->captured())){
                 texture_history_bytes-=(*p)->mem.size;
                 bury(std::move(*p));p=list.erase(p);
                 ++texture_history_drops;++views_gen;
@@ -3683,10 +3689,12 @@ void Renderer::evict_textures() {
     auto gate=texture_leases().retire();
     std::vector<TextureKey> drop;
     for (auto& [k, img] : textures) {
-        if (!img) continue;
+        // Most resident textures are recent. Filter them before consulting
+        // the original registry or acquiring the lease mutex under the gate.
+        if(!img||img->last_frame+horizon>=now)continue;
         const bool still_registered = img->res_val && img->res_obj && opt.res_current &&
                                       (opt.res_current(img->res_obj) >> 32) == (img->res_val >> 32);
-        if (!still_registered && img->last_frame + horizon < now && !img->captured()) drop.push_back(k);
+        if (!still_registered && !img->captured()) drop.push_back(k);
     }
     for (const auto& k : drop) {
         auto it = textures.find(k);
