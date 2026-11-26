@@ -105,3 +105,10 @@ if(NOT WIN32)
   add_executable(tiling-fast-test gfx/tests/tiling_fast_test.cpp)
   target_link_libraries(tiling-fast-test PRIVATE d1_gfx)
 endif()
+
+# Standalone native memory metadata regression (no Vulkan or game assets required).
+add_executable(region-extent-cache-test tests/region_extent_cache_test.cpp)
+target_include_directories(region-extent-cache-test PRIVATE src)
+target_link_libraries(region-extent-cache-test PRIVATE Threads::Threads)
+enable_testing()
+add_test(NAME region-extent-cache COMMAND region-extent-cache-test)
