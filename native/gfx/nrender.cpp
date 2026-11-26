@@ -965,7 +965,9 @@ struct Renderer {
     std::unordered_map<uint32_t, StreamMipInfo> stream_mips;  // res_id -> authored full dimensions & mip bases
     StreamMipInfo get_stream_info(uint64_t res, uint64_t obj, const fmt::TSharp& ts);
     ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res = 0);
-    Image* upload_texture(const uint32_t* t, uint64_t res = 0, uint64_t obj = 0);
+    // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
+    Image* upload_texture(const uint32_t* t, uint64_t res = 0, uint64_t obj = 0,
+                          const uint8_t* prepared = nullptr, uint64_t prepared_size = 0);
     void resolve_draw_resources(const std::vector<Draw*>& draws, bool have_lock);
     struct DiskPipeSpec {
         uint64_t vs_hash = 0, ps_hash = 0;
@@ -2141,7 +2143,8 @@ Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res, uint64_t obj, co
     return info;
 }
 
-Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
+Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
+                                const uint8_t* prepared, uint64_t prepared_size) {
     const uint64_t t_in = now_ns();
     struct LoadTimer {
         Renderer* r;
@@ -2178,7 +2181,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
     const uint64_t cur_bytes = cur_is_low ? sf.total_size : (streamed ? sf.mips[0].size : sf.total_size);
-    if (const uint64_t ext = guest_region_extent(ts.base); ext && ext < cur_bytes) return nullptr;
+    if (guest_region_extent(ts.base) < cur_bytes) return nullptr;
 
     std::unique_ptr<Image> prev;
     auto it = textures.find(key);
@@ -2186,6 +2189,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
     if (found && it->second && it->second->stale) {
         prev = std::move(it->second);
         prev->stale = false;
+        // A write event invalidates contents, not just the cache entry. Do not let
+        // the same-address streamed-mip shortcut silently reuse the dirty bytes.
+        prev->low_loaded = prev->hi_loaded = false;
         textures.erase(it), found = false; ++views_gen;
         ++st.tex_reloads;
     }
@@ -2197,8 +2203,8 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
         if (res && img->res_val) {
             const uint32_t want_base_lv = cur_is_low ? 1u : 0u;
             const bool have_want = streamed
-                ? (cur_is_low ? (img->low_loaded && img->low_base == ts.base)
-                              : (img->hi_loaded && img->hi_base == ts.base && img->low_loaded))
+                ? (img->res_val == res && (cur_is_low ? (img->low_loaded && img->low_base == ts.base)
+                              : (img->hi_loaded && img->hi_base == ts.base && img->low_loaded && img->low_base == smi.low_base)))
                 : (img->res_val == res && img->src_addr == ts.base);
             if (have_want) {
                 img->res_val = res;
@@ -2218,6 +2224,11 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
                 return img;
             }
             ++st.res_changed;
+            if (streamed && img->res_val != res) {
+                // Epoch changes may represent writes at unchanged addresses. Until
+                // per-mip content identities are proven, refresh conservatively.
+                img->low_loaded = img->hi_loaded = false;
+            }
             prev = std::move(it->second);
             textures.erase(it), found = false; ++views_gen;
             ++st.tex_reloads;
@@ -2268,6 +2279,10 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
     }
 
     auto upload_range = [&](const tiling::Surface& s_src, uint64_t base_addr, uint32_t src_lv_begin, uint32_t src_lv_count, uint32_t dst_lv_begin) -> bool {
+        if (!src_lv_count || src_lv_begin >= s_src.levels || src_lv_count > s_src.levels - src_lv_begin ||
+            dst_lv_begin >= full_levels || src_lv_count > full_levels - dst_lv_begin) return false;
+        const auto& last = s_src.mips[src_lv_begin + src_lv_count - 1];
+        if (!base_addr || guest_region_extent(base_addr) < last.offset + last.size) return false;
         uint64_t total = 0;
         std::vector<uint64_t> sizes(src_lv_count), level_off(src_lv_count);
         for (uint32_t k = 0; k < src_lv_count; ++k) {
@@ -2287,10 +2302,14 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
         if (!sb.map) return false;
 
         const uint64_t tf0 = now_ns();
-        const uint32_t missing = (src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count > 1) ? first_missing_mip(ts, fi, s_src, is3d) : src_lv_count;
+        const bool use_prepared = !streamed && prepared && prepared_size == total &&
+                                  src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count == full_levels;
+        const uint32_t missing = (!use_prepared && src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count > 1) ? first_missing_mip(ts, fi, s_src, is3d) : src_lv_count;
         const uint64_t td = now_ns();
         st.t_fill += td - tf0;
-        if (missing < src_lv_count) {
+        if (use_prepared) {
+            std::memcpy(sb.map, prepared, total);
+        } else if (missing < src_lv_count) {
             static thread_local std::vector<uint8_t> scratch;
             scratch.resize(total);
             for (uint32_t k = 0; k < missing; ++k)
@@ -2324,8 +2343,8 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
     if (streamed) {
         if (cur_is_low) {
             if (!img->low_loaded || img->low_base != ts.base) {
-                const uint32_t n_low = std::min<uint32_t>(sf.levels, full_levels - 1);
-                ok = upload_range(sf, ts.base, 0, n_low, 1);
+                const uint32_t n_low = full_levels - 1;
+                ok = sf.levels == n_low && upload_range(sf, ts.base, 0, n_low, 1);
                 if (ok) {
                     img->low_loaded = true;
                     img->low_base = ts.base;
@@ -2340,7 +2359,8 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
             }
             img->resident_base_level = 1;
         } else {
-            if (!img->low_loaded && smi.low_base && smi.low_base != ts.base) {
+            if ((!img->low_loaded || img->low_base != smi.low_base) && smi.low_base && smi.low_base != ts.base) {
+                img->low_loaded = false;
                 tiling::Surface sf_low = sf;
                 sf_low.width = std::max(1u, full_w >> 1);
                 sf_low.height = std::max(1u, full_h >> 1);
@@ -2360,12 +2380,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
                 }
             }
             if (!img->hi_loaded || img->hi_base != ts.base) {
-                if (!img->low_loaded && guest_region_extent(ts.base) >= sf.total_size) {
-                    ok = upload_range(sf, ts.base, 0, full_levels, 0);
-                    if (ok) img->low_loaded = true;
-                } else {
-                    ok = upload_range(sf, ts.base, 0, 1, 0);
-                }
+                // The high allocation contains mip 0 only; a mapped region's extent
+                // is not the resource allocation size. Never read the low chain here.
+                ok = img->low_loaded && img->low_base == smi.low_base && upload_range(sf, ts.base, 0, 1, 0);
                 if (ok) {
                     img->hi_loaded = true;
                     img->hi_base = ts.base;
@@ -2378,6 +2395,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj) {
             } else {
                 ok = true;
             }
+            ok = ok && img->low_loaded && img->hi_loaded && img->low_base == smi.low_base;
             img->resident_base_level = 0;
         }
         img->res_val = res;
@@ -4695,7 +4713,10 @@ void Renderer::load_texture(const LoadJob& j) {
     up_rec.submit_no = submit_seq.load();
     begin_record();
     if (up_rec.cur == UINT32_MAX) return;
-    if (upload_texture(t, j.res, j.obj)) ++ld_tex;
+    // Recheck the resource epoch after acquiring m. For a normal surface the
+    // upload consumes the already-detiled CPU scratch; streaming uses its own ranges.
+    if (opt.res_current && opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
+    if (upload_texture(t, j.res, j.obj, scratch.data(), total)) ++ld_tex;
 }
 
 void Renderer::load_shader(const LoadJob& j) {
@@ -4765,9 +4786,7 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
     if (up_rec.cur != UINT32_MAX) pre_pass(items);
     pre_for = nullptr;
     tr = &R;
-    lk.unlock();
-    resolve_draw_resources(items, false);
-    relock();
+    // Resolve once per plain run after its actual targets have been bound.
     for (const Draw* d : items) R.q_on |= d->kind == Draw::ZPass;
     if (R.q_on) {
         Sub& sb = subs[R.cur];
@@ -4882,9 +4901,12 @@ void Renderer::submit_recorded(const std::vector<uint32_t>& handles) {
     for (uint32_t h : handles) {
         if (h >= subs.size() || subs[h].state != Sub::Recorded) continue;
         for (const auto& c : subs[h].recopy) {
-            if (!recopy_on || guest_region_extent(c.src) < c.size || c.off + c.size > ring.size) continue;
+            if (!recopy_on || guest_region_extent(c.src) < c.size || c.off > ring.size || c.size > ring.size - c.off) continue;
             ++recopy_n[c.kind];
-            if (std::memcmp(ring.map + c.off, reinterpret_cast<const void*>(c.src), c.size) == 0) continue;
+            // The mapping may be write-combined device-local VRAM (ReBAR).
+            // Reading it to avoid a write is far more expensive than a write.
+            // Preserve late-write semantics; refresh unconditionally until a CPU
+            // snapshot/fingerprint can be tracked without racing the source copy.
             ++recopy_changed[c.kind];
             std::memcpy(ring.map + c.off, reinterpret_cast<const void*>(c.src), c.size);
         }
@@ -5915,7 +5937,7 @@ void print_stats() {
             (unsigned long long)g->snap_copies, (unsigned long long)g->snap_reused, (unsigned long long)g->dma_stale,
             (unsigned long long)g->readback_stale, (unsigned long long)g->cpu_stale);
         g->snap_copies = g->snap_reused = g->dma_stale = g->readback_stale = g->cpu_stale = 0;
-        log("native renderer: dynamic data filled after its list ended (copied again at submission): constants %llu of %llu, vertices %llu of %llu, indices %llu of %llu",
+        log("native renderer: dynamic data refreshed at submission (no mapped VRAM reads): constants %llu of %llu, vertices %llu of %llu, indices %llu of %llu",
             (unsigned long long)g->recopy_changed[0], (unsigned long long)g->recopy_n[0], (unsigned long long)g->recopy_changed[1],
             (unsigned long long)g->recopy_n[1], (unsigned long long)g->recopy_changed[2], (unsigned long long)g->recopy_n[2]);
         for (int k = 0; k < 3; ++k) g->recopy_n[k] = g->recopy_changed[k] = 0;

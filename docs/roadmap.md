@@ -2,6 +2,8 @@
 
 ## Renderer (native/gfx)
 
+See [B17 evidence review](b17-renderer-evidence.md) for the imported research, conservative fixes, rejected changes and required validation. The benchmark below predates those fixes.
+
 The draw path was rewritten to a bindless table, memoised pipelines and state diffing, then streamed
 textures were given one persistent image and pipelines a saved list. Measured in Earth patrol on an
 RTX 5090 at 1080p: 730 ns of CPU per draw, about 5 ms of renderer CPU per frame, 49 pipelines created during
