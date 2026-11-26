@@ -17,6 +17,9 @@
 
 #include "hle.h"
 #include "runtime.h"
+#include "pc_thread_keys.h"
+#include <cstdlib>
+#include <new>
 
 namespace d1 {
 
@@ -327,6 +330,47 @@ HLE("scePthreadRename", scePthreadRename)
 // function per key that knows which game function to call.
 using GuestDtor = D1_SYSV void (*)(void*);
 static constexpr size_t kMaxKeys = 512;
+
+// Experimental coherent key cohort. One host key provides the thread-exit
+// notification; all individual guest key identities and values are native.
+using NativeKeys = pc_threads::Keys<GuestDtor, kMaxKeys>;
+static NativeKeys& native_keys() {
+    static auto* keys = new NativeKeys; // outlives guest thread teardown
+    return *keys;
+}
+static pthread_once_t g_native_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_native_key;
+static int g_native_key_error = 0;
+static bool native_keys_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("D1_PC_PTHREAD_KEYS");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+static void native_key_exit(void* opaque) {
+    auto* values = static_cast<NativeKeys::Values*>(opaque);
+    // POSIX clears the host key before invoking this callback. Re-publish
+    // the same state so a guest destructor can call Getspecific/Setspecific.
+    if (pthread_setspecific(g_native_key, values) != 0) {
+        log("native keys: failed to restore thread-exit state");
+        delete values;
+        return;
+    }
+    native_keys().drain(*values, [](GuestDtor dtor, void* value) {
+        d1_call_guest(reinterpret_cast<const void*>(dtor), reinterpret_cast<uint64_t>(value), 0, 0);
+    });
+    if (pthread_setspecific(g_native_key, nullptr) == 0) delete values;
+    else log("native keys: failed to clear thread-exit state");
+}
+static void native_key_initialize() {
+    g_native_key_error = pthread_key_create(&g_native_key, native_key_exit);
+}
+static int native_key_ready() {
+    const int status = pthread_once(&g_native_key_once, native_key_initialize);
+    return status ? status : g_native_key_error;
+}
+
 static GuestDtor g_key_dtors[kMaxKeys];
 template <size_t K> static void key_dtor(void* v) { if (g_key_dtors[K]) g_key_dtors[K](v); }
 template <size_t... K> static constexpr auto make_key_dtors(std::index_sequence<K...>) {
@@ -338,6 +382,12 @@ static constexpr auto kKeyDtors = make_key_dtors(std::make_index_sequence<kMaxKe
 static pthread_key_t g_host_keys[kMaxKeys];
 static std::atomic<bool> g_key_used[kMaxKeys];
 static int32_t scePthreadKeyCreate(uint32_t* key, GuestDtor dtor) {
+    if (native_keys_enabled()) {
+        if (!key) return sce_err(22);
+        const int status = native_key_ready();
+        if (status) return sce(status);
+        return native_keys().create(*key,dtor) ? SCE_OK : sce_err(35);
+    }
     for (size_t k = 0; k < kMaxKeys; ++k) {
         bool expected = false;
         if (!g_key_used[k].compare_exchange_strong(expected, true)) continue;
@@ -351,6 +401,7 @@ static int32_t scePthreadKeyCreate(uint32_t* key, GuestDtor dtor) {
 }
 HLE("scePthreadKeyCreate", scePthreadKeyCreate)
 static int32_t scePthreadKeyDelete(uint32_t k) {
+    if (native_keys_enabled()) return native_keys().erase(k) ? SCE_OK : sce_err(22);
     if (k >= kMaxKeys || !g_key_used[k]) return sce_err(22);
     pthread_key_delete(g_host_keys[k]);
     g_key_dtors[k] = nullptr;
@@ -358,9 +409,28 @@ static int32_t scePthreadKeyDelete(uint32_t k) {
     return SCE_OK;
 }
 HLE("scePthreadKeyDelete", scePthreadKeyDelete)
-static void* scePthreadGetspecific(uint32_t k) { return k < kMaxKeys ? pthread_getspecific(g_host_keys[k]) : nullptr; }
+static void* scePthreadGetspecific(uint32_t k) {
+    if (native_keys_enabled()) {
+        if (native_key_ready()) return nullptr;
+        auto* values = static_cast<NativeKeys::Values*>(pthread_getspecific(g_native_key));
+        return values ? native_keys().get(*values,k) : nullptr;
+    }
+    return k < kMaxKeys && g_key_used[k] ? pthread_getspecific(g_host_keys[k]) : nullptr;
+}
 HLE("scePthreadGetspecific", scePthreadGetspecific)
 static int32_t scePthreadSetspecific(uint32_t k, const void* v) {
+    if (native_keys_enabled()) {
+        const int status = native_key_ready();
+        if (status) return sce(status);
+        auto* values = static_cast<NativeKeys::Values*>(pthread_getspecific(g_native_key));
+        if (!values) {
+            values = new (std::nothrow) NativeKeys::Values;
+            if (!values) return sce_err(12);
+            const int err = pthread_setspecific(g_native_key,values);
+            if (err) { delete values; return sce(err); }
+        }
+        return native_keys().set(*values,k,const_cast<void*>(v)) ? SCE_OK : sce_err(22);
+    }
     if (k >= kMaxKeys || !g_key_used[k]) return sce_err(22);
     return sce(pthread_setspecific(g_host_keys[k], v));
 }

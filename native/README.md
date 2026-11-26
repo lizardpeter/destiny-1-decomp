@@ -141,6 +141,7 @@ Native renderer (`native/gfx`):
 | `D1_NG_GPU_TIMING=1` | optional GPU submission timestamp spans, collected after fences complete; logs summed/mean/max spans (not utilization, spans can overlap). |
 | `D1_PC_LIBC_LEAVES=0` | diagnostic A/B only: disable native libc memory/string leaves and optional math wrappers; allocator/stdio/exception ABI still uses the original module |
 | `D1_PC_LIBC_MATH=1` | experimental: 18 native scalar math/time-difference import replacements, in addition to 19 default memory/string leaves. Original floating-point behavior and Windows integration still need validation |
+| `D1_PC_PTHREAD_KEYS=1` | experimental native guest key registry with a single host exit-notification key; guest destructor/cancellation behavior still needs live validation |
 | `D1_NATIVE_FIOS=1` | Experimental: omit original libSceFios2.prx and require all 25 observed FIOS NIDs to resolve to native implementations. Original libc.prx and eboot.bin remain mandatory. Live game and Windows validation pending |
 | `D1_FIOS_TRACE=1` | Bounded first 32 calls per FIOS import argument trace for either native or original provider |
 | `D1_NATIVE_FRAME_TRACE=1` | optional scheduler instrumentation: observe published 0x591D40 frame records, including follow-up steps and aggregate timing channels; reports every 10 seconds. |
