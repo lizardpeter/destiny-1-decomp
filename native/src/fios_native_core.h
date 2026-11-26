@@ -43,7 +43,7 @@ inline uint32_t status(const std::error_code& ec) {
     return fios_contract::from_encoded_kernel_status(0x80020000u | n);
 }
 inline int64_t sync_count(Result r) {
-    if (r.bytes || !r.error) return int64_t(r.bytes);
+    if (!r.error) return int64_t(r.bytes);
     return int32_t(status(r.error));
 }
 
@@ -243,6 +243,7 @@ public:
     bool poll(uint32_t handle, Result& result) { return service_.poll(decode(kOperation, handle), result); }
     Result wait(uint32_t handle) { return service_.wait(decode(kOperation, handle)); }
     bool forget(uint32_t handle) { return service_.forget(decode(kOperation, handle)); }
+    bool delete_operation(uint32_t handle) { return service_.delete_operation(decode(kOperation, handle)); }
     void drain() { service_.drain(); }
 };
 } // namespace d1::fios_native
