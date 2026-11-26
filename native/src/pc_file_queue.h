@@ -47,6 +47,8 @@ private:
     size_t limit_;
     ByteBudget budget_;
     bool stopping_ = false, callbacks_stopping_ = false;
+    size_t pending_ = 0;
+    std::condition_variable idle_;
     void worker() {
         for (;;) {
             std::unique_lock lock(m_);
@@ -75,6 +77,7 @@ private:
             op->result = r; op->done = true;
             const bool callback = bool(op->callback);
             if (callback) callbacks_.splice(callbacks_.end(), in_flight);
+            else if (--pending_ == 0) idle_.notify_all();
             lock.unlock();
             complete_.notify_all();
             if (callback) callback_ready_.notify_one();
@@ -89,6 +92,8 @@ private:
             callbacks_.pop_front();
             lock.unlock();
             op->callback(id, op->result);
+            lock.lock();
+            if (--pending_ == 0) idle_.notify_all();
         }
     }
     void stop() {
@@ -110,6 +115,7 @@ private:
         ops_.emplace(id, op);
         try { jobs_.emplace_back(id, std::move(op)); }
         catch (...) { ops_.erase(id); throw; }
+        ++pending_;
         work_.notify_one();
         return id;
     }
@@ -184,6 +190,9 @@ public:
         return submit(0, std::move(op), ec);
     }
     uint64_t staging_bytes() const { return budget_.used(); }
+    // External callers only: callbacks and I/O deliveries must not drain themselves.
+    void drain() { std::unique_lock lock(m_); idle_.wait(lock, [&] { return pending_ == 0; }); }
+    bool has_operation(Id id) { std::lock_guard lock(m_); return ops_.count(id) != 0; }
     // Wait keeps a reference even if a concurrent callback deletes the public ID.
     Result wait(Id id) {
         std::unique_lock lock(m_);
