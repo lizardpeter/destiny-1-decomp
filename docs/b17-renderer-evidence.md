@@ -41,3 +41,9 @@ Frame scheduler hypothesis: simulation, extraction, rendering have separate pipe
 ## Required validation
 
 Build Linux and Windows; capture identical Earth Patrol, orbit, inventory and Tower scenes against last correct ac988d31; capture G-buffer, lighting, LUT, depth and final output; verify texture mip address/epoch transitions, same-address changes, dirty low chain while hi is resident, descriptor exhaustion and skipped draws. Compare cold/warm frame time distributions, lock waits, bytes uploaded, GPU timestamps, queue waits, and actual simulation time. No visual parity or FPS improvement claimed until run on hardware.
+
+## Follow-up: verified function bodies and mip range safety
+
+The original 007d4480 body calls the descriptor initializer with half dimensions when high memory is absent, rounds dimensions to multiples of four when tag+35 is set, and selects the low or high address explicitly. The Vulkan upload now validates these descriptor states, treats mip callback addresses as authoritative, checks the two independent memory spans on DMA/CPU invalidation, allows failed uploads to retry, and crops padded block rows into the authored destination footprint. Split resources use demand upload until the background loader can prepare both allocation ranges safely; this is a correctness-first tradeoff, not a claim of higher streaming FPS.
+
+The full function index was checked before recording 17 additional evidence-backed names. Existing ledger entries and unconfirmed function starts were not overwritten. In particular, 007df200 writes a dummy T# pointer, rather than binding a PS texture. See records/names.tsv for individual evidence. The status table was regenerated programmatically using the existing status algorithm and full function index.

@@ -333,6 +333,12 @@ struct Image {
     uint64_t res_val = 0, res_obj = 0, content = 0;
     uint64_t low_base = 0;   // guest base address of low-mip chain (levels 1..levels-1)
     uint64_t hi_base = 0;    // guest base address of streamed hi-mip (level 0)
+    uint64_t low_size = 0, hi_size = 0; // independent source footprints
+    bool overlaps_source(uint64_t a, uint64_t e) const {
+        auto overlap = [a,e](uint64_t b, uint64_t n) { return n && a < b + n && e > b; };
+        return overlap(src_addr, src_size) || (low_loaded && overlap(low_base, low_size)) ||
+               (hi_loaded && overlap(hi_base, hi_size));
+    }
     uint32_t resident_base_level = 0; // 0 when top mip is resident, 1 when only low mips are resident
     bool low_loaded = false;
     bool hi_loaded = false;
@@ -781,7 +787,7 @@ struct Renderer {
             const uint64_t a = d->caller, e = d->caller + d->count;
             bool any_stale = false;
             for (auto& [k, img] : textures)
-                if (img && img->src_size && a < img->src_addr + img->src_size && e > img->src_addr && !img->stale) img->stale = true, ++dma_stale, any_stale = true;
+                if (img && !img->stale && img->overlaps_source(a, e)) img->stale = true, ++dma_stale, any_stale = true;
             if (any_stale) ++views_gen;
             dma_texture_check(d->caller, d->count);
         }
@@ -792,7 +798,7 @@ struct Renderer {
         if (!on) return;
         static int told = 0;
         for (auto& [k, img] : textures)
-            if (img && img->src_size && dst < img->src_addr + img->src_size && dst + n > img->src_addr) {
+            if (img && img->overlaps_source(dst, dst + n)) {
                 ++dma_tex_hits;
                 if (told++ < 40)
                     log("native renderer: copy-queue write %#llx +%llu into texture %#llx %ux%u fmt %d (%s)", (unsigned long long)dst,
@@ -826,12 +832,16 @@ struct Renderer {
                 else r[++k] = r[i];
             r.resize(k + 1);
             for (auto& [key, img] : textures) {
-                if (!img || !img->src_size || img->stale) continue;
-                const uint64_t a = img->src_addr, e = a + img->src_size;
-                auto it = std::upper_bound(r.begin(), r.end(), std::make_pair(a, UINT64_MAX));
-                bool hit = it != r.end() && it->first < e;
-                if (!hit && it != r.begin()) hit = std::prev(it)->second > a;
-                if (!hit) continue;
+                if (!img || img->stale) continue;
+                auto overlaps = [&](uint64_t a, uint64_t n) {
+                    if (!n) return false;
+                    auto it = std::upper_bound(r.begin(), r.end(), std::make_pair(a, UINT64_MAX));
+                    return (it != r.end() && it->first < a + n) || (it != r.begin() && std::prev(it)->second > a);
+                };
+                if (!overlaps(img->src_addr, img->src_size) &&
+                    !(img->low_loaded && overlaps(img->low_base, img->low_size)) &&
+                    !(img->hi_loaded && overlaps(img->hi_base, img->hi_size))) continue;
+                const uint64_t a = img->src_addr;
                 img->stale = true, ++cpu_stale, ++views_gen;
                 static int told = 0;
                 if (told++ < 30 && std::getenv("D1_NG_LOG_DYN"))
@@ -960,6 +970,7 @@ struct Renderer {
         uint64_t obj = 0, low_base = 0, hi_base = 0;
         uint16_t full_w = 0, full_h = 0, full_d = 1;
         uint8_t full_mips = 1, has_hi = 0;
+        bool from_callback = false;
     };
     std::mutex mip_m;
     std::unordered_map<uint32_t, StreamMipInfo> stream_mips;  // res_id -> authored full dimensions & mip bases
@@ -2117,26 +2128,32 @@ Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res, uint64_t obj, co
         const uint16_t td = *reinterpret_cast<const uint16_t*>(tag + 0x2C);
         const uint8_t tm = *reinterpret_cast<const uint8_t*>(tag + 0x31);
         const uint8_t thi = *reinterpret_cast<const uint8_t*>(tag + 0x34);
-        if (tw >= ts.width && th >= ts.height && tw <= 16384 && th <= 16384 && tm >= ts.last_level + 1 && tm <= tiling::kMaxMips) {
+        if (tw && th && tw <= 16384 && th <= 16384 && tm >= ts.last_level + 1 && tm <= tiling::kMaxMips) {
             info.obj = tag;
             info.full_w = tw;
             info.full_h = th;
             info.full_d = ts.type == 10 ? std::max<uint16_t>(1, td) : 1;
             info.full_mips = tm;
             info.has_hi = thi;
-            if (thi && tm > 1) {
-                if (ts.last_level + 1 == tm - 1) info.low_base = ts.base;
-                else if (ts.last_level + 1 == tm) info.hi_base = ts.base;
-            } else {
-                info.low_base = ts.base;
+            // The callback knows the allocation addresses; never overwrite them
+            // using a potentially half-built draw descriptor.
+            if (!info.from_callback) {
+                if (thi && tm > 1) {
+                    if (ts.last_level + 1 == tm - 1) info.low_base = ts.base;
+                    else if (ts.last_level + 1 == tm) info.hi_base = ts.base;
+                } else {
+                    info.low_base = ts.base;
+                }
             }
             std::lock_guard lk(mip_m);
             auto& cur = stream_mips[rid];
             cur.obj = info.obj;
             cur.full_w = info.full_w, cur.full_h = info.full_h, cur.full_d = info.full_d;
             cur.full_mips = info.full_mips, cur.has_hi = info.has_hi;
-            if (info.low_base) cur.low_base = info.low_base;
-            if (info.hi_base) cur.hi_base = info.hi_base;
+            if (!cur.from_callback) {
+                if (info.low_base) cur.low_base = info.low_base;
+                if (info.hi_base) cur.hi_base = info.hi_base;
+            }
             info = cur;
         }
     }
@@ -2163,15 +2180,25 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
 
     const StreamMipInfo smi = (!is3d && ts.type != 12 && ts.type != 13) ? get_stream_info(res, obj, ts) : StreamMipInfo{};
     const bool streamed = res != 0 && !is3d && ts.type != 12 && ts.type != 13 &&
-                          smi.has_hi != 0 && smi.low_base != 0 && smi.full_mips > 1 &&
-                          smi.full_w >= ts.width && smi.full_h >= ts.height &&
-                          (ts.width == smi.full_w || ts.width == std::max(1u, uint32_t(smi.full_w >> 1))) &&
-                          (ts.height == smi.full_h || ts.height == std::max(1u, uint32_t(smi.full_h >> 1)));
+                          smi.has_hi != 0 && smi.full_mips > 1;
+    if (streamed) {
+        // 7D4480 constructs a half-size low descriptor (BC dimensions may be
+        // rounded up to four) or a full-size high descriptor.
+        const uint32_t low_w = smi.full_w < 4 ? 1u : uint32_t(smi.full_w >> 1);
+        const uint32_t low_h = std::max(1u, uint32_t(smi.full_h >> 1));
+        const bool low_dims = (ts.width == low_w || (fi.block && ts.width == ((low_w + 3) & ~3u))) &&
+                              (ts.height == low_h || (fi.block && ts.height == ((low_h + 3) & ~3u)));
+        const bool low_desc = low_dims && ts.last_level + 1 == smi.full_mips - 1 &&
+                              smi.low_base && ts.base == smi.low_base;
+        const bool high_desc = ts.width == smi.full_w && ts.height == smi.full_h &&
+                               ts.last_level + 1 == smi.full_mips && smi.hi_base && ts.base == smi.hi_base;
+        if ((!low_desc && !high_desc) || !smi.low_base) return nullptr;
+    }
     const uint32_t full_w = streamed ? smi.full_w : ts.width;
     const uint32_t full_h = streamed ? smi.full_h : ts.height;
     const uint32_t full_d = streamed ? smi.full_d : (is3d ? ts.depth : 1);
     const uint32_t full_levels = streamed ? smi.full_mips : std::min(ts.last_level + 1, tiling::kMaxMips);
-    const bool cur_is_low = streamed && (ts.last_level + 1 < full_levels || ts.width < full_w);
+    const bool cur_is_low = streamed && ts.last_level + 1 < full_levels;
 
     tiling::Surface sf;
     sf.tile_mode = ts.tiling, sf.bpp = fi.bpp, sf.block = fi.block, sf.pow2 = ts.pow2;
@@ -2186,6 +2213,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     std::unique_ptr<Image> prev;
     auto it = textures.find(key);
     bool found = it != textures.end();
+    if (found && !it->second) { textures.erase(it); found = false; }
     if (found && it->second && it->second->stale) {
         prev = std::move(it->second);
         prev->stale = false;
@@ -2285,6 +2313,19 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         if (!base_addr || guest_region_extent(base_addr) < last.offset + last.size) return false;
         uint64_t total = 0;
         std::vector<uint64_t> sizes(src_lv_count), level_off(src_lv_count);
+        // The engine rounds the compressed low descriptor to a block boundary.
+        // At deeper levels its linear block rows may be wider than the authored
+        // Vulkan mip. Detile into a sized CPU temporary, then copy only valid rows.
+        bool crop = false;
+        const uint32_t block = fi.block ? 4 : 1, bytes = fi.bpp / 8;
+        auto elems = [block](uint32_t n) { return (n + block - 1) / block; };
+        for (uint32_t k = 0; k < src_lv_count; ++k) {
+            const uint32_t sl = src_lv_begin + k, dl = dst_lv_begin + k;
+            const uint32_t sw = elems(std::max(1u, s_src.width >> sl)), sh = elems(std::max(1u, s_src.height >> sl));
+            const uint32_t dw = elems(std::max(1u, full_w >> dl)), dh = elems(std::max(1u, full_h >> dl));
+            if (sw < dw || sh < dh) return false;
+            crop |= sw != dw || sh != dh;
+        }
         for (uint32_t k = 0; k < src_lv_count; ++k) {
             const uint32_t dst_lv = dst_lv_begin + k;
             const uint32_t mw = std::max(1u, full_w >> dst_lv), mh = std::max(1u, full_h >> dst_lv);
@@ -2307,7 +2348,22 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         const uint32_t missing = (!use_prepared && src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count > 1) ? first_missing_mip(ts, fi, s_src, is3d) : src_lv_count;
         const uint64_t td = now_ns();
         st.t_fill += td - tf0;
-        if (use_prepared) {
+        if (crop) {
+            static thread_local std::vector<uint8_t> cropped_source;
+            for (uint32_t k = 0; k < src_lv_count; ++k) {
+                const uint32_t sl = src_lv_begin + k, dl = dst_lv_begin + k;
+                const uint32_t sw = elems(std::max(1u, s_src.width >> sl)), sh = elems(std::max(1u, s_src.height >> sl));
+                const uint32_t dw = elems(std::max(1u, full_w >> dl)), dh = elems(std::max(1u, full_h >> dl));
+                const uint32_t slices = is3d ? std::max(1u, full_d >> dl) : layers;
+                cropped_source.resize(uint64_t(sw) * sh * slices * bytes);
+                tiling::detile(s_src, sl, reinterpret_cast<const uint8_t*>(base_addr), cropped_source.data());
+                for (uint32_t z = 0; z < slices; ++z)
+                    for (uint32_t y = 0; y < dh; ++y)
+                        std::memcpy(sb.map + level_off[k] + (uint64_t(z) * dh + y) * dw * bytes,
+                                    cropped_source.data() + (uint64_t(z) * sh + y) * sw * bytes, uint64_t(dw) * bytes);
+            }
+            st.t_detile += now_ns() - td;
+        } else if (use_prepared) {
             std::memcpy(sb.map, prepared, total);
         } else if (missing < src_lv_count) {
             static thread_local std::vector<uint8_t> scratch;
@@ -2348,6 +2404,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 if (ok) {
                     img->low_loaded = true;
                     img->low_base = ts.base;
+                    img->low_size = sf.total_size;
                     static const bool log_stream = std::getenv("D1_NG_LOG_STREAM") != nullptr;
                     if (log_stream) {
                         log("ng stream [IN-PLACE LOW MIPS res=%u img=%p]: filled mips [1..%u] from %#llx (frame %llu)",
@@ -2376,6 +2433,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                     if (upload_range(sf_low, smi.low_base, 0, full_levels - 1, 1)) {
                         img->low_loaded = true;
                         img->low_base = smi.low_base;
+                        img->low_size = sf_low.total_size;
                     }
                 }
             }
@@ -2386,6 +2444,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 if (ok) {
                     img->hi_loaded = true;
                     img->hi_base = ts.base;
+                    img->hi_size = sf.mips[0].size;
                     static const bool log_stream = std::getenv("D1_NG_LOG_STREAM") != nullptr;
                     if (log_stream) {
                         log("ng stream [IN-PLACE HI MIP 0 res=%u img=%p]: filled mip [0] from %#llx into existing VkImage (frame %llu)",
@@ -2422,7 +2481,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     if (prev) bury(std::move(prev));
     if (!ok) {
         bury(std::move(img));
-        textures[key] = nullptr; ++views_gen;
+        textures.erase(key); ++views_gen; // failed upload must be retryable
         return nullptr;
     }
     Image* out = img.get();
@@ -4657,6 +4716,10 @@ void Renderer::load_texture(const LoadJob& j) {
     const VkFormat f = fmt::vk_format(ts.dfmt, ts.nfmt);
     if (f == VK_FORMAT_UNDEFINED || !fi.bpp || fi.bpp == 96 || !ts.base || ts.width > 16384 || ts.height > 16384) return;
     if (opt.res_current && opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
+    if (!((ts.type == 10) || (ts.type == 12) || (ts.type == 13))) {
+        const auto smi = get_stream_info(j.res, j.obj, ts);
+        if (smi.has_hi && smi.full_mips > 1) return; // split-source uploads are handled on demand
+    }
     tiling::Surface sf;
     sf.tile_mode = ts.tiling, sf.bpp = fi.bpp, sf.block = fi.block, sf.pow2 = ts.pow2;
     sf.width = ts.width, sf.height = ts.height, sf.pitch = ts.pitch;
@@ -5652,8 +5715,9 @@ void notify_texture_mips(const uint32_t* tsharp, uint64_t res, uint64_t obj, uin
             info.full_mips = *reinterpret_cast<const uint8_t*>(obj + 0x31);
             info.has_hi = *reinterpret_cast<const uint8_t*>(obj + 0x34);
         }
-        if (low_base) info.low_base = low_base;
+        info.low_base = low_base;
         info.hi_base = hi_base;
+        info.from_callback = true;
     }
     if (tsharp) prefetch_texture(tsharp, res, obj);
 }
