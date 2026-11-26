@@ -348,6 +348,8 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
                         binding.identity=resreg::get(obj);
                         binding.resource_size=field<uint32_t>(obj,0);
                         binding.object=obj;
+                        if(leases&&leases->pin_geometry(binding.identity,binding.resource_base,binding.resource_size))
+                            ng::capture_geometry_source({binding.identity,binding.resource_base,binding.resource_size,binding.object});
                     }
                     binding.valid=true;
                 }
@@ -357,7 +359,6 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
             vbsig = mix(vbsig, uint64_t(i) << 48 | uint64_t(d->vb[i][1] >> 16) | uint64_t(d->vb[i][3]) << 32);
             if(resreg::g_on){
                 d->vres[i]={binding.identity,binding.resource_base,binding.resource_size,binding.object};
-                if(leases&&leases->pin(binding.identity))ng::capture_geometry_source(d->vres[i]);
             }
         }
     }
@@ -485,7 +486,16 @@ void capture_indexed(uint64_t dev,uint32_t prim,int32_t first,uint32_t count,uin
         d->index_addr = ib ? field<uint64_t>(ib, 0x30) + uint64_t(uint32_t((isz * 2 + 2) * first)) : 0;
         if(ib&&nr::resreg::g_on){
             d->ires={nr::resreg::get(ib),field<uint64_t>(ib,0x30),uint64_t(field<uint32_t>(ib,0x3c))*(isz?4:2),ib};
-            if(leases&&leases->pin(d->ires.id))ng::capture_geometry_source(d->ires);
+            bool cpu_required=d->prim==0x13;
+            for(uint32_t i=0;i<d->num_vb&&!cpu_required;++i){
+                const auto* words=d->vb[i];
+                const uint64_t base=uint64_t(words[0])|(uint64_t(words[1]&0xfff)<<32);
+                const auto& r=d->vres[i];
+                if((words[1]>>16&0x3fff)&&(!r.id||base<r.base||base-r.base>=r.size))
+                    cpu_required=true;
+            }
+            if(leases&&leases->pin_geometry(d->ires.id,d->ires.base,d->ires.size,cpu_required))
+                ng::capture_geometry_source(d->ires,cpu_required);
         }
         }
         d->count = count;
