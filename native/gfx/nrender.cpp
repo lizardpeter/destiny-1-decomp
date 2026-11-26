@@ -475,6 +475,7 @@ struct Sub {
     VkCommandPool cpool = VK_NULL_HANDLE;  // its own (lists are recorded on several threads at once)
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+    VkFence completion_fence = VK_NULL_HANDLE; // shared with the last slot in a submitted group
     uint64_t serial = 0;
     enum State : uint8_t { Idle, Recording, Recorded, Inflight } state = Idle;
     uint64_t submit_no = 0;   // the first recording that used it (what it may reference)
@@ -1047,6 +1048,8 @@ struct Renderer {
     void begin_record();
     void submit(const VkSemaphoreSubmitInfo* wait = nullptr, const VkSemaphoreSubmitInfo* signal = nullptr);
     void submit_sub(uint32_t i, const VkSemaphoreSubmitInfo* wait = nullptr, const VkSemaphoreSubmitInfo* signal = nullptr);
+    void submit_recorded_group(const uint32_t* slots,size_t count);
+    uint64_t grouped_submissions=0,queue_calls_saved=0;
     uint64_t min_live_submit() const;
     uint64_t oldest_ring() const;
     uint64_t ring_oldest = 0;  // a lower bound of oldest_ring()
@@ -1068,7 +1071,7 @@ struct Renderer {
     std::vector<Dead> grave;
     void bury(std::unique_ptr<Image> img);
     void reap();
-    void retire_one();
+    void retire_one(bool known_complete=false,bool reclaim=true);
     void retire_completed();
     void wait_serial(uint64_t serial);
     void wait_idle() { wait_serial(serial_next - 1); }
@@ -1599,6 +1602,7 @@ void Renderer::begin_record() {
     Sub& sb = subs[rc().cur];
     sb.ring_begin = ring_head;
     sb.state = Sub::Recording;
+    sb.completion_fence=sb.fence;
     sb.submit_no = rc().submit_no;
     for (VkDescriptorPool p : sb.pools) vkResetDescriptorPool(ctx.device, p, 0);
     sb.pool = 0;
@@ -1683,8 +1687,62 @@ void Renderer::submit_sub(uint32_t i, const VkSemaphoreSubmitInfo* wait, const V
         std::_Exit(1);
     }
     sb.serial = serial_next++;
+    sb.completion_fence=sb.fence;
     sb.state = Sub::Inflight;
     inflight.push_back(i);
+}
+
+// Consolidate independent command-buffer submissions into one driver
+// call without changing their queue order, barriers or logical serials.
+// Only an already-recorded list group is eligible; never delay a live
+// submission/EOP boundary to collect unrelated future work.
+void Renderer::submit_recorded_group(const uint32_t* slots,size_t count){
+    if(!count)return;
+    if(count==1){submit_sub(slots[0]);return;}
+    constexpr size_t cap=32;
+    if(count>cap)std::abort();
+    std::array<VkCommandBufferSubmitInfo,cap> commands{};
+    std::array<VkSemaphoreSubmitInfo,cap> signals{};
+    std::array<VkSubmitInfo2,cap> infos{};
+    const auto fence=subs[slots[count-1]].fence;
+    {
+        std::lock_guard dl(done_m);
+        for(size_t j=0;j<count;++j){
+            const auto i=slots[j];
+            auto& sb=subs[i];
+            const uint64_t serial=serial_next+j;
+            commands[j]={VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+            commands[j].commandBuffer=sb.cmd;
+            infos[j]={VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+            infos[j].commandBufferInfoCount=1;
+            infos[j].pCommandBufferInfos=&commands[j];
+            if(timeline){
+                signals[j]={VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+                signals[j].semaphore=timeline;signals[j].value=serial;
+                signals[j].stageMask=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                infos[j].signalSemaphoreInfoCount=1;
+                infos[j].pSignalSemaphoreInfos=&signals[j];
+            }
+            res_state[i].store(serial<<2,std::memory_order_release);
+            done_subs.push_back({serial,i});
+        }
+        while(done_subs.size()>4096)done_subs.pop_front();
+    }
+    const uint64_t start=now_ns();
+    const auto result=vkQueueSubmit2(ctx.queue,uint32_t(count),infos.data(),fence);
+    st.t_submit+=now_ns()-start;
+    if(result!=VK_SUCCESS){
+        log("native renderer: grouped queue submission failed (%d)",int(result));
+        std::_Exit(1);
+    }
+    for(size_t j=0;j<count;++j){
+        auto& sb=subs[slots[j]];
+        sb.serial=serial_next++;sb.completion_fence=fence;sb.state=Sub::Inflight;
+        inflight.push_back(slots[j]);
+    }
+    // The owner of the shared fence is last in FIFO retirement order.
+    // It cannot be reset until every earlier member has retired.
+    ++grouped_submissions;queue_calls_saved+=count-1;
 }
 
 // Descriptor sets come from pools owned by the recording submission, reset when it is reused.
@@ -1739,17 +1797,19 @@ void Renderer::write_results(uint32_t i, uint64_t serial) {
     while (res_state[i].load(std::memory_order_acquire) == (serial << 2 | 1)) std::this_thread::yield();
 }
 
-void Renderer::retire_one() {
+void Renderer::retire_one(bool known_complete,bool reclaim) {
     if (inflight.empty()) return;
     const uint32_t i = inflight.front();
     inflight.pop_front();
     Sub& sb = subs[i];
-    const uint64_t tw = now_ns();
-    const VkResult waited = vkWaitForFences(ctx.device, 1, &sb.fence, VK_TRUE, UINT64_MAX);
-    st.t_wait += now_ns() - tw;
-    if (waited != VK_SUCCESS) {
-        log("native renderer: completion fence failed (%d); refusing to publish unfinished GPU results", int(waited));
-        std::_Exit(1);
+    if(!known_complete){
+        const uint64_t tw=now_ns();
+        const VkResult waited=vkWaitForFences(ctx.device,1,&sb.completion_fence,VK_TRUE,UINT64_MAX);
+        st.t_wait+=now_ns()-tw;
+        if(waited!=VK_SUCCESS){
+            log("native renderer: completion fence failed (%d); refusing to publish unfinished GPU results",int(waited));
+            std::_Exit(1);
+        }
     }
     if (sb.timepool) {
         uint64_t ticks[2]{};
@@ -1776,7 +1836,7 @@ void Renderer::retire_one() {
     if (serial_done > serial_done_seen.load()) serial_done_seen.store(serial_done);
     sb.state = Sub::Idle;
     idle_subs.push_back(i);
-    reap();
+    if(reclaim)reap();
 }
 
 // The oldest recording any submission slot in use (recording, recorded or in flight) made:
@@ -1802,10 +1862,11 @@ void Renderer::bury(std::unique_ptr<Image> img) {
 }
 
 void Renderer::reap() {
-    const uint64_t live = min_live_submit();
     std::vector<Dead> now;
     {
         std::lock_guard lk(grave_m);
+        if(grave.empty())return;
+        const uint64_t live=min_live_submit();
         auto keep = std::stable_partition(grave.begin(), grave.end(), [&](const Dead& d) { return d.tag >= live; });
         std::move(keep, grave.end(), std::back_inserter(now));
         grave.erase(keep, grave.end());
@@ -1817,7 +1878,21 @@ void Renderer::reap() {
 }
 
 void Renderer::retire_completed() {
-    while (!inflight.empty() && vkGetFenceStatus(ctx.device, subs[inflight.front()].fence) == VK_SUCCESS) retire_one();
+    VkFence completed=VK_NULL_HANDLE;
+    bool retired=false;
+    while(!inflight.empty()){
+        const auto fence=subs[inflight.front()].completion_fence;
+        if(fence!=completed){
+            const auto status=vkGetFenceStatus(ctx.device,fence);
+            if(status==VK_NOT_READY)break;
+            if(status!=VK_SUCCESS){
+                log("native renderer: completion fence status failed (%d)",int(status));std::_Exit(1);
+            }
+            completed=fence;
+        }
+        retire_one(true,false);retired=true;
+    }
+    if(retired)reap();
 }
 
 void Renderer::wait_serial(uint64_t serial) {
@@ -6288,8 +6363,21 @@ void Renderer::submit_recorded(const std::vector<uint32_t>& handles) {
                 (unsigned long long)late_changed[0], (unsigned long long)late_checked[0], (unsigned long long)late_changed[1],
                 (unsigned long long)late_checked[1], (unsigned long long)late_changed[2], (unsigned long long)late_checked[2]);
     }
-    for (uint32_t h : handles)
-        if (h < subs.size() && subs[h].state == Sub::Recorded) submit_sub(h);
+    // Preserve logical per-list serials and completion results while
+    // avoiding one host/driver crossing for each already-recorded list.
+    std::array<uint32_t,32> group;
+    size_t n=0;
+    static const bool group_on=[]{
+        const char* v=std::getenv("D1_NG_GROUP_SUBMIT");return !v||std::atoi(v)!=0;
+    }();
+    for(uint32_t h:handles){
+        if(h>=subs.size()||subs[h].state!=Sub::Recorded)continue;
+        if(!group_on){submit_sub(h);continue;}
+        if(std::find(group.begin(),group.begin()+n,h)!=group.begin()+n)continue;
+        group[n++]=h;
+        if(n==group.size()){submit_recorded_group(group.data(),n);n=0;}
+    }
+    submit_recorded_group(group.data(),n);
     retire_completed();
 }
 
@@ -7514,6 +7602,8 @@ void print_stats() {
     g->native_view_cache_hits=g->native_view_cache_misses=0;
     log("native renderer: %llu prepared native geometry bindings consumed without recording-thread resource lookup",(unsigned long long)g->native_geometry_bindings);
     g->native_geometry_bindings=0;
+    log("native renderer: grouped queue submissions %llu, driver calls avoided %llu",(unsigned long long)g->grouped_submissions,(unsigned long long)g->queue_calls_saved);
+    g->grouped_submissions=g->queue_calls_saved=0;
     g->native_stage_reuse=g->inline_run_draws=g->inline_runs=0;
     s.memo_hits = s.memo_misses = s.memo_gen = 0, g->par_draws = g->par_runs = 0;
     if (const double f = double(s.frames - s.t_frames); f > 0 && g->list_rec)
