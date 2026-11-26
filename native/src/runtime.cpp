@@ -1,5 +1,6 @@
 // Linker, import thunks, call tracing, TLS and crash reporting.
 #include "runtime.h"
+#include "pc_guest_tls.h"
 #include "fios_imports.h"
 #include "guest_call4_asm.h"
 
@@ -308,42 +309,42 @@ struct Tcb {
     uint64_t reserved[30];
 };
 static uint64_t g_static_tls_size = 0;
-static void* aligned_alloc64(size_t n) {
-#if D1_WINDOWS
-    return _aligned_malloc(n, 64);
-#else
-    return aligned_alloc(64, (n + 63) & ~size_t(63));
-#endif
+static pc_tls::Image tls_image(const Module& m) {
+    return {reinterpret_cast<const void*>(m.tls_init), m.tls_filesz, m.tls_memsz, m.tls_align};
 }
 #if D1_WINDOWS
 static DWORD g_tls_slot = TLS_OUT_OF_INDEXES;
 static uint32_t tls_slot_disp() {  // gs-relative offset of the slot in the TEB
     if (g_tls_slot == TLS_OUT_OF_INDEXES) {
         g_tls_slot = TlsAlloc();
-        if (g_tls_slot >= 64) throw std::runtime_error("no low TLS slot free for the guest TCB");
+        if (g_tls_slot >= 64) {
+            if (g_tls_slot != TLS_OUT_OF_INDEXES) TlsFree(g_tls_slot);
+            g_tls_slot = TLS_OUT_OF_INDEXES;
+            throw std::runtime_error("no low TLS slot free for the guest TCB");
+        }
     }
     return 0x1480 + g_tls_slot * 8;
 }
 #endif
-static thread_local std::map<int, void*>* t_dtv = nullptr;
+static thread_local pc_tls::DynamicBlocks* t_dtv = nullptr;
 static thread_local Tcb* t_tcb = nullptr;
 
 void* tls_create_thread_block() {
     const Module& exe = rt().modules[0];
     // Static TLS size is published once by link_all, before guest threads start.
-    uint8_t* blk = static_cast<uint8_t*>(aligned_alloc64(g_static_tls_size + sizeof(Tcb) + 64));
-    if (!blk) throw std::bad_alloc();
-    std::memset(blk, 0, g_static_tls_size + sizeof(Tcb) + 64);
-    uint8_t* tls = blk + 64;
-    Tcb* tcb = reinterpret_cast<Tcb*>(tls + g_static_tls_size);
-    if (exe.tls_filesz) std::memcpy(tls, reinterpret_cast<void*>(exe.tls_init), exe.tls_filesz);
+    auto block = std::make_unique<pc_tls::StaticBlock>(tls_image(exe), sizeof(Tcb));
+    if (block->extent() != g_static_tls_size) throw std::logic_error("TLS layout mismatch");
+    auto* tcb = new (block->tcb()) Tcb{};
     tcb->self = tcb;
+    // Preserve the transitional process lifetime: host pthread-key destructors
+    // can enter guest code after the thread trampoline has returned.
+    (void)block.release();
     return tcb;
 }
 
 void tls_set_current(void* tcb) {
 #if D1_WINDOWS
-    TlsSetValue(g_tls_slot, tcb);
+    if (!TlsSetValue(g_tls_slot, tcb)) throw std::runtime_error("TlsSetValue failed");
 #else
     if (syscall(SYS_arch_prctl, ARCH_SET_GS, reinterpret_cast<uint64_t>(tcb)) != 0)
         throw std::runtime_error("arch_prctl(ARCH_SET_GS) failed");
@@ -356,19 +357,24 @@ void tls_destroy_thread_block(void*) { /* leaked deliberately in the prototype *
 // __tls_get_addr(tls_index*): dynamic TLS for modules loaded after the executable.
 struct TlsIndex { uint64_t modid; uint64_t offset; };
 static void* tls_get_addr(TlsIndex* ti) {
-    if (ti->modid == 1) return reinterpret_cast<uint8_t*>(t_tcb) - g_static_tls_size + ti->offset;
-    if (!t_dtv) t_dtv = new std::map<int, void*>();
-    auto& slot = (*t_dtv)[int(ti->modid)];
-    if (!slot) {
-        for (auto& m : rt().modules)
-            if (m.tls_modid == int(ti->modid)) {
-                slot = aligned_alloc64(m.tls_memsz);
-                std::memset(slot, 0, m.tls_memsz);
-                if (m.tls_filesz) std::memcpy(slot, reinterpret_cast<void*>(m.tls_init), m.tls_filesz);
-            }
-        if (!slot) { log("__tls_get_addr: unknown module id %llu", (unsigned long long)ti->modid); return nullptr; }
+    if (!ti || !t_tcb || !ti->modid) return nullptr;
+    const auto& modules = rt().modules;
+    if (!modules.empty() && ti->modid == uint64_t(modules.front().tls_modid)) {
+        if (ti->offset >= modules.front().tls_memsz) return nullptr;
+        return reinterpret_cast<uint8_t*>(t_tcb) - g_static_tls_size + ti->offset;
     }
-    return static_cast<uint8_t*>(slot) + ti->offset;
+    for (const auto& m : modules) {
+        if (uint64_t(m.tls_modid) != ti->modid) continue;
+        try {
+            if (!t_dtv) t_dtv = new pc_tls::DynamicBlocks;
+            return t_dtv->get(ti->modid, ti->offset, tls_image(m));
+        } catch (const std::bad_alloc&) {
+            log("__tls_get_addr: allocation failed for module %llu", (unsigned long long)ti->modid);
+            return nullptr;
+        }
+    }
+    log("__tls_get_addr: unknown module id %llu", (unsigned long long)ti->modid);
+    return nullptr;
 }
 HLE("__tls_get_addr", tls_get_addr)
 
@@ -398,8 +404,9 @@ void link_all() {
     auto& mods = rt().modules;
     if (mods.empty()) throw std::runtime_error("no executable for TLS layout");
     const auto& exe = mods.front();
+    for (const auto& m : mods) tls_image(m).validate();
     const uint64_t tls_align = std::max<uint64_t>(exe.tls_align, 16);
-    g_static_tls_size = (exe.tls_memsz + tls_align - 1) & ~(tls_align - 1);
+    g_static_tls_size = pc_tls::round_up(exe.tls_memsz, tls_align);
     int next_modid = 1;
     for (auto& m : mods)
         if (m.tls_memsz) m.tls_modid = next_modid++;
