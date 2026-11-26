@@ -472,6 +472,17 @@ void link_all() {
                     // The original PRX is absent in this mode. Do not silently
                     // route any missing member of the cohort to a logging stub.
                     value = reinterpret_cast<uint64_t>(target);
+                    if (trace_fios) {
+                        auto& t = thunk_cache[key];
+                        if (!t) {
+                            auto nm = names.find(nid);
+                            auto* ii = new ImportInfo{nm != names.end() ? nm->second : nid, lib, m.name, target};
+                            ii->fios_trace = true;
+                            g_imports.push_back(ii);
+                            t = make_thunk(g_imports.size() - 1, target, true);
+                        }
+                        value = reinterpret_cast<uint64_t>(t);
+                    }
                     fios_nids.insert(nid);
                     ++n_native_fios;
                 } else if (leaf) {
