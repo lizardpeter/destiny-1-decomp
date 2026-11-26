@@ -1189,6 +1189,7 @@ struct Renderer {
     struct CapturedSource {
         ImageLifetime<Image>::Token ready;
         std::shared_ptr<const OwnedTexture> owned;
+        bool nonsplit=false;
     };
     std::mutex source_m;
     std::unordered_map<TextureSourceKey,CapturedSource,TextureSourceKeyHash> captured_sources;
@@ -2775,6 +2776,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 img->descriptor_epoch[slot]=res;
                 img->res_val = res;
                 ++st.res_hits;
+                if(split_resource)source_ready(t,res,img);
                 st.t_tex_hit += now_ns() - t_in;
                 return img;
             }
@@ -2844,6 +2846,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     if (prev && prev->format == f && prev->w == full_w && prev->h == full_h && prev->d == full_d &&
         prev->layers == layers && prev->levels == full_levels && prev->cube == cube && prev->is3d == is3d) {
         img = std::move(prev);
+        img->lifetime.retire(); // reused storage no longer proves prior contents
         img->aliases.clear();
         img->torn = 0;
         ++st.tex_inplace;
@@ -3130,7 +3133,11 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     out->last_frame = st.frames;
     ++st.textures;
     textures[key] = std::move(img); ++views_gen;
-    if(split_resource)source_ready(t,res,out);
+    if(split_resource){
+        source_ready(t,res,out);
+        if(out->low_loaded&&out->descriptor_epoch[0]==res&&out->resident_descriptor[0][0])
+            source_ready(out->resident_descriptor[0],res,out);
+    }
     if(owned)++captured_source_replays;
     return out;
 }
@@ -4476,7 +4483,7 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
     Sub& sb = subs[rc().cur];
     if (sb.sec.size() < T) sb.sec.resize(T);
     // slices and their command buffers (allocated here: the pools belong to this thread's use)
-    std::vector<VkCommandBuffer> cbs(T);
+    std::array<VkCommandBuffer,16> cbs{};
     for (uint32_t t = 0; t < T; ++t)
         if (!(cbs[t] = secondary(t))) {
             for (size_t i = 0; i < n; ++i) draw(*run[i]);
@@ -4504,8 +4511,8 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
     VkCommandBufferInheritanceInfo ii{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, &iri};
     ii.occlusionQueryEnable = rc().q_active >= 0;
     ii.queryFlags = rc().q_active >= 0 && ctx.occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0;
-    std::vector<Rec> recs(T);
-    std::vector<DrawState> states(T);
+    std::array<Rec,16> recs{};
+    std::array<DrawState,16> states{};
     auto slice = [&](uint32_t t) {
         const size_t b = n * t / T, e = n * (t + 1) / T;
         Rec& r = recs[t];
@@ -4528,7 +4535,7 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
         for (uint32_t t = 1; t < T; ++t) wk.jobs.push_back([&slice, t] { slice(t); });
         wk.pending += T - 1;
     }
-    wk.cv.notify_all();
+    for(uint32_t t=1;t<T;++t)wk.cv.notify_one();
     slice(0);
     const uint64_t t_wait=now_ns();
     {
@@ -4538,7 +4545,7 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
     t_run_worker_wait+=now_ns()-t_wait;
     vkCmdExecuteCommands(rc().cmd,T,cbs.data());
     t_run_worker_wall+=now_ns()-t_workers;
-    for (const Rec& r : recs) merge(r);
+    for(uint32_t t=0;t<T;++t)merge(recs[t]);
     rc().dstate.valid = false;  // (the primary's bindings and dynamic state are undefined after secondaries)
     rc().dstate.stage_valid[0] = rc().dstate.stage_valid[1] = false;
     // Primary inline graphics state is not legal inside a rendering
@@ -6119,6 +6126,7 @@ void Renderer::load_texture(const LoadJob& j) {
                 img->descriptor_epoch[0]=j.res;img->descriptor_epoch[1]=0;
                 ++views_gen; // invalidate cached misses and old descriptor epochs
                 ++ld_moves;
+                if(smi.has_hi&&smi.full_mips>1)source_ready(t,j.res,img);
                 return;
             }
         }
@@ -6175,16 +6183,20 @@ static bool split_2d_surface(const uint32_t* words,tiling::Surface& sf){
 // The first list that references an unprepared epoch retains its actual
 // source bytes. Later lists share the same snapshot or ready GPU token.
 void Renderer::capture_owned_texture(const uint32_t* words,uint64_t res,uint64_t obj){
-    if(!res||!obj||!opt.res_current||opt.res_current(obj)!=res||guest_region_extent(obj)<0x44||
-       !*reinterpret_cast<const uint8_t*>(obj+0x34))return;
-    const auto ts=fmt::decode_tsharp(words);
-    if(ts.type<8||ts.type>9)return;
+    if(!res||!obj||!opt.res_current||(words[3]>>28)<8||(words[3]>>28)>9)return;
     const auto key=texture_source_key(words,res);
     {
         std::lock_guard lk(source_m);
         const auto it=captured_sources.find(key);
-        if(it!=captured_sources.end()&&(it->second.owned||ImageLifetime<Image>::resolve(it->second.ready)))return;
+        if(it!=captured_sources.end()&&(it->second.nonsplit||it->second.owned||ImageLifetime<Image>::resolve(it->second.ready)))return;
     }
+    if(opt.res_current(obj)!=res||guest_region_extent(obj)<0x44)return;
+    if(!*reinterpret_cast<const uint8_t*>(obj+0x34)){
+        std::lock_guard lk(source_m);
+        captured_sources[key].nonsplit=true;
+        return;
+    }
+    const auto ts=fmt::decode_tsharp(words);
     StreamMipInfo info{};
     bool have=false;
     {
