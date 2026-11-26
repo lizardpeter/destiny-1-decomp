@@ -182,6 +182,8 @@ bool create_context(Context& ctx, int gpu_index, const char** inst_exts, uint32_
     ef.features.textureCompressionBC = f.features.textureCompressionBC;
     ef.features.fragmentStoresAndAtomics = f.features.fragmentStoresAndAtomics;
     ef.features.vertexPipelineStoresAndAtomics = f.features.vertexPipelineStoresAndAtomics;
+    ef.features.multiDrawIndirect = f.features.multiDrawIndirect;
+    ctx.multi_draw_indirect = f.features.multiDrawIndirect;
     ef.features.occlusionQueryPrecise = f.features.occlusionQueryPrecise;
     ctx.occlusion_precise = f.features.occlusionQueryPrecise;
 

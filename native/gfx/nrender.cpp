@@ -18,6 +18,7 @@
 #include "native_texture_identity.h"
 #include "native_texture_leases.h"
 #include "native_epoch_cohort.h"
+#include "native_draw_batch.h"
 #include "native_shader_slots.h"
 #include "../src/native_ranges.h"
 #include "../src/host_memory.h"
@@ -1273,6 +1274,7 @@ struct Renderer {
     uint32_t rec_min_run = 64;  // fewest draws in a pass worth splitting
     uint64_t par_runs = 0, par_draws = 0;
     uint64_t native_stage_reuse=0,inline_run_draws=0,inline_runs=0;
+    uint64_t batched_draws=0,indirect_batches=0;
     void start_workers();
     void run_parallel(Draw* const* run, size_t n);
     VkCommandBuffer secondary(uint32_t worker);
@@ -1297,6 +1299,7 @@ struct Renderer {
         const Draw* last_pipeline_draw=nullptr;
         Pipeline* last_pipeline=nullptr;
         uint64_t last_pipeline_mask_epoch=0;
+        uint64_t batched_draws=0,indirect_batches=0;
         uint64_t chunk_pos = 0, chunk_end = 0;  // (parallel) this worker's slice of the ring
         uint64_t chunk_reserved=0,chunk_payload=0;
         std::vector<Sub::ReCopy> recopy;        // (see Sub::recopy)
@@ -1312,10 +1315,12 @@ struct Renderer {
         st.t_pipe += r.t_pipe, st.t_geo += r.t_geo, st.t_desc += r.t_desc, st.t_cmd += r.t_cmd, st.draws += r.draws;
         st.bytes_vtx += r.bytes_vtx, st.bytes_idx += r.bytes_idx, st.bytes_cb += r.bytes_cb, st.predicated += r.predicated;
         st.memo_hits += r.memo_tl;
+        batched_draws+=r.batched_draws;indirect_batches+=r.indirect_batches;
         ring_worker_reserved+=r.chunk_reserved;ring_worker_payload+=r.chunk_payload;
         if (rc().lr && !r.recopy.empty()) rc().recopy.insert(rc().recopy.end(), r.recopy.begin(), r.recopy.end());
     }
-    void draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run_depth);
+    void draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run_depth,
+              Draw* const* followers=nullptr,size_t available=0,size_t* consumed=nullptr);
     void draw(Draw& dr) {
         Image* colors[8] = {};
         for (int i = 0; i < 5; ++i) colors[i] = color_target(dr.color[i]);
@@ -1416,7 +1421,7 @@ bool Renderer::init(const Options& o) {
     if (const char* v = std::getenv("D1_NG_RING_MB")) ring_mb = std::max<uint64_t>(64, std::strtoull(v, nullptr, 10));
     if (ctx.props.limits.maxStorageBufferRange >= (64ull << 20))
         ring_mb = std::min<uint64_t>(ring_mb, ctx.props.limits.maxStorageBufferRange >> 20);
-    ring = make_buffer(ring_mb << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+    ring = make_buffer(ring_mb << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, std::getenv("D1_NG_RING_SYSMEM") == nullptr);
     if (!ring.map) {
@@ -4334,7 +4339,11 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
         vkBeginCommandBuffer(r.cmd, &bi);
         if (bindless_set && pipe_layout)
             vkCmdBindDescriptorSets(r.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_layout, 0, 1, &bindless_set, 0, nullptr);
-        for (size_t i = b; i < e; ++i) draw(*run[i], r, colors, depth);
+        for(size_t i=b;i<e;){
+            size_t used=1;
+            draw(*run[i],r,colors,depth,run+i+1,e-i-1,&used);
+            i+=used;
+        }
         vkEndCommandBuffer(r.cmd);
     };
     {
@@ -4900,7 +4909,8 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
 // One draw into a recording context: references only finished GPU objects (pipelines, bindless
 // texture/sampler IDs, geometry cache buffers, and ring buffer offsets) with state-diffed
 // command emission and no global renderer lock on the draw path.
-void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run_depth) {
+void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run_depth,
+                    Draw* const* followers,size_t available,size_t* consumed) {
     auto skip = [&](const char* why) {
         std::unique_lock<std::mutex> lk(skip_m, std::defer_lock);
         if (r.parallel) lk.lock();
@@ -4974,7 +4984,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
 
     VkBuffer vbufs[16];
     VkDeviceSize voffs[16], vsizes[16];
-    uint32_t vmask = 0;
+    uint32_t vmask = 0,whole_vmask=0;
     uint32_t vfirst = 0, vlast = dr.count ? dr.count - 1 : 0;
     bool ige = false, ige_whole = false;
     uint32_t first_index = 0;
@@ -5076,6 +5086,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
                     voffs[slot] = goff + rel;
                     vsizes[slot] = std::min<uint64_t>(uint64_t(records - std::min(voff_idx, records - 1)) * stride, R.size - rel);
                     vmask |= 1u << slot;
+                    if(voff_idx==0)whole_vmask|=1u<<slot;
                     continue;
                 }
             }
@@ -5343,7 +5354,46 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     if (indexed) {
         if (ds.ib != index_buf || ds.ioff != ioff || ds.itype != itype)
             vkCmdBindIndexBuffer(cmd, index_buf, ioff, itype), ds.ib = index_buf, ds.ioff = ioff, ds.itype = itype;
-        vkCmdDrawIndexed(cmd, count, std::max(1u, dr.instances), first_index, vertex_offset, 0);
+        // A native indexed run with identical immutable resources and state
+        // needs no repeated pipeline, geometry or descriptor resolution.
+        // Keep draw order; direct emission is the safe default. The optional
+        // multi-draw path additionally collapses the Vulkan API calls.
+        std::array<VkDrawIndexedIndirectCommand,64> batch{};
+        size_t n=1;
+        batch[0]={count,std::max(1u,dr.instances),first_index,vertex_offset,0};
+        static const bool batch_on=[]{
+            const char* v=std::getenv("D1_NG_DRAW_BATCH");return !v||std::atoi(v)!=0;
+        }();
+        static const bool indirect_on=[]{
+            const char* v=std::getenv("D1_NG_MULTI_DRAW");return v&&std::atoi(v)!=0;
+        }();
+        if(batch_on&&consumed&&followers&&available&&!predicated&&!rc().lr&&
+           !debug&&st.frames!=passlog_frame&&ige_whole&&whole_vmask==vmask&&
+           !need_vrange&&dr.prim!=0x13&&vertex_offset==0){
+            uint32_t first;
+            if(native_index_range(dr,first)&&first==first_index){
+                const size_t cap=std::min(available,batch.size()-1);
+                for(;n<=cap;++n){
+                    const Draw& next=*followers[n-1];
+                    if(!same_native_draw_state(dr,next)||!native_index_range(next,first))break;
+                    batch[n]={next.count,std::max(1u,next.instances),first,0,0};
+                }
+            }
+        }
+        bool indirect=false;
+        if(n>1&&indirect_on&&ctx.multi_draw_indirect&&n<=ctx.props.limits.maxDrawIndirectCount){
+            const auto off=rec_ring(r,n*sizeof(batch[0]),4);
+            if(off!=UINT64_MAX){
+                std::memcpy(ring.map+off,batch.data(),n*sizeof(batch[0]));
+                vkCmdDrawIndexedIndirect(cmd,ring.buf,off,uint32_t(n),sizeof(batch[0]));
+                indirect=true;++r.indirect_batches;
+            }
+        }
+        if(!indirect)for(size_t i=0;i<n;++i){
+            const auto& b=batch[i];
+            vkCmdDrawIndexed(cmd,b.indexCount,b.instanceCount,b.firstIndex,b.vertexOffset,b.firstInstance);
+        }
+        if(n>1){*consumed=n;r.batched_draws+=n-1;r.draws+=n-1;}
     } else {
         vkCmdDraw(cmd, count, std::max(1u, dr.instances), 0, 0);
     }
@@ -5509,7 +5559,11 @@ void Renderer::run_inline(Draw* const* run,size_t n){
     feedback_snapshots(run,n,colors,depth);
     resolve_draw_resources(run,n);
     Rec rec;rec.cmd=rc().cmd;rec.ds=&rc().dstate;
-    for(size_t i=0;i<n;++i)draw(*run[i],rec,colors,depth);
+    for(size_t i=0;i<n;){
+        size_t used=1;
+        draw(*run[i],rec,colors,depth,run+i+1,n-i-1,&used);
+        i+=used;
+    }
     merge(rec);
     ++inline_runs;inline_run_draws+=n;
 }
@@ -7370,6 +7424,9 @@ void print_stats() {
     log("native renderer: hot path reuse: %llu unchanged native material stages, %llu inline draws in %llu fixed-attachment runs",
         (unsigned long long)g->native_stage_reuse,(unsigned long long)g->inline_run_draws,
         (unsigned long long)g->inline_runs);
+    log("native renderer: native indexed draw batching: %llu follower draws bypassed CPU preparation, %llu multi-draw indirect calls",
+        (unsigned long long)g->batched_draws,(unsigned long long)g->indirect_batches);
+    g->batched_draws=g->indirect_batches=0;
     g->native_stage_reuse=g->inline_run_draws=g->inline_runs=0;
     s.memo_hits = s.memo_misses = s.memo_gen = 0, g->par_draws = g->par_runs = 0;
     if (const double f = double(s.frames - s.t_frames); f > 0 && g->list_rec)

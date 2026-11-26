@@ -1,4 +1,5 @@
 #include "native_epoch_cohort.h"
+#include "native_draw_batch.h"
 #include <cstdlib>
 #include <cstdio>
 using d1::ng::EpochCohort;
@@ -18,5 +19,23 @@ int main(){
     check(!cohort.observe(res(1,1)));
     check(cohort.observe(res(257,8)));
     check(cohort.observe(res(1,2)));
+    using namespace d1::ng;
+    Draw a{},b{};
+    a.kind=b.kind=Draw::Indexed;
+    a.ires=b.ires={res(1,2),0x10000,256};
+    a.index_addr=0x10000;b.index_addr=0x10020;
+    a.count=12;b.count=24;
+    uint32_t first=0;
+    check(same_native_draw_state(a,b)&&native_index_range(b,first)&&first==16);
+    b.index_addr=0x100ff;check(!native_index_range(b,first));b.index_addr=0x10020;
+    b.cb[0][1].addr=42;check(!same_native_draw_state(a,b));b.cb[0][1].addr=0;
+    b.stencil_ref=1;check(!same_native_draw_state(a,b));b.stencil_ref=0;
+    b.vres[1].id=99;check(!same_native_draw_state(a,b));b.vres[1].id=0;
+    a.active_tex_mask[1]=b.active_tex_mask[1]=1;
+    check(!same_native_draw_state(a,b));
+    a.native_tex_ready[1]=b.native_tex_ready[1]=1;
+    a.tex_res[1][0]=b.tex_res[1][0]=res(2,1);
+    check(same_native_draw_state(a,b));
+    b.tex_res[1][0]=res(2,2);check(!same_native_draw_state(a,b));
     std::puts("40000 ordered texture epoch and direct-cache collision checks passed");
 }

@@ -36,7 +36,7 @@
     X(vkDestroyPipelineCache) \
     X(vkCmdPipelineBarrier2) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) \
-    X(vkCmdDrawIndexed) X(vkCmdExecuteCommands) X(vkCmdDispatch) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdCopyBuffer) \
+    X(vkCmdDrawIndexed) X(vkCmdDrawIndexedIndirect) X(vkCmdExecuteCommands) X(vkCmdDispatch) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdCopyBuffer) \
     X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdClearColorImage) \
     X(vkCmdClearDepthStencilImage) X(vkCmdSetStencilReference) X(vkCmdPushConstants) X(vkCmdClearAttachments) \
     X(vkCmdSetDepthBias) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) \
@@ -71,6 +71,7 @@ struct Context {
     bool host_image_copy = false;     // VK 1.4 hostImageCopy feature
     bool external_memory_host = false;
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering
+    bool multi_draw_indirect = false;
     bool occlusion_precise = false;      // exact sample counts from occlusion queries
     char name[256] = {};
 };
