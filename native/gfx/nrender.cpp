@@ -1189,7 +1189,6 @@ struct Renderer {
     struct CapturedSource {
         ImageLifetime<Image>::Token ready;
         std::shared_ptr<const OwnedTexture> owned;
-        bool nonsplit=false;
     };
     std::mutex source_m;
     std::unordered_map<TextureSourceKey,CapturedSource,TextureSourceKeyHash> captured_sources;
@@ -1203,7 +1202,8 @@ struct Renderer {
         return it==captured_sources.end()?nullptr:it->second.owned;
     }
     void source_ready(const uint32_t* words,uint64_t res,Image* img){
-        if(!res||!img)return;
+        const auto type=words[3]>>28;
+        if(!res||!img||type<8||type>9||!img->matches_epoch(words,res))return;
         std::lock_guard lk(source_m);
         captured_sources[texture_source_key(words,res)].ready=img->lifetime.token(img);
     }
@@ -2790,7 +2790,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 img->descriptor_epoch[slot]=res;
                 img->res_val = res;
                 ++st.res_hits;
-                if(split_resource)source_ready(t,res,img);
+                source_ready(t,res,img);
                 st.t_tex_hit += now_ns() - t_in;
                 return img;
             }
@@ -2804,7 +2804,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 img->descriptor_epoch[0]=res;img->descriptor_epoch[1]=0;
                 ++views_gen;
                 ++st.res_moves;
-                if(split_resource)source_ready(t,res,img);
+                source_ready(t,res,img);
                 if(owned)++captured_source_replays;
                 st.t_tex_hit += now_ns() - t_in;
                 return img;
@@ -3149,11 +3149,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     out->last_used = rc().submit_no;
     out->last_frame = st.frames;
     ++st.textures;
-    if(split_resource){
-        source_ready(t,res,out);
-        if(out->low_loaded&&out->descriptor_epoch[0]==res&&out->resident_descriptor[0][0])
-            source_ready(out->resident_descriptor[0],res,out);
-    }
+    source_ready(t,res,out);
+    if(streamed&&!cur_is_low&&out->low_loaded&&out->descriptor_epoch[0]==res&&out->resident_descriptor[0][0])
+        source_ready(out->resident_descriptor[0],res,out);
     if(historical_replay)archive_texture(key,std::move(img));
     else textures[key]=std::move(img);
     ++views_gen;
@@ -6153,7 +6151,7 @@ void Renderer::load_texture(const LoadJob& j) {
                 img->descriptor_epoch[0]=j.res;img->descriptor_epoch[1]=0;
                 ++views_gen; // invalidate cached misses and old descriptor epochs
                 ++ld_moves;
-                if(smi.has_hi&&smi.full_mips>1)source_ready(t,j.res,img);
+                source_ready(t,j.res,img);
                 return;
             }
         }
@@ -6208,7 +6206,7 @@ static bool split_2d_surface(const uint32_t* words,tiling::Surface& sf){
     tiling::layout(sf);return true;
 }
 // Called from the engine capture thread with a shared publication gate.
-// Only split 1D/2D assets with an exact published descriptor are eligible.
+// Ordinary and split 1D/2D assets with an exact published descriptor are eligible.
 // The first list that references an unprepared epoch retains its actual
 // source bytes. Later lists share the same snapshot or ready GPU token.
 void Renderer::capture_owned_texture(const uint32_t* words,uint64_t res,uint64_t obj){
@@ -6228,54 +6226,62 @@ void Renderer::capture_owned_texture(const uint32_t* words,uint64_t res,uint64_t
             if(ImageLifetime<Image>::resolve(it->second.ready)){
                 fast={this,key,it->second.ready};return;
             }
-            if(it->second.nonsplit||it->second.owned)return;
+            if(it->second.owned)return;
         }
     }
     if(opt.res_current(obj)!=res||guest_region_extent(obj)<0x44)return;
-    if(!*reinterpret_cast<const uint8_t*>(obj+0x34)){
-        std::lock_guard lk(source_m);
-        captured_sources[key].nonsplit=true;
-        return;
-    }
     const auto ts=fmt::decode_tsharp(words);
-    StreamMipInfo info{};
-    bool have=false;
-    {
-        std::lock_guard lk(mip_m);
-        const auto it=stream_mips.find(uint32_t(res>>32));
-        if(it!=stream_mips.end())if(const auto* entry=it->second.find(res)){info=*entry;have=true;}
-    }
-    if(!have){
-        // Initial low-res bind may not invoke 7D4480. The captured
-        // descriptor and authored mip count establish the low chain;
-        // a full-resolution descriptor without callback bounds does not.
-        info.obj=obj;info.epoch=res;info.has_hi=1;
-        info.full_w=*reinterpret_cast<const uint16_t*>(obj+0x28);
-        info.full_h=*reinterpret_cast<const uint16_t*>(obj+0x2a);
-        info.full_d=1;info.full_mips=*reinterpret_cast<const uint8_t*>(obj+0x31);
-        if(info.full_mips<2||ts.last_level+1!=uint32_t(info.full_mips)-1)return;
-        info.low_base=ts.base;info.low_layout=ts;std::memcpy(info.low_words.data(),words,32);
-    }
-    if(!info.valid||!info.has_hi||info.full_mips<2)return;
     tiling::Surface sf;
     if(!split_2d_surface(words,sf))return;
-    const auto fi=fmt::data_format(ts.dfmt);
-    const uint32_t lw=info.full_w<4?1u:uint32_t(info.full_w>>1),lh=std::max(1u,uint32_t(info.full_h>>1));
-    const bool low_dims=(ts.width==lw||(fi.block&&ts.width==((lw+3)&~3u)))&&
-                        (ts.height==lh||(fi.block&&ts.height==((lh+3)&~3u)));
-    const bool low=low_dims&&ts.last_level+1==uint32_t(info.full_mips)-1&&ts.base==info.low_base;
-    const bool high=ts.width==info.full_w&&ts.height==info.full_h&&ts.last_level+1==info.full_mips&&ts.base==info.hi_base;
-    const auto source=mip_source(low,high,info.low_base,info.hi_base,info.low_bytes,info.hi_bytes,sf.total_size,sf.mips[0].size);
-    if(source==MipSource::invalid||(!info.from_callback&&source==MipSource::high_only))return;
-    const uint64_t primary=(source==MipSource::high_only||source==MipSource::split_chain)?sf.mips[0].size:sf.total_size;
-    uint64_t secondary=0;
-    if(source==MipSource::split_chain){
-        tiling::Surface low_sf;
-        if(!info.low_words[0]||!split_2d_surface(info.low_words.data(),low_sf)||
-           info.low_layout.base!=info.low_base||info.low_layout.dfmt!=ts.dfmt||
-           info.low_layout.nfmt!=ts.nfmt||low_sf.levels!=uint32_t(info.full_mips)-1)return;
-        secondary=low_sf.total_size;
-        if(info.low_bytes&&secondary>info.low_bytes)return;
+    StreamMipInfo info{};
+    const auto authored_mips=*reinterpret_cast<const uint8_t*>(obj+0x31);
+    const bool has_high=*reinterpret_cast<const uint8_t*>(obj+0x34)!=0;
+    const bool split=has_high&&authored_mips>1;
+    uint64_t primary=sf.total_size,secondary=0;
+    if(!split){
+        // The ordinary registered path consumes the complete descriptor
+        // footprint. Preserve it just like the assembled split chain; an
+        // unprepared ordinary texture can expire before submission too.
+        if(has_high&&(authored_mips!=1||sf.levels!=1))return;
+        info.obj=obj;info.epoch=res;
+        info.full_w=uint16_t(ts.width);info.full_h=uint16_t(ts.height);
+        info.full_mips=uint8_t(sf.levels);info.low_base=ts.base;
+    }else{
+        bool have=false;
+        {
+            std::lock_guard lk(mip_m);
+            const auto it=stream_mips.find(uint32_t(res>>32));
+            if(it!=stream_mips.end())if(const auto* entry=it->second.find(res)){info=*entry;have=true;}
+        }
+        if(!have){
+            // Initial low-res bind may not invoke 7D4480. The captured
+            // descriptor and authored mip count establish the low chain;
+            // a full-resolution descriptor without callback bounds does not.
+            info.obj=obj;info.epoch=res;info.has_hi=1;
+            info.full_w=*reinterpret_cast<const uint16_t*>(obj+0x28);
+            info.full_h=*reinterpret_cast<const uint16_t*>(obj+0x2a);
+            info.full_d=1;info.full_mips=authored_mips;
+            if(ts.last_level+1!=uint32_t(info.full_mips)-1)return;
+            info.low_base=ts.base;info.low_layout=ts;std::memcpy(info.low_words.data(),words,32);
+        }
+        if(!info.valid||!info.has_hi||info.full_mips<2)return;
+        const auto fi=fmt::data_format(ts.dfmt);
+        const uint32_t lw=info.full_w<4?1u:uint32_t(info.full_w>>1),lh=std::max(1u,uint32_t(info.full_h>>1));
+        const bool low_dims=(ts.width==lw||(fi.block&&ts.width==((lw+3)&~3u)))&&
+                            (ts.height==lh||(fi.block&&ts.height==((lh+3)&~3u)));
+        const bool low=low_dims&&ts.last_level+1==uint32_t(info.full_mips)-1&&ts.base==info.low_base;
+        const bool high=ts.width==info.full_w&&ts.height==info.full_h&&ts.last_level+1==info.full_mips&&ts.base==info.hi_base;
+        const auto source=mip_source(low,high,info.low_base,info.hi_base,info.low_bytes,info.hi_bytes,sf.total_size,sf.mips[0].size);
+        if(source==MipSource::invalid||(!info.from_callback&&source==MipSource::high_only))return;
+        primary=(source==MipSource::high_only||source==MipSource::split_chain)?sf.mips[0].size:sf.total_size;
+        if(source==MipSource::split_chain){
+            tiling::Surface low_sf;
+            if(!info.low_words[0]||!split_2d_surface(info.low_words.data(),low_sf)||
+               info.low_layout.base!=info.low_base||info.low_layout.dfmt!=ts.dfmt||
+               info.low_layout.nfmt!=ts.nfmt||low_sf.levels!=uint32_t(info.full_mips)-1)return;
+            secondary=low_sf.total_size;
+            if(info.low_bytes&&secondary>info.low_bytes)return;
+        }
     }
     constexpr uint64_t budget=256ull<<20;
     if(!primary||primary>budget||secondary>budget-primary)return;
