@@ -79,7 +79,6 @@ int main(int argc, char** argv) {
     using namespace d1::fios_contract;
     const fs::path root = argv[1];
     check(fs::create_directory(root) && fs::create_directory(root / "assets") && fs::create_directory(root / "data"));
-    check(::setenv("D1_NATIVE_FIOS", "1", 1) == 0);
     d1::rt().app0 = (root / "assets").string();
     d1::rt().data_root = (root / "data").string();
     d1::Module m;
