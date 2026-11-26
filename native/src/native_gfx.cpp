@@ -259,7 +259,11 @@ void prefetch(uint32_t type, uint64_t o) {
     if (!o || !ng::active()) return;
     const uint64_t res = get(o);
     if (!res) return;
-    if (type == 8 || type == 9 || type == 12 || type == 13) {
+    // 0x7D4B90 (type 8) binds a texture with an 8-byte tag header,
+    // not a shader. Its descriptor layout is different from types 1-3.
+    // Do not parse it as shader bytecode or feed it to the type-1 mip path.
+    if (type == 8) return;
+    if (type == 9 || type == 12 || type == 13) {
         ng::prefetch_shader(reinterpret_cast<const uint8_t*>(o), type == 9, res, o);
         return;
     }
@@ -272,7 +276,10 @@ void prefetch(uint32_t type, uint64_t o) {
     }
 }
 void event(uint32_t type, uint32_t handle, bool insert) {
-    if (const uint64_t o = object_of(type, handle)) touch(o, insert, handle), prefetch(type, o);
+    if (const uint64_t o = object_of(type, handle)) {
+        touch(o, insert, handle);
+        if (insert) prefetch(type, o);
+    }
 }
 void event_any(uint32_t handle) {
     if (handle == 0xFFFFFFFFu) return;
@@ -383,6 +390,7 @@ ng::Draw* alloc_draw() {
     d->kind = ng::Draw::Auto, d->prim = 4, d->index32 = 0, d->clear_flags = 0;
     d->count = 0, d->instances = 1, d->index_addr = 0, d->order = 0, d->seq = 0, d->frame = 0, d->caller = 0;
     d->vs = d->ps = nullptr, d->num_vb = 0;
+    d->shader_res[0] = d->shader_res[1] = 0;
     std::memset(d->vb, 0, sizeof d->vb);
     for (auto& r : d->vres) r = {};
     d->ires = {};
