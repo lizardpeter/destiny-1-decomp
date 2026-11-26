@@ -55,6 +55,7 @@ add_executable(d1-native
   src/loader.cpp
   src/runtime.cpp
   src/pc_libc_imports.cpp
+  src/fios_imports.cpp
   src/hle_kernel.cpp
   src/hle_pthread.cpp
   src/hle_services.cpp
