@@ -819,7 +819,19 @@ struct Renderer {
     Recorder up_rec;  // uploads and target set-up for lists recorded on engine threads
     Recorder* pre_for = nullptr;  // the list whose textures pre_pass is preparing (in the upload slot)
     // the loader thread: engine resources prepared when the engine binds or moves them
-    struct LoadJob { uint8_t kind; uint32_t t[8]; uint64_t base, size, res, obj; MappingSpans mapping; };  // kind: 0 buf, 1 tex, 2 vs, 3 ps
+    struct LoadJob {
+        uint8_t kind; uint32_t t[8]; uint64_t base,size,res,obj; MappingSpans mapping;
+        uint32_t low[8]{};
+        uint64_t low_base=0,low_size=0;
+        MappingSpans low_mapping;
+    }; // 0 buffer, 1 contiguous texture, 2 VS, 3 PS, 4 split 2D texture
+    struct PreparedMipRange {
+        uint64_t base=0,source_size=0;
+        uint32_t levels=0,dst=0;
+        tiling::Surface surface{};
+        MappingSpans mapping;
+        std::vector<uint8_t> tiled,linear;
+    };
     std::mutex load_m;
     std::condition_variable load_cv;
     std::deque<LoadJob> load_q;
@@ -827,7 +839,12 @@ struct Renderer {
     static uint64_t load_key(const LoadJob& j) {
         uint64_t h=mix(mix(mix(j.kind,j.res),j.obj),mix(j.base,j.size));
         for(const auto& span:j.mapping)h=mix(mix(mix(h,span.base),span.size),span.identity);
-        if (j.kind == 1) h = mix(h, hash_bytes(j.t, sizeof j.t));
+        if(j.kind==1||j.kind==4)h=mix(h,hash_bytes(j.t,sizeof j.t));
+        if(j.kind==4){
+            h=mix(mix(h,j.low_base),j.low_size);
+            h=mix(h,hash_bytes(j.low,sizeof j.low));
+            for(const auto& span:j.low_mapping)h=mix(mix(mix(h,span.base),span.size),span.identity);
+        }
         return h;
     }
     std::thread loader;
@@ -835,6 +852,7 @@ struct Renderer {
     std::atomic<uint64_t> ld_tex{0}, ld_moves{0}, ld_buf{0}, ld_stale{0}, ld_skipped{0}, ld_dropped{0}, ld_ns{0};
     void start_loader();
     void load_texture(const LoadJob& j);
+    void load_split_texture(const LoadJob& j);
     void load_buffer(const LoadJob& j);
     void load_shader(const LoadJob& j);
     void prefetch(const LoadJob& j) {
@@ -1121,7 +1139,8 @@ struct Renderer {
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
     Image* upload_texture(const uint32_t* t, uint64_t res = 0, uint64_t obj = 0,
                           const uint8_t* prepared = nullptr, uint64_t prepared_size = 0,
-                          uint64_t prepared_source_size = 0, uint64_t prepared_hash = 0);
+                          uint64_t prepared_source_size = 0, uint64_t prepared_hash = 0,
+                          const std::vector<PreparedMipRange>* split_prepared=nullptr);
     void resolve_draw_resources(Draw* const* draws, size_t count);
     struct DiskPipeSpec {
         uint64_t vs_hash = 0, ps_hash = 0;
@@ -2417,7 +2436,8 @@ Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res,uint64_t obj,cons
 
 Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                                 const uint8_t* prepared, uint64_t prepared_size,
-                                uint64_t prepared_source_size, uint64_t prepared_hash) {
+                                uint64_t prepared_source_size, uint64_t prepared_hash,
+                                const std::vector<PreparedMipRange>* split_prepared) {
     const uint64_t t_in = now_ns();
     struct LoadTimer {
         Renderer* r;
@@ -2467,6 +2487,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     const bool streamed = res != 0 && !is3d && ts.type != 12 && ts.type != 13 &&
                           smi.has_hi != 0 && smi.full_mips > 1;
     if(prepared&&(!res||streamed))return nullptr; // prepared jobs describe one contiguous registered surface
+    if(split_prepared&&(!streamed||prepared))return nullptr;
     if (streamed) {
         // 7D4480 constructs a half-size low descriptor (BC dimensions may be
         // rounded up to four) or a full-size high descriptor.
@@ -2666,7 +2687,22 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         const uint8_t* tiled=nullptr;
         const MappingSpans* spans=nullptr;
         uint64_t captured=needed;
-        if(!prepared){
+        const PreparedMipRange* split=nullptr;
+        if(split_prepared){
+            for(const auto& range:*split_prepared){
+                const auto& a=range.surface;
+                if(range.base==base_addr&&range.source_size==needed&&range.levels==src_lv_count&&
+                   range.dst==dst_lv_begin&&src_lv_begin==0&&
+                   a.width==s_src.width&&a.height==s_src.height&&a.pitch==s_src.pitch&&
+                   a.tile_mode==s_src.tile_mode&&a.pow2==s_src.pow2&&a.block==s_src.block&&
+                   a.bpp==s_src.bpp&&a.depth==s_src.depth&&a.layers==s_src.layers&&
+                   a.stored_layers==s_src.stored_layers&&a.samples==s_src.samples&&a.levels==s_src.levels){
+                    split=&range;break;
+                }
+            }
+            if(!split)return false;
+        }
+        if(!prepared&&!split){
             if(base_addr==ts.base&&needed<=cur_bytes){
                 if(!primary()){++texture_range_rejects;return false;}
                 tiled=primary_source.data();spans=&primary_spans;captured=cur_bytes;
@@ -2711,14 +2747,16 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         const uint64_t tf0 = now_ns();
         const bool use_prepared = !streamed && prepared && prepared_size == total &&
                                   src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count == full_levels;
-        if(prepared&&(!use_prepared||crop)) {
+        if((prepared&&(!use_prepared||crop))||(split&&split->linear.size()!=total)) {
             if(own)free_buffer(sb);
             return false; // do not silently fall back to guest memory
         }
-        const uint32_t missing = (!use_prepared && src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count > 1) ? first_missing_mip(ts, fi, s_src, is3d,tiled) : src_lv_count;
+        const uint32_t missing = (!split && !use_prepared && src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count > 1) ? first_missing_mip(ts, fi, s_src, is3d,tiled) : src_lv_count;
         const uint64_t td = now_ns();
         st.t_fill += td - tf0;
-        if (crop) {
+        if(split){
+            std::memcpy(sb.map,split->linear.data(),total);
+        }else if (crop) {
             static thread_local std::vector<uint8_t> cropped_source;
             for (uint32_t k = 0; k < src_lv_count; ++k) {
                 const uint32_t sl = src_lv_begin + k, dl = dst_lv_begin + k;
@@ -2750,8 +2788,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 tiling::detile(s_src,src_lv_begin+k,tiled,sb.map+level_off[k]);
             st.t_detile += now_ns() - td;
         }
-        if(!current_epoch()||(!prepared&&(!spans||
-           !guest_matches_current_spans(base_addr,captured,*spans,tiled)))){
+        if(!current_epoch()||(split?
+           !guest_matches_current_spans(base_addr,needed,split->mapping,split->tiled.data()):
+           (!prepared&&(!spans||!guest_matches_current_spans(base_addr,captured,*spans,tiled))))){
             if(own)free_buffer(sb);
             ++st.tex_torn;
             return false;
@@ -5456,6 +5495,7 @@ void Renderer::start_loader() {
             const uint64_t t0 = now_ns();
             if (opt.res_current(j.obj) != j.res) ++ld_stale;
             else if (j.kind == 1) load_texture(j);
+            else if (j.kind == 4) load_split_texture(j);
             else if (j.kind == 0) load_buffer(j);
             else load_shader(j);
             ld_ns += now_ns() - t0;
@@ -5597,6 +5637,94 @@ void Renderer::load_texture(const LoadJob& j) {
         ++ld_stale;return;
     }
     if (upload_texture(t,j.res,j.obj,scratch.data(),total,sf.total_size,content)) ++ld_tex;
+}
+
+// Exact source geometry for ordinary 1D/2D split textures. Cube and
+// volume variants remain on the existing ordered path until separately tested.
+static bool split_2d_surface(const uint32_t* words,tiling::Surface& sf){
+    const auto d=fmt::decode_tsharp(words);
+    const auto fi=fmt::data_format(d.dfmt);
+    if(d.type<8||d.type>9||!d.base||!fi.bpp||fi.bpp%8||fi.bpp==96||
+       d.width>16384||d.height>16384)return false;
+    sf.tile_mode=d.tiling;sf.bpp=fi.bpp;sf.block=fi.block;sf.pow2=d.pow2;
+    sf.width=d.width;sf.height=d.height;sf.pitch=d.pitch;
+    sf.depth=sf.layers=sf.stored_layers=1;
+    sf.levels=std::min(d.last_level+1,tiling::kMaxMips);
+    tiling::layout(sf);return true;
+}
+void Renderer::load_split_texture(const LoadJob& j){
+    if(!opt.res_current||opt.res_current(j.obj)!=j.res)return;
+    const auto ts=fmt::decode_tsharp(j.t);
+    const auto info=get_stream_info(j.res,j.obj,ts,j.t);
+    if(!info.valid||!info.from_callback||!info.has_hi||info.full_mips<2)return;
+    const bool high=ts.last_level+1==info.full_mips;
+    const auto key=tex_key(j.t,j.res);
+    {
+        std::lock_guard lk(m);
+        auto it=textures.find(key);
+        if(it!=textures.end()&&it->second&&it->second->matches_epoch(j.t,j.res)){
+            ++ld_skipped;return;
+        }
+    }
+    std::vector<PreparedMipRange> ranges;
+    uint64_t prepared_bytes=0;
+    auto prepare=[&](const uint32_t* words,uint64_t base,uint64_t size,const MappingSpans& mapping,
+                     uint32_t levels,uint32_t dst){
+        const auto d=fmt::decode_tsharp(words);
+        PreparedMipRange range;
+        auto& sf=range.surface;
+        if(!split_2d_surface(words,sf)||d.base!=base||mapping.empty()||!size||
+           size>(128ull<<20)||d.dfmt!=ts.dfmt||d.nfmt!=ts.nfmt||!levels||
+           levels>sf.levels||dst+levels>info.full_mips||
+           sf.mips[levels-1].offset+sf.mips[levels-1].size!=size)return false;
+        range.base=base;range.source_size=size;range.levels=levels;range.dst=dst;
+        range.mapping=mapping;
+        if(prepared_bytes+size>(128ull<<20))return false;
+        range.tiled.resize(size);
+        if(!guest_copy_current_spans(base,size,mapping,range.tiled.data())||opt.res_current(j.obj)!=j.res)return false;
+        const uint32_t block=sf.block?4:1,bytes=sf.bpp/8;
+        const auto elems=[&](uint32_t n){return (n+block-1)/block;};
+        static thread_local std::vector<uint8_t> scratch;
+        for(uint32_t lv=0;lv<levels;++lv){
+            const auto sw=elems(std::max(1u,d.width>>lv)),sh=elems(std::max(1u,d.height>>lv));
+            const auto dw=elems(std::max(1u,uint32_t(info.full_w)>>(dst+lv)));
+            const auto dh=elems(std::max(1u,uint32_t(info.full_h)>>(dst+lv)));
+            if(sw<dw||sh<dh)return false;
+            const uint64_t src_bytes=uint64_t(sw)*sh*bytes;
+            const uint64_t padded=(uint64_t(dw)*dh*bytes+15)&~15ull;
+            if(src_bytes>(128ull<<20)||prepared_bytes+size+range.linear.size()+padded>(128ull<<20))return false;
+            const size_t off=range.linear.size();range.linear.resize(off+padded);
+            if(sw==dw&&sh==dh)tiling::detile(sf,lv,range.tiled.data(),range.linear.data()+off);
+            else{
+                scratch.resize(src_bytes);tiling::detile(sf,lv,range.tiled.data(),scratch.data());
+                for(uint32_t y=0;y<dh;++y)
+                    std::memcpy(range.linear.data()+off+uint64_t(y)*dw*bytes,
+                        scratch.data()+uint64_t(y)*sw*bytes,uint64_t(dw)*bytes);
+            }
+        }
+        prepared_bytes+=range.tiled.size()+range.linear.size();
+        ranges.push_back(std::move(range));return true;
+    };
+    if(high){
+        if(ts.base!=info.hi_base||j.low_base!=info.low_base||
+           !prepare(j.low,j.low_base,j.low_size,j.low_mapping,info.full_mips-1,1)||
+           !prepare(j.t,j.base,j.size,j.mapping,1,0))return;
+    }else if(ts.base!=info.low_base||ts.last_level+1!=info.full_mips-1||
+              !prepare(j.t,j.base,j.size,j.mapping,info.full_mips-1,1))return;
+    // Native linear data is now owned by this job, independent of tag pointers.
+    // Validate mapping/content identity before publishing it to the GPU.
+    std::lock_guard lk(m);
+    if(opt.res_current(j.obj)!=j.res){++ld_stale;return;}
+    for(const auto& range:ranges)
+        if(!guest_matches_current_spans(range.base,range.source_size,range.mapping,range.tiled.data())){
+            ++ld_stale;return;
+        }
+    Recorder* const previous=tr;
+    struct Restore {Recorder* p;~Restore(){tr=p;}} restore{previous};
+    tr=&up_rec;up_rec.lr=true;
+    if(up_rec.cur==UINT32_MAX)up_rec.submit_no=submit_seq.load(),begin_record();
+    if(up_rec.cur==UINT32_MAX)return;
+    if(upload_texture(j.t,j.res,j.obj,nullptr,0,0,0,&ranges))++ld_tex;
 }
 
 void Renderer::load_shader(const LoadJob& j) {
@@ -6764,7 +6892,28 @@ void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64
         auto& slot=history[uint32_t(res)&3];
         if(slot.epoch<=res)slot=info;
     }
-    if(tsharp)prefetch_texture(tsharp,res,obj);
+    if(!tsharp)return;
+    if(!info.has_hi||info.full_mips<2){prefetch_texture(tsharp,res,obj);return;}
+    if(!g->load_on||!info.valid||!info.low_base||g->opt.res_current(obj)!=res)return;
+    Renderer::LoadJob job{4,{},0,0,res,obj};
+    std::memcpy(job.t,tsharp,32);
+    const auto ts=fmt::decode_tsharp(job.t);
+    const bool high=ts.last_level+1==info.full_mips;
+    if(high?(ts.base!=info.hi_base||!info.low_words[0]):
+             (ts.base!=info.low_base||ts.last_level+1!=info.full_mips-1))return;
+    auto span=[&](const uint32_t* words,uint32_t levels,uint64_t& base,uint64_t& size,MappingSpans& mapping){
+        tiling::Surface sf;
+        const auto d=fmt::decode_tsharp(words);
+        if(!split_2d_surface(words,sf)||d.dfmt!=ts.dfmt||d.nfmt!=ts.nfmt||!levels||levels>sf.levels)return false;
+        base=d.base;size=sf.mips[levels-1].offset+sf.mips[levels-1].size;
+        return size&&size<=(128ull<<20)&&guest_capture_read_spans(base,size,mapping);
+    };
+    if(!span(job.t,high?1:info.full_mips-1,job.base,job.size,job.mapping))return;
+    if(high){
+        std::memcpy(job.low,info.low_words.data(),32);
+        if(!span(job.low,info.full_mips-1,job.low_base,job.low_size,job.low_mapping))return;
+    }
+    if(g->opt.res_current(obj)==res)g->prefetch(job);
 }
 
 void prefetch_shader_pair(const uint8_t* vs_obj, const uint8_t* ps_obj) {
