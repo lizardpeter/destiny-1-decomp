@@ -139,6 +139,8 @@ Native renderer (`native/gfx`):
 | `D1_NG_PENDING_STATS=1` | log the pending draw / constant event lookups per submission |
 | `D1_NG_FRAMES_IN_FLIGHT=<n>` | frames the CPU may record ahead of the GPU (default 2) |
 | `D1_NG_GPU_TIMING=1` | optional GPU submission timestamp spans, collected after fences complete; logs summed/mean/max spans (not utilization, spans can overlap). |
+| `D1_NATIVE_FRAME_TRACE=1` | optional scheduler instrumentation: observe published 0x591D40 frame records, including follow-up steps and aggregate timing channels; reports every 10 seconds. |
+| `D1_NATIVE_FIXED_TICK=1` | experimental fixed-step path: preserve the original accumulator period and temporarily suppress the forced one-primary-step branch during timing calculation. Not the default; animation, physics, networking, and stage scheduling need live validation. |
 | `D1_NG_READBACK=<pixels>` | largest never-sampled render target written back to guest memory for the CPU (default 4096, 0 off); `D1_NG_LOG_READBACK=1` lists the decisions |
 | `D1_NG_STATS=1` | renderer statistics every 5 s instead of 15 s |
 | `D1_NG_LOG_FAULTS=1` | the 64 KiB regions the game keeps rewriting (write-protection faults) |
