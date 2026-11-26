@@ -193,6 +193,10 @@ int main(int argc, char** argv) {
     }
     rt().app0 = app0;
     rt().data_root = data;
+    if (!init_pc_filesystem()) {
+        os::error_box("Game assets and writable data must be in separate, accessible directories. Details are in d1-native.log.");
+        return 2;
+    }
 
     // Backend: start ours from this folder, use a remote one, or none.
     if (st.backend == "local") {
