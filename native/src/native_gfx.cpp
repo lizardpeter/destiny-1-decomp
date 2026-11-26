@@ -7,6 +7,7 @@
 // threads and executed by our Vulkan renderer (gfx/nrender.cpp). No PM4, no emulated GPU.
 #include <deque>
 #include <map>
+#include <memory>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -1458,40 +1459,54 @@ static void nr_every_world() {
 
 bool native_device_active() { return nd::g_on; }
 void gnm_signal_eop();  // hle_gpu.cpp
-void native_device_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
+// The queue owns detached native lists, not pointers into the engine's
+// reusable console-shaped command buffers. Tokens are decoded at the API boundary.
+struct NativeSubmission {
     std::vector<nd::List*> lists;
-    {
+};
+NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
+    auto batch = std::make_unique<NativeSubmission>();
+    std::lock_guard lk(nd::g_lists_m);
+    for (uint32_t k = 0; k < count; ++k) {
+        const uint32_t* p = dcbs[k];
+        const uint32_t n = p ? sizes[k] / 4 : 0;
+        for (uint32_t i = 0; i < n;) {
+            const uint32_t h = p[i], type = h >> 30;
+            const uint32_t words = type == 2 ? 1 : ((h >> 16) & 0x3FFF) + 2;
+            if (words > n - i) break;
+            if (type == 3 && words == 4 && ((h >> 8) & 0xFF) == 0x10 && p[i + 1] == nd::kMagic) {
+                const uint64_t id = p[i + 2] | uint64_t(p[i + 3]) << 32;
+                if (auto it = nd::g_lists.find(id); it != nd::g_lists.end()) {
+                    batch->lists.push_back(it->second);
+                    nd::g_lists.erase(it);
+                }
+            }
+            i += words;
+        }
+    }
+    return batch.release();
+}
+void native_device_execute_submit(NativeSubmission* batch) {
+    if (!batch) return;
+    std::unique_ptr<NativeSubmission> owned(batch);
+    auto& lists = owned->lists;
+    // Only the consumer thread retires orphaned list allocations. Never hold
+    // the capture mutex while calling the renderer or retiring memory.
+    std::vector<nd::List*> orphans;
+    static uint64_t sweep = 0;
+    if (++sweep % 256 == 0) {
         std::lock_guard lk(nd::g_lists_m);
-        for (uint32_t k = 0; k < count; ++k) {
-            const uint32_t* p = dcbs[k];
-            const uint32_t n = p ? sizes[k] / 4 : 0;
-            for (uint32_t i = 0; i < n;) {
-                const uint32_t h = p[i], type = h >> 30;
-                if (type == 3) {
-                    const uint32_t cnt = (h >> 16) & 0x3FFF;
-                    if (((h >> 8) & 0xFF) == 0x10 && cnt == 2 && i + 3 < n && p[i + 1] == nd::kMagic) {
-                        const uint64_t id = p[i + 2] | uint64_t(p[i + 3]) << 32;
-                        if (auto it = nd::g_lists.find(id); it != nd::g_lists.end()) lists.push_back(it->second), nd::g_lists.erase(it);
-                    }
-                    i += cnt + 2;
-                } else if (type == 2) {
-                    i += 1;
-                } else {
-                    i += ((h >> 16) & 0x3FFF) + 2;
-                }
-            }
+        for (auto it = nd::g_lists.begin(); it != nd::g_lists.end();) {
+            if (it->second->made + 300 < gpu_flip_count()) {
+                orphans.push_back(it->second);
+                it = nd::g_lists.erase(it);
+            } else ++it;
         }
-        static uint64_t sweep = 0;
-        if (++sweep % 256 == 0) {
-            for (auto it = nd::g_lists.begin(); it != nd::g_lists.end();) {
-                if (it->second->made + 300 < gpu_flip_count()) {
-                    if (it->second->recorded) ng::discard_recorded(it->second->handle);
-                    ++nd::g_orphans, nd::free_list(it->second), it = nd::g_lists.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
+    }
+    for (nd::List* l : orphans) {
+        if (l->recorded) ng::discard_recorded(l->handle);
+        ++nd::g_orphans;
+        nd::free_list(l);
     }
     std::vector<ng::Draw*> draws;
     std::vector<uint32_t> recorded;
@@ -1607,6 +1622,10 @@ void native_device_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t*
     flush_draws();
     nd::g_lists_run += lists.size();
     for (nd::List* l : lists) nd::free_list(l);
+}
+
+void native_device_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
+    native_device_execute_submit(native_device_capture_submit(count, dcbs, sizes));
 }
 
 void native_gfx_flip(void* addr, uint32_t width, uint32_t height) {
