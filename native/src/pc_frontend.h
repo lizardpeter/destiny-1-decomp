@@ -10,9 +10,6 @@ struct PadState {
     uint32_t buttons;
     uint8_t lx, ly, rx, ry, l2, r2;
 };
-// Stats overlay (FPS, resolutions, v-sync, GPU, game state); F3 toggles it.
-bool overlay_enabled();
-void set_overlay(bool on);
 
 bool window_active();
 bool read_pad(PadState& out);  // false when there is no window: caller keeps its own input
