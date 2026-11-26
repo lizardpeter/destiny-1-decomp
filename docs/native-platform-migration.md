@@ -34,3 +34,36 @@ sceFiosOpGetActualCount, sceFiosOpDelete, sceFiosInitialize, sceFiosTerminate, s
 The exact committed pc_libc_leaf.h / pc_libc_leaf_test.cpp and native_record_registry.h / native_record_registry_test.cpp were compiled locally, with blob hashes checked against the repository. Both passed g++ C++20 -O2 -Wall -Wextra -Werror and Clang AddressSanitizer/UndefinedBehaviorSanitizer. The leaf suite ran 100,000 randomized iterations plus boundary checks; the registry ran 100,000 ownership cycles on four concurrent threads plus invalid/duplicate/reused-record checks. CTest registrations updated. The tests exercise standalone implementation, not original executable linkage or GPU playthrough.
 
 No full PC executable build or physical GPU test was possible: direct GitHub checkout fails DNS; this environment lacks Vulkan and SDL development headers and R2 host DNS resolution also fails. The record-address association is grounded in original pseudocode but not yet live-validated; unknown callers intentionally fail rather than falling back. The original eboot and both PRX modules are still needed. A source-complete independent build, full graphics parity, and performance gains remain unverified.
+
+
+## Native file services and libc migration — continued 2026-11-26
+
+### Retail FIOS evidence
+
+Re-read `analysis/ps4-0133/pseudocode/00080000.c`. The engine-side wrappers are:
+- 0x803A0: initialization copies 0x98 bytes of parameters, installs four original memory-pool addresses/sizes, vprintf and memcpy callbacks. 0x804C0 terminates.
+- 0x804E0: engine open flags translate into low FIOS bits through a recovered exact expression; all 16 low-bit combinations are preserved in `fios_contract.h` and tested over 65,536 input values. This does not establish the semantic names of every FIOS flag.
+- 0x805A0: synchronous open passes a 24-byte zero-initialized attribute record with 16-bit flags at +0, a 32-bit file handle output, and null operation attributes. 0x80610 closes, 0x80640 deletes.
+- 0x80670 and 0x80740: positional async read/write pass a 48-byte stack attribute record with callback at +8 and low 16-bit request token in the +0x10 user context. Zero returned operation ID maps to 0x80820001.
+- 0x802E0: terminal callback event 1 stores the supplied result at request+0x94, reads actual byte count through sceFiosOpGetActualCount into request+0x18, deletes the operation, atomically clears request+0x68, then calls 0x82A70 under the original engine lock. This constrains callback ordering and lifetime; it does not prove callbacks may run on arbitrary host threads.
+- 0x807F0 directory delete; 0x809F0 file-size failure -1 maps to 0x8082000B; 0x80570 recognizes 0x80820010. 0x8A1A0 tests open/write/close/delete on temporary storage.
+
+### Implemented native service (not yet the production FIOS import provider)
+
+- `pc_file.h`: owned host file descriptor, explicit access/create/truncate/exclusive options, 64-bit positional reads/writes, partial-count errors, independent sequential cursor, size/seek/tell/sync. Linux uses pread/pwrite; Windows uses wide-path CRT open and per-file serialized seek/transfer. Windows overlapped/IOCP optimization is not implemented or measured.
+- `pc_file_queue.h`: native bounded-count worker queue, monotonic nonzero file/operation IDs, shared ownership of files for accepted jobs, owned write snapshots, caller-owned read storage, completed result publication and callbacks outside the lock, poll/wait/delete and close while jobs run. Independent positional jobs may execute out of order; original priority, cancellation and same-file ordering remain to recover. Queue limit counts operations, not aggregate snapshot bytes; callbacks must not throw or destroy/wait on the same worker pool.
+- `pc_paths.h`: explicit immutable asset and writable data roots, containment checks, native stat and directory operations. Rejects parent components, absolute child paths and existing symlink escapes. Preserves the leaf path after canonical containment validation for unlink/rename. Not a hardened concurrent sandbox (symlink races/hardlinks remain). `pc_file_service.h` composes file operations with those roots; all its opens go through containment.
+- `pc_mount_adapter.h`: exact retail mount boundary mapping. Existing kernel open, stat, truncate, mkdir, rmdir, unlink, rename and chmod now use this native resolver. `main.cpp` initializes both roots before entering game code. Both roots must be separate existing directories; unknown relative paths now map beneath data/unmapped rather than concatenating strings, invalid foreign path syntax and parent components fail, and chmod returns its actual error. These are deliberate path-policy changes. The original kernel descriptor ABI remains in use; the new native async queue is not yet called by retail FIOS.
+- `pc_libc_math.h`: 18 additional native scalar math/time-difference wrappers with explicit 64-bit integer widths (including lrintf), wired to library-scoped import lookup via **D1_PC_LIBC_MATH=1**. The existing 19 memory/string leaves stay enabled by default. D1_PC_LIBC_LEAVES=0 disables both groups. Math remains opt-in: original libm accuracy, exceptional results, errno, floating-point environment and ABI crossing need game verification. Do not substitute host wchar_t: the 0x7C2750 caller copies wcslen * 2 bytes, so the retail wide-character width needs verification.
+
+### Validation
+
+Exact committed header/test blob hashes matched local sources. Six standalone suites passed g++ C++20 optimized -Wall -Wextra -Werror and Clang ASan/UBSan; math used -frounding-math.
+- pc-file: 10,000 positional write/read pairs, 12,800 async operations, EOF, invalid ranges, close with outstanding work, nonreused IDs, sparse offset beyond 4 GiB on Linux.
+- pc-paths: 128 files plus metadata/list/remove, immutable asset and existing symlink containment.
+- pc-mount: mount boundary and syntax cases.
+- pc-service: queue capacity, read completion callback obtains count then deletes its own operation, close during I/O, invalid range and immutable assets.
+- fios-contract: 65,536 flag cases against an independent 16-entry truth table.
+- pc-libc-math: 100,000 randomized scalar decomposition/rounding cases, all four rounding modes, signed zero, invalid domains and >32-bit integer values.
+
+All six registered with CTest. This is Linux standalone execution, not a Windows full-game build. GitHub and R2 host DNS resolution failed locally, and Vulkan/SDL development headers and a Windows cross compiler are unavailable. No claim of actual FIOS replacement or reduced stutter yet. Original `libSceFios2.prx` remains required (0/22 production imports redirected); file/stat/directory output layouts, true FIOS error values/open flags, callback TLS, in-flight buffer pinning, libc-to-FIOS dependencies and original behavior still need evidence before one coherent group switch. Libc has 19 default plus 18 opt-in native imports out of 143 distinct original eboot imports. No change to graphics quality or simulation timing in this pass.
