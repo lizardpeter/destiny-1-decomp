@@ -34,8 +34,9 @@ int main(int argc, char** argv) {
         require(read && !ec && service.close(id));
         while (!finished.load(std::memory_order_acquire)) std::this_thread::yield();
         require(std::string(result) == value && !service.file(id));
-        require(service.paths().remove_file("file", ec) && !ec);
     }
+    Paths paths(root / "assets", root / "data");
+    require(paths.remove_file("file", ec) && !ec);
     require(fs::remove(root / "assets") && fs::remove(root / "data") && fs::remove(root));
     std::puts("native file service: immutable assets, queue limits, callback deletion, close during I/O passed");
 }
