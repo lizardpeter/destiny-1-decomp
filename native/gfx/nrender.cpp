@@ -2935,24 +2935,23 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
     const uint32_t first = std::min(img->resident_base_level + std::max(ts.base_level, (ts.min_lod + 255) >> 8),
                                     img->levels ? img->levels - 1 : 0);
     static const bool log_stream = std::getenv("D1_NG_LOG_STREAM") != nullptr;
-    if (log_stream && res && img->levels > 1) {
-        static std::mutex sm;
-        static uint32_t tracked_sky = 0, tracked_tree = 0;
-        static uint64_t last_f_sky = ~0ull, last_f_tree = ~0ull;
+    if (log_stream && res && img->levels > 1 && (img->low_size || img->hi_size)) {
+        // Report real split-resource transitions throughout gameplay. The old
+        // frame-1200 cutoff ended long before the world loaded in test 33.
+        static std::unordered_map<uint32_t, uint64_t> last;
+        static uint32_t messages = 0;
         const uint32_t rid = uint32_t(res >> 32);
-        std::lock_guard sl(sm);
-        if (!tracked_sky && (img->cube || (img->w >= 1024 && img->h >= 512))) tracked_sky = rid;
-        else if (!tracked_tree && rid != tracked_sky && img->w >= 512 && img->w == img->h && img->levels >= 9) tracked_tree = rid;
-        if (rid == tracked_sky && st.frames != last_f_sky && st.frames < 1200) {
-            last_f_sky = st.frames;
-            log("ng stream [SKY res=%u img=%p %ux%u mips=%u]: frame %llu bound mip range [%u..%u] (T# %ux%u base=%#llx)",
-                rid, (void*)img->image, img->w, img->h, img->levels, (unsigned long long)st.frames,
-                first, img->levels - 1, ts.width, ts.height, (unsigned long long)ts.base);
-        } else if (rid == tracked_tree && st.frames != last_f_tree && st.frames < 1200) {
-            last_f_tree = st.frames;
-            log("ng stream [TREE res=%u img=%p %ux%u mips=%u]: frame %llu bound mip range [%u..%u] (T# %ux%u base=%#llx)",
-                rid, (void*)img->image, img->w, img->h, img->levels, (unsigned long long)st.frames,
-                first, img->levels - 1, ts.width, ts.height, (unsigned long long)ts.base);
+        const uint64_t state = mix(mix(mix(res, uint64_t(img->image)), ts.base),
+                                   uint64_t(first) | uint64_t(img->resident_base_level) << 32);
+        auto it = last.find(rid);
+        if (messages < 1024 && (it == last.end() || it->second != state)) {
+            last[rid] = state;
+            ++messages;
+            log("ng stream [BIND res=%u epoch=%u img=%p]: frame %llu view [%u..%u] resident=%u low=%#llx/%llu hi=%#llx/%llu T#=%#llx",
+                rid, uint32_t(res), (void*)img->image, (unsigned long long)st.frames,
+                first, img->levels - 1, img->resident_base_level, (unsigned long long)img->low_base,
+                (unsigned long long)img->low_size, (unsigned long long)img->hi_base,
+                (unsigned long long)img->hi_size, (unsigned long long)ts.base);
         }
     }
     return view(img, vt, comp, first, false);
