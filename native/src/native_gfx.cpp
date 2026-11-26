@@ -296,6 +296,11 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
     d->order = ctx ? field<uint64_t>(ctx, 0x10) : 0;
     DevState* ds = dev_state(dev);
     CueState* cs = ctx ? cue_state(ctx + 0xC0, false) : nullptr;
+    {
+    // The pool retirement gate covers both static geometry and texture
+    // capture; capture cannot publish a lease after its epoch is retired.
+    auto gate=ng::texture_leases().capture();
+    auto* leases=nd_texture_leases(dev);
     uint64_t vbsig = 0;
     if (const uint64_t decl = field<uint64_t>(dev, kVertexDecl)) {
         const uint32_t n = std::min(field<uint32_t>(decl, 0), 16u);
@@ -304,7 +309,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
         // Resolve each bound stream exactly once; all attributes in that stream
         // consume the same native allocation identity, offset and vertex count.
         struct StreamBinding {
-            uint64_t base,resource_base,resource_size,identity;
+            uint64_t base,resource_base,resource_size,identity,object;
             uint32_t count;
             bool valid;
         };
@@ -342,6 +347,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
                     if(resreg::g_on){
                         binding.identity=resreg::get(obj);
                         binding.resource_size=field<uint32_t>(obj,0);
+                        binding.object=obj;
                     }
                     binding.valid=true;
                 }
@@ -349,13 +355,13 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
             if(!binding.valid)continue;
             build_vsharp(d->vb[i],binding.base+off,fmt,stride,binding.count);
             vbsig = mix(vbsig, uint64_t(i) << 48 | uint64_t(d->vb[i][1] >> 16) | uint64_t(d->vb[i][3]) << 32);
-            if(resreg::g_on)d->vres[i]={binding.identity,binding.resource_base,binding.resource_size};
+            if(resreg::g_on){
+                d->vres[i]={binding.identity,binding.resource_base,binding.resource_size,binding.object};
+                if(leases&&leases->pin(binding.identity))ng::capture_geometry_source(d->vres[i]);
+            }
         }
     }
     d->vb_sig = vbsig;
-    {
-    auto gate=ng::texture_leases().capture();
-    auto* leases=nd_texture_leases(dev);
     for (int s = 0; s < 2; ++s) {
         const uint32_t gnm = s ? 1 : 2;
         for (int i = 0; i < 16; ++i) {
@@ -470,11 +476,18 @@ void capture_indexed(uint64_t dev,uint32_t prim,int32_t first,uint32_t count,uin
     if (field<uint8_t>(dev, 0x26)) {
         ng::Draw* d = nr::capture(dev,prim,caller);
         d->kind = ng::Draw::Indexed;
+        {
+        auto gate=ng::texture_leases().capture();
+        auto* leases=nd_texture_leases(dev);
         const uint64_t ib = field<uint64_t>(dev, 0x1D70);
         const uint32_t isz = ib ? field<uint32_t>(ib, 0x38) : 0;
         d->index32 = isz != 0;
         d->index_addr = ib ? field<uint64_t>(ib, 0x30) + uint64_t(uint32_t((isz * 2 + 2) * first)) : 0;
-        if (ib && nr::resreg::g_on) d->ires = {nr::resreg::get(ib), field<uint64_t>(ib, 0x30), uint64_t(field<uint32_t>(ib, 0x3C)) * (isz ? 4 : 2)};
+        if(ib&&nr::resreg::g_on){
+            d->ires={nr::resreg::get(ib),field<uint64_t>(ib,0x30),uint64_t(field<uint32_t>(ib,0x3c))*(isz?4:2),ib};
+            if(leases&&leases->pin(d->ires.id))ng::capture_geometry_source(d->ires);
+        }
+        }
         d->count = count;
         d->instances=instances;
         nr::push(d);
@@ -790,7 +803,7 @@ bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint,bool
     // transaction relative to command-list capture. Other resource types
     // have their own binding contracts.
     decltype(ng::texture_leases().retire()) texture_transaction;
-    if(type>=1&&type<=3)texture_transaction=ng::texture_leases().retire();
+    if((type>=1&&type<=4)||type==6)texture_transaction=ng::texture_leases().retire();
     {
         using namespace ng::binding;
         if(!supported(type,repoint))return false;
