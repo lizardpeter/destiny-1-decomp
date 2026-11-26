@@ -14,6 +14,7 @@
 #include "native_memory_policy.h"
 #include "native_staging_pages.h"
 #include "native_resource_identity.h"
+#include "native_descriptor_slots.h"
 #include "../src/native_ranges.h"
 #include "../src/host_memory.h"
 
@@ -565,8 +566,9 @@ struct Renderer {
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
     std::mutex bindless_m;
-    uint16_t next_view_id = 1, next_sampler_id = 1;
-    std::vector<uint16_t> free_view_ids;
+    DescriptorSlots<gcn::kBindlessImageBindings,gcn::kMaxBindlessViews> view_slots;
+    uint16_t next_sampler_id = 1;
+    uint64_t view_exhausted=0,sampler_exhausted=0,view_create_failed=0,sampler_create_failed=0;
     std::atomic<uint64_t> geo_evict_gen{1};
     uint16_t alloc_bindless_view(VkImageView v, uint8_t dim, uint8_t kind);
     void free_bindless_view(uint16_t id, uint8_t dim, uint8_t kind);
@@ -1858,16 +1860,12 @@ void Renderer::heap_free(Alloc& a) {
 uint16_t Renderer::alloc_bindless_view(VkImageView v, uint8_t dim, uint8_t kind) {
     if (!v || !bindless_set) return 0;
     std::lock_guard lk(bindless_m);
-    uint16_t id = 0;
-    if (!free_view_ids.empty()) {
-        id = free_view_ids.back();
-        free_view_ids.pop_back();
-    } else if (next_view_id < gcn::kMaxBindlessViews) {
-        id = next_view_id++;
-    } else {
+    const uint32_t binding = uint32_t(dim) * 3 + uint32_t(kind);
+    const uint16_t id=view_slots.acquire(binding);
+    if(!id){
+        if(++view_exhausted<=8)log("native renderer: sampled descriptor binding %u exhausted (%u live)",binding,view_slots.live(binding));
         return 0;
     }
-    const uint32_t binding = uint32_t(dim) * 3 + uint32_t(kind);
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, bindless_set, binding, id, 1,
                            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii, nullptr, nullptr};
@@ -1883,7 +1881,7 @@ void Renderer::free_bindless_view(uint16_t id, uint8_t dim, uint8_t kind) {
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, bindless_set, binding, id, 1,
                            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii, nullptr, nullptr};
     vkUpdateDescriptorSets(ctx.device, 1, &w, 0, nullptr);
-    free_view_ids.push_back(id);
+    view_slots.release(binding,id);
 }
 
 void Renderer::destroy_image(Image* img) {
@@ -2034,8 +2032,7 @@ ViewHandle Renderer::view(Image* img, VkImageViewType type, VkComponentMapping c
     const bool filterable = !stencil_aspect && (format_props(img->format).optimalTilingFeatures &
                                                 VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
     if (view_result != VK_SUCCESS || !v) {
-        static unsigned failed = 0;
-        if (failed++ < 32) log("native renderer: sampled view creation failed (%d), format %d, type %d, mip %u",
+        if (++view_create_failed <= 32) log("native renderer: sampled view creation failed (%d), format %d, type %d, mip %u",
             int(view_result), int(img->format), int(type), base_level);
         return {dummy_views[uint32_t(dim) * 3 + kind], 0, dim, kind, kind == 0};
     }
@@ -3257,9 +3254,6 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
 
 uint16_t Renderer::sampler_id(const uint32_t* s, bool nearest) {
     if (!s) return 0;
-    const uint64_t key = hash_bytes(s, 16) ^ (nearest ? 0x6A09E667F3BCC909ull : 0);
-    auto it = samplers.find(key);
-    if (it != samplers.end()) return it->second.id;
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.addressModeU = address_mode(s[0] & 7);
     sci.addressModeV = address_mode(s[0] >> 3 & 7);
@@ -3287,13 +3281,30 @@ uint16_t Renderer::sampler_id(const uint32_t* s, bool nearest) {
     sci.borderColor = border == 1 ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
                     : border == 2 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
                                   : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    // Canonicalize precisely the effective Vulkan sampler state. Retail
+    // padding, ignored anisotropy/compare bits and equivalent filter encodings
+    // must not each consume another permanent descriptor.
+    const uint64_t key=uint64_t(sci.addressModeU)|(uint64_t(sci.addressModeV)<<3)|
+        (uint64_t(sci.addressModeW)<<6)|(uint64_t(uint32_t(sci.minLod*256))<<9)|
+        (uint64_t(uint32_t(sci.maxLod*256))<<21)|(uint64_t(s[2]&0x3fff)<<33)|
+        (uint64_t(sci.magFilter)<<47)|(uint64_t(sci.minFilter)<<48)|
+        (uint64_t(sci.mipmapMode)<<49)|(uint64_t(sci.borderColor)<<50);
+    auto it=samplers.find(key);
+    if(it!=samplers.end())return it->second.id;
+    if(!bindless_set||next_sampler_id>=gcn::kMaxBindlessSamplers){
+        if(++sampler_exhausted<=8)log("native renderer: sampler descriptors exhausted");
+        return 0;
+    }
     VkSampler smp = VK_NULL_HANDLE;
-    vkCreateSampler(ctx.device, &sci, nullptr, &smp);
+    if(vkCreateSampler(ctx.device,&sci,nullptr,&smp)!=VK_SUCCESS||!smp){
+        ++sampler_create_failed;return 0;
+    }
     uint16_t id = 0;
     {
         std::lock_guard lk(bindless_m);
         if (next_sampler_id < gcn::kMaxBindlessSamplers) id = next_sampler_id++;
     }
+    if(!id){vkDestroySampler(ctx.device,smp,nullptr);++sampler_exhausted;return 0;}
     if (id && bindless_set) {
         VkDescriptorImageInfo ii{smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, bindless_set, gcn::kBindlessSamplerBinding,
@@ -4430,7 +4441,7 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
                 TvEntry& e = tvc[key & 4095];
                 ViewHandle vh;
                 const uint64_t dependency = tres ? 0 : tg;
-                if (e.key == key && e.gen == gen && e.target_gen == dependency) {
+                if (e.key == key && e.gen == gen && e.target_gen == dependency && e.vh.id) {
                     vh = e.vh;
                     if (e.tex) e.tex->last_used = sub_no, e.tex->last_frame = st.frames;
                 } else {
@@ -4468,7 +4479,7 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
                 const uint32_t* S = dr.smp[s][slot];
                 const uint64_t key = hash_bytes(S, 16) | 1;
                 SmpPair& se = smc[key & 1023];
-                if (se.key != key) {
+                if (se.key != key || !se.lin || !se.near) {
                     const uint16_t lin = sampler_id(S, false);
                     const uint16_t near = sampler_id(S, true);
                     se = {key, lin, near};
@@ -6673,6 +6684,18 @@ void print_stats() {
             (unsigned long long)g->texture_range_rejects,(unsigned long long)g->split_descriptor_rejects,
             (unsigned long long)g->texture_upload_failures,(unsigned long long)g->split_partial_kept);
         g->texture_range_rejects=g->split_descriptor_rejects=g->texture_upload_failures=g->split_partial_kept=0;
+        {
+            std::lock_guard dl(g->bindless_m);
+            uint32_t live=0,peak=0,binding=0;
+            for(uint32_t i=0;i<gcn::kBindlessImageBindings;++i){
+                live+=g->view_slots.live(i);
+                if(g->view_slots.peak(i)>peak){peak=g->view_slots.peak(i);binding=i;}
+            }
+            log("native renderer: descriptors %u live images, busiest binding %u peak %u/%u, %u samplers | failures: %llu view capacity, %llu view creation, %llu sampler capacity, %llu sampler creation",
+                live,binding,peak,gcn::kMaxBindlessViews-1,uint32_t(g->next_sampler_id-1),
+                (unsigned long long)g->view_exhausted,(unsigned long long)g->view_create_failed,
+                (unsigned long long)g->sampler_exhausted,(unsigned long long)g->sampler_create_failed);
+        }
         g->snap_copies = g->snap_reused = g->dma_stale = g->readback_stale = g->cpu_stale = 0;
         log("native renderer: dynamic data refreshed at submission (no mapped VRAM reads): constants %llu of %llu, vertices %llu of %llu, indices %llu of %llu",
             (unsigned long long)g->recopy_changed[0], (unsigned long long)g->recopy_n[0], (unsigned long long)g->recopy_changed[1],
