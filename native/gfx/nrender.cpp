@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -5610,7 +5611,18 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
     begin_record();
     run_copies(items.data(), items.size());
     pre_for = &R;
-    if (up_rec.cur != UINT32_MAX) pre_pass(items.data(), items.size());
+    if(up_rec.cur!=UINT32_MAX)pre_pass(items.data(),items.size());
+    else{
+        // The experimental early recorder may exhaust upload slots.
+        // Preserve the conservative captured binding set in that case.
+        for(Draw* d:items){
+            if(d->kind!=Draw::Indexed&&d->kind!=Draw::Auto)continue;
+            d->shader_res[0]=d->vs&&opt.res_current?opt.res_current(uint64_t(d->vs)):0;
+            d->shader_res[1]=d->ps&&opt.res_current?opt.res_current(uint64_t(d->ps)):0;
+            d->active_tex_mask[0]=d->tex_mask[0];
+            d->active_tex_mask[1]=d->tex_mask[1];
+        }
+    }
     pre_for = nullptr;
     tr = &R;
     // Resolve once per plain run after its actual targets have been bound.
