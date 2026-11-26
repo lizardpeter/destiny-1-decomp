@@ -1000,7 +1000,7 @@ struct Renderer {
     VkPipeline pred_reduce = VK_NULL_HANDLE;
     bool pred_reduce_failed = false;
     bool init_pred_reduce();
-    bool write_predicate(uint32_t slot, uint32_t first, uint32_t end);
+    bool write_predicate(uint32_t slot, uint32_t first, uint32_t end, bool prepared = false);
     uint64_t zcount_base = 0;    // occlusion counter value before the oldest unwritten submission
     void q_begin();
     void q_end();
@@ -5382,7 +5382,7 @@ bool Renderer::init_pred_reduce() {
     VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     sl.bindingCount = 2; sl.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &sl, nullptr, &pred_set_layout) != VK_SUCCESS) return fail();
-    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1; pl.pSetLayouts = &pred_set_layout;
     pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &range;
@@ -5425,27 +5425,29 @@ bool Renderer::init_pred_reduce() {
     return true;
 }
 
-bool Renderer::write_predicate(uint32_t slot, uint32_t first, uint32_t end) {
+bool Renderer::write_predicate(uint32_t slot, uint32_t first, uint32_t end, bool prepared) {
     Sub& sb = subs[rc().cur];
     if (first > end || end > sb.q_used) return false;
-    barrier(); // any prior conditional read must finish before slot reuse
+    if (!prepared) barrier(); // any prior conditional read must finish before slot reuse
     if (first == end) {
         vkCmdFillBuffer(rc().cmd, pred_buf.buf, uint64_t(slot) * 4, 4, 0);
     } else {
         if (!sb.qpool || !init_pred_reduce()) return false;
         // Order scratch reuse and any preceding conditional reads. All work
         // remains on the Vulkan queue; the CPU never waits for query values.
-        vkCmdCopyQueryPoolResults(rc().cmd, sb.qpool, first, end - first,
-            pred_scratch.buf, 0, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        barrier();
-        const uint32_t constants[2] = {end - first, slot};
+        if (!prepared) {
+            vkCmdCopyQueryPoolResults(rc().cmd, sb.qpool, first, end - first,
+                pred_scratch.buf, 0, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            barrier();
+        }
+        const uint32_t constants[3] = {end - first, slot, prepared ? first : 0};
         vkCmdBindPipeline(rc().cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pred_reduce);
         vkCmdBindDescriptorSets(rc().cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             pred_layout, 0, 1, &pred_set, 0, nullptr);
         vkCmdPushConstants(rc().cmd, pred_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof constants, constants);
         vkCmdDispatch(rc().cmd, 1, 1, 1);
     }
-    barrier();
+    if (!prepared) barrier();
     return true;
 }
 
@@ -5501,6 +5503,8 @@ void Renderer::store_query_predicates() {
     if (!pred_buf.buf)
         pred_buf = make_buffer(kPredSlots * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
     if (!pred_buf.buf) return;
+    struct Job { uint64_t base, mapping; uint32_t first, end; };
+    std::vector<Job> jobs;
     std::unordered_set<uint64_t> stored;
     for (const auto& z : sb.zrecs) {
         if ((z.dest & 15) != 0) continue;
@@ -5508,9 +5512,29 @@ void Renderer::store_query_predicates() {
         const uint64_t mapping = guest_mapping_identity(z.dest, 8 * 16);
         if (!mapping || mapping != z.mapping || !stored.insert(z.dest).second ||
             !query_span(sb.zrecs, z.dest, b0, b1, mapping)) continue;
-        const uint32_t slot = pred_slot(z.dest, mapping);
-        if (!write_predicate(slot, b0, b1)) pred_slots[z.dest].mapping = 0;
+        if (b0 <= b1 && b1 <= sb.q_used) jobs.push_back({z.dest, mapping, b0, b1});
     }
+    if (jobs.empty()) return;
+    // Copy a query pool once, then write disjoint slots with no inter-job
+    // barriers. Fall back to individually ordered writes if slot allocation
+    // could wrap and reuse a slot within this batch.
+    const bool has_counts = std::any_of(jobs.begin(), jobs.end(),
+        [](const Job& j) { return j.first != j.end; });
+    const bool batch = !rc().lr && pred_slots.size() + jobs.size() <= kPredSlots &&
+        (!has_counts || (sb.qpool && init_pred_reduce()));
+    if (batch) {
+        barrier();
+        if (has_counts) {
+            vkCmdCopyQueryPoolResults(rc().cmd, sb.qpool, 0, sb.q_used, pred_scratch.buf,
+                0, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            barrier();
+        }
+    }
+    for (const auto& j : jobs) {
+        const uint32_t slot = pred_slot(j.base, j.mapping);
+        if (!write_predicate(slot, j.first, j.end, batch)) pred_slots[j.base].mapping = 0;
+    }
+    if (batch) barrier();
 }
 
 // When the submission is done: every dump's counter into guest memory (DB 0 carries the count,
