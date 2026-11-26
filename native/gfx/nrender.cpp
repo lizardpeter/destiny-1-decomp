@@ -5516,8 +5516,8 @@ void Renderer::load_texture(const LoadJob& j) {
     if (f == VK_FORMAT_UNDEFINED || !fi.bpp || fi.bpp == 96 || !ts.base || ts.width > 16384 || ts.height > 16384) return;
     if (opt.res_current && opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
     if (!((ts.type == 10) || (ts.type == 12) || (ts.type == 13))) {
-        const auto smi = get_stream_info(j.res, j.obj, ts);
-        if (smi.has_hi && smi.full_mips > 1) return; // split-source uploads are handled on demand
+        const auto smi = get_stream_info(j.res, j.obj, ts, t);
+        if (!smi.valid || (smi.has_hi && smi.full_mips > 1)) return; // split-source uploads are handled on demand
     }
     tiling::Surface sf;
     sf.tile_mode = ts.tiling, sf.bpp = fi.bpp, sf.block = fi.block, sf.pow2 = ts.pow2;
