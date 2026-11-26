@@ -560,12 +560,14 @@ bool native_bind_enabled() {
 bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint) {
     if(native_bind_enabled()) {
         using namespace ng::binding;
-        const bool supported=(type>=1&&type<=4)||type==6||type==8||type==18;
-        if(supported) {
+        if(!supported(type,repoint))return false;
+        if(type==16)return true;
+        {
             const uint64_t obj=handle==UINT32_MAX?0:nr::resolve_handle_safe(handle);
-            const auto result=apply(type,repoint,reinterpret_cast<void*>(obj),addr);
+            const auto result=apply(type,repoint,reinterpret_cast<void*>(obj),addr,
+                                    type==10&&obj?guest_region_extent(obj):0);
             if(result!=Result::bound)return false;
-            if(type!=18) {
+            if(nr::resreg::object_of(type,handle)==obj&&obj) {
                 // Publish once from the already resolved object. Geometry
                 // creation takes a native byte range directly from this event.
                 nr::resreg::touch(obj,true,handle);

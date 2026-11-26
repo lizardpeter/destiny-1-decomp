@@ -32,8 +32,12 @@ inline void index_fields(void* object,uint32_t count,uint64_t address,uint32_t w
     store(object,0x3c,count);store(object,0x30,address);store(object,0x38,uint32_t(width!=2));
 }
 enum class Result { unsupported, rejected, bound };
-inline Result apply(uint32_t type,bool repoint,void* object,uint64_t address) {
-    if(type!=1&&type!=2&&type!=3&&type!=4&&type!=6&&type!=8&&type!=18)return Result::unsupported;
+constexpr bool supported(uint32_t type,bool repoint) {
+    return (type>=1&&type<=4)||(type>=6&&type<=13)||(type==14&&!repoint)||type==16||type==18;
+}
+inline Result apply(uint32_t type,bool repoint,void* object,uint64_t address,size_t extent=0) {
+    if(!supported(type,repoint))return Result::unsupported;
+    if(type==16)return Result::bound; // 0x1F70: constant true, no object access
     if(!object)return Result::rejected;
     if(type==18){store(object,8,address);return Result::bound;}
     // Initial texture bind has no address-null guard; re-point does.
@@ -56,7 +60,33 @@ inline Result apply(uint32_t type,bool repoint,void* object,uint64_t address) {
             }
             break;
         }
-        case 8:store(object,8,uint32_t(address>>8));store(object,12,uint32_t(address>>40));break;
+        case 7:
+            store(object,0,uint32_t(address));
+            store(object,4,(load<uint32_t>(object,4)&0xfffff000u)|uint32_t((address>>32)&0xfff));
+            break;
+        case 8:case 12:case 13:
+            store(object,8,uint32_t(address>>8));store(object,12,uint32_t(address>>40));break;
+        case 9:
+            store(object,0x1c,uint32_t(address>>8));store(object,0x20,uint32_t(address>>40));
+            store(object,8,load<uint32_t>(object,0x10)==2?uint64_t(0):address+load<uint32_t>(object,4));
+            break;
+        case 11:case 14:
+            store(object,0x18,uint32_t(address>>8));store(object,0x1c,uint32_t(address>>40));
+            store(object,8,address+load<uint32_t>(object,4));break;
+        case 10:{
+            // GS includes an aligned second program after its variable metadata.
+            // 0x7D4AB0 uses the high byte of word zero as the metadata count.
+            if(extent<4)return Result::rejected;
+            const uint32_t n=load<uint8_t>(object,3),off=4*n;
+            if(extent<off+0x5e)return Result::rejected;
+            const uint32_t metadata=((uint32_t(load<uint8_t>(object,off+0x3b))+
+                                     load<uint8_t>(object,off+0x5c))*4+0x2b+
+                                     uint32_t(load<uint8_t>(object,off+0x5d))*2)&0xfffffffcu;
+            const uint64_t second=address+((metadata+off+0x137)&0xffffff00u);
+            store(object,8,uint32_t(address>>8));store(object,12,uint32_t(address>>40));
+            store(object,off+0x40,uint32_t(second>>8));store(object,off+0x44,uint32_t(second>>40));
+            break;
+        }
         default:break;
     }
     return Result::bound;
