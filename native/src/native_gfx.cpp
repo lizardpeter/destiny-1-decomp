@@ -1267,6 +1267,37 @@ D1_SYSV uint64_t build_3d(void* p,uint32_t w,uint32_t h,uint32_t depth,uint32_t 
     return build(p,{w,h,depth,mips,format,tile,0,0,true});
 }
 } // namespace texture_constructor
+// 0xE01E0 resolves the low/high allocation handles, while 0xE00D0
+// resolves the same pair before iterating the linked texture tags. Preserve
+// the exact size from the original allocation-size query (0x6DBD0) in
+// this synchronous callback scope. Addresses alone cannot prove a full chain.
+struct MipBounds {uint64_t low=0,high=0,low_size=0,high_size=0;};
+thread_local MipBounds mip_bounds;
+using MipHandlesFn=D1_SYSV void(*)(uint32_t,uint32_t,uint32_t);
+MipHandlesFn o_mip_handles,o_mip_relocation;
+uint64_t mip_allocation_size(uint32_t h,uint64_t base){
+    if(h==UINT32_MAX||base<0x10000)return 0;
+    using SizeFn=D1_SYSV uint64_t(*)(uint32_t*);
+    const uint64_t bytes=reinterpret_cast<SizeFn>(nr::g_base+0x6dbd0)(&h);
+    return bytes&&bytes<=(512ull<<20)&&guest_readable_range(base,bytes)?bytes:0;
+}
+struct MipBoundsScope {
+    MipBounds previous=mip_bounds;
+    MipBoundsScope(uint32_t low,uint32_t high){
+        mip_bounds={};
+        if(low!=UINT32_MAX)mip_bounds.low=nr::resolve_handle_safe(low);
+        if(high!=UINT32_MAX)mip_bounds.high=nr::resolve_handle_safe(high);
+        mip_bounds.low_size=mip_allocation_size(low,mip_bounds.low);
+        mip_bounds.high_size=mip_allocation_size(high,mip_bounds.high);
+    }
+    ~MipBoundsScope(){mip_bounds=previous;}
+};
+D1_SYSV void h_mip_handles(uint32_t tag,uint32_t low,uint32_t high){
+    MipBoundsScope bounds(low,high);o_mip_handles(tag,low,high);
+}
+D1_SYSV void h_mip_relocation(uint32_t tag,uint32_t low,uint32_t high){
+    MipBoundsScope bounds(low,high);o_mip_relocation(tag,low,high);
+}
 using MipFn = D1_SYSV void (*)(uint32_t, uint64_t, uint64_t);
 MipFn o_mips;
 D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
@@ -1307,7 +1338,9 @@ D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
                     if(bytes){ng::binding::mip_base(low_descriptor,low_base);low=low_descriptor;}
                 }
             }
-            ng::notify_texture_mips(reinterpret_cast<const uint32_t*>(o),res,o,low_base,hi_base,low);
+            ng::notify_texture_mips(reinterpret_cast<const uint32_t*>(o),res,o,low_base,hi_base,low,
+                low_base&&low_base==mip_bounds.low?mip_bounds.low_size:0,
+                hi_base&&hi_base==mip_bounds.high?mip_bounds.high_size:0);
         }
     }
 }
@@ -1410,6 +1443,8 @@ bool install() {
     ok &= hook(0x7D3560, &h_copy, o_copy, "resource_move_copy");
     ok &= hook(0x7D37B0, &h_swap, o_swap, "resource_move_commit");
     ok &= hook(0x7D4480, &h_mips, o_mips, "texture_mips");
+    ok &= hook(0xE01E0,&h_mip_handles,o_mip_handles,"texture_mip_handle_bounds");
+    ok &= hook(0xE00D0,&h_mip_relocation,o_mip_relocation,"texture_mip_relocation_bounds");
     if(native_bind_enabled()){
         ok &= hook(0xF89BD0,&texture_constructor::calculate_footprint,texture_constructor::original_footprint,"texture_footprint");
         ok &= replace_eboot_function(0xF83530,reinterpret_cast<const void*>(&texture_constructor::build_2d));

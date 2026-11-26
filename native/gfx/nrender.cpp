@@ -16,6 +16,7 @@
 #include "native_resource_identity.h"
 #include "native_descriptor_slots.h"
 #include "native_texture_identity.h"
+#include "native_mip_source.h"
 #include "native_texture_leases.h"
 #include "native_epoch_cohort.h"
 #include "native_draw_batch.h"
@@ -977,7 +978,7 @@ struct Renderer {
     uint64_t texture_range_rejects=0, split_partial_kept=0, split_descriptor_rejects=0, texture_upload_failures=0;
     uint64_t resident_descriptor_hits=0,readback_unused_skipped=0,split_layout_guesses=0,expired_texture_epochs=0;
     uint64_t texture_cohort_splits=0,texture_draw_epoch_conflicts=0,unused_texture_slots=0;
-    uint64_t top_only_uploads=0,texture_view_mismatches=0;
+    uint64_t top_only_uploads=0,texture_view_mismatches=0,contiguous_high_uploads=0;
     std::atomic<uint64_t> expired_gpu_results{0};
     // The GPU's results reached guest memory (a readback): copies made from that memory (a
     // texture over a render target's memory, e.g. glyphs drawn into a cache texture) are stale.
@@ -1140,6 +1141,7 @@ struct Renderer {
     Image* target_for(const fmt::TSharp& ts);
     struct StreamMipInfo {
         uint64_t obj = 0, low_base = 0, hi_base = 0, epoch=0;
+        uint64_t low_bytes=0,hi_bytes=0;
         uint16_t full_w = 0, full_h = 0, full_d = 1;
         uint8_t full_mips = 1, has_hi = 0;
         bool from_callback = false;
@@ -2604,62 +2606,52 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
 
     const StreamMipInfo smi = (!is3d && ts.type != 12 && ts.type != 13) ? get_stream_info(res, obj, ts, t) : StreamMipInfo{};
     if(!smi.valid){++expired_texture_epochs;return nullptr;}
-    const bool split_resource=res!=0&&!is3d&&ts.type!=12&&ts.type!=13&&
-                              smi.has_hi!=0&&smi.full_mips>1;
-    const bool top_only=split_resource&&smi.from_callback&&!smi.low_base&&smi.hi_base==ts.base&&
-                        ts.width==smi.full_w&&ts.height==smi.full_h&&ts.last_level+1==smi.full_mips;
-    const bool streamed=split_resource&&!top_only;
-    if(prepared&&(!res||streamed))return nullptr; // prepared jobs describe one contiguous registered surface
-    if(split_prepared&&(!split_resource||prepared))return nullptr;
-    if (streamed) {
-        // 7D4480 constructs a half-size low descriptor (BC dimensions may be
-        // rounded up to four) or a full-size high descriptor.
-        const uint32_t low_w = smi.full_w < 4 ? 1u : uint32_t(smi.full_w >> 1);
-        const uint32_t low_h = std::max(1u, uint32_t(smi.full_h >> 1));
-        const bool low_dims = (ts.width == low_w || (fi.block && ts.width == ((low_w + 3) & ~3u))) &&
-                              (ts.height == low_h || (fi.block && ts.height == ((low_h + 3) & ~3u)));
-        const bool low_desc = low_dims && ts.last_level + 1 == smi.full_mips - 1 &&
-                              smi.low_base && ts.base == smi.low_base;
-        const bool high_desc = ts.width == smi.full_w && ts.height == smi.full_h &&
-                               ts.last_level + 1 == smi.full_mips && smi.hi_base && ts.base == smi.hi_base;
-        if ((!low_desc && !high_desc) || !smi.low_base) {
+    tiling::Surface sf;
+    sf.tile_mode=ts.tiling;sf.bpp=fi.bpp;sf.block=fi.block;sf.pow2=ts.pow2;
+    sf.width=ts.width;sf.height=ts.height;sf.pitch=ts.pitch;
+    sf.depth=is3d?ts.depth:1;sf.layers=layers;
+    sf.stored_layers=cube?ts.depth*6u:(ts.type==12||ts.type==13)?ts.depth:1u;
+    sf.levels=std::min(ts.last_level+1,tiling::kMaxMips);
+    tiling::layout(sf);
+    if(opt.compare_layout&&!rc().lr)opt.compare_layout(t,sf);
+    const bool split_resource=res!=0&&!is3d&&ts.type!=12&&ts.type!=13&&smi.has_hi&&smi.full_mips>1;
+    MipSource source=MipSource::invalid;
+    if(split_resource){
+        const uint32_t lw=smi.full_w<4?1u:uint32_t(smi.full_w>>1);
+        const uint32_t lh=std::max(1u,uint32_t(smi.full_h>>1));
+        const bool low_dims=(ts.width==lw||(fi.block&&ts.width==((lw+3)&~3u)))&&
+                            (ts.height==lh||(fi.block&&ts.height==((lh+3)&~3u)));
+        const bool low_desc=low_dims&&ts.last_level+1==smi.full_mips-1&&ts.base==smi.low_base;
+        const bool high_desc=ts.width==smi.full_w&&ts.height==smi.full_h&&
+                             ts.last_level+1==smi.full_mips&&ts.base==smi.hi_base;
+        source=mip_source(low_desc,high_desc,smi.low_base,smi.hi_base,smi.low_bytes,smi.hi_bytes,
+                          sf.total_size,sf.mips[0].size);
+        if(source==MipSource::invalid||(!smi.from_callback&&source==MipSource::high_only)){
             ++split_descriptor_rejects;
-            // Bounded evidence: distinguish missing allocation links from
-            // dimension, mip-count and address mismatches. No per-draw spam.
-            static uint64_t reports=0;
-            if(reports<64){
-                ++reports;
-                log("ng split reject: res=%u epoch=%u callback=%u T#=%#llx %ux%u levels=%u fmt=%u/%u tile=%u authored=%ux%u levels=%u low=%#llx high=%#llx low_desc=%u high_desc=%u",
-                    uint32_t(res>>32),uint32_t(res),unsigned(smi.from_callback),
-                    (unsigned long long)ts.base,ts.width,ts.height,ts.last_level+1,ts.dfmt,ts.nfmt,ts.tiling,
-                    unsigned(smi.full_w),unsigned(smi.full_h),unsigned(smi.full_mips),
-                    (unsigned long long)smi.low_base,(unsigned long long)smi.hi_base,unsigned(low_desc),unsigned(high_desc));
-            }
+            static unsigned reports=0;
+            if(reports++<64)log("ng mip reject: res=%u epoch=%u T#=%#llx %ux%u levels=%u low=%#llx/%llu high=%#llx/%llu layout=%llu top=%llu",
+                uint32_t(res>>32),uint32_t(res),(unsigned long long)ts.base,ts.width,ts.height,ts.last_level+1,
+                (unsigned long long)smi.low_base,(unsigned long long)smi.low_bytes,
+                (unsigned long long)smi.hi_base,(unsigned long long)smi.hi_bytes,
+                (unsigned long long)sf.total_size,(unsigned long long)sf.mips[0].size);
             return nullptr;
         }
     }
-    const uint32_t full_w = streamed ? smi.full_w : ts.width;
-    const uint32_t full_h = streamed ? smi.full_h : ts.height;
-    const uint32_t full_d = streamed ? smi.full_d : (is3d ? ts.depth : 1);
-    const uint32_t full_levels = top_only?1u:streamed ? smi.full_mips : std::min(ts.last_level + 1, tiling::kMaxMips);
-    const bool cur_is_low = streamed && ts.last_level + 1 < full_levels;
+    const bool contiguous_high=split_resource&&source==MipSource::contiguous_high;
+    const bool top_only=split_resource&&source==MipSource::high_only;
+    const bool streamed=split_resource&&!top_only&&!contiguous_high;
+    if(prepared&&(!res||streamed||top_only))return nullptr;
+    if(split_prepared&&(!split_resource||prepared||contiguous_high))return nullptr;
+    const uint32_t full_w=streamed?smi.full_w:ts.width;
+    const uint32_t full_h=streamed?smi.full_h:ts.height;
+    const uint32_t full_d=streamed?smi.full_d:(is3d?ts.depth:1);
+    const uint32_t full_levels=top_only?1u:streamed?smi.full_mips:sf.levels;
+    const bool cur_is_low=streamed&&source==MipSource::low_chain;
     const auto matches_shape=[&](const Image* img){
         return img->format==f&&img->w==full_w&&img->h==full_h&&img->d==full_d&&
                img->layers==layers&&img->levels==full_levels&&img->cube==cube&&img->is3d==is3d;
     };
-
-    tiling::Surface sf;
-    sf.tile_mode = ts.tiling, sf.bpp = fi.bpp, sf.block = fi.block, sf.pow2 = ts.pow2;
-    sf.width = ts.width, sf.height = ts.height, sf.pitch = ts.pitch;
-    sf.depth = is3d ? ts.depth : 1;
-    sf.layers = layers;
-    sf.stored_layers=cube?ts.depth*6u:(ts.type==12||ts.type==13)?ts.depth:1u;
-    // Compute the authored full layout (its top level pitch can depend on
-    // the mip count), but only capture the allocation's first mip below.
-    sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
-    tiling::layout(sf);
-    if(opt.compare_layout&&!rc().lr)opt.compare_layout(t,sf);
-    const uint64_t cur_bytes = cur_is_low ? sf.total_size : ((streamed||top_only) ? sf.mips[0].size : sf.total_size);
+    const uint64_t cur_bytes=(source==MipSource::split_chain||top_only)?sf.mips[0].size:sf.total_size;
     if(prepared ? prepared_source_size!=cur_bytes : !guest_readable_range(ts.base,cur_bytes)){
         ++texture_range_rejects;
         return nullptr;
@@ -2719,7 +2711,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 st.t_tex_hit += now_ns() - t_in;
                 return img;
             }
-            if (!split_resource && matches_shape(img)&&same_layout&&img->src_size == cur_bytes &&
+            if ((!split_resource||contiguous_high) && matches_shape(img)&&same_layout&&img->src_size == cur_bytes &&
                 (prepared ? prepared_hash==img->content :
                  (primary()&&hash_bytes(primary_source.data(),cur_bytes)==img->content&&
                   guest_matches_current_spans(ts.base,cur_bytes,primary_spans,primary_source.data())&&current_epoch()))) {
@@ -3028,6 +3020,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             img->content=prepared?prepared_hash:split_prepared?
                 hash_bytes(split_prepared->front().tiled.data(),cur_bytes):hash_bytes(primary_source.data(),cur_bytes);
             if(top_only)++top_only_uploads;
+            if(contiguous_high)++contiguous_high_uploads;
         } else if (ok && (opt.watch || dynamic_copy)) {
             const uint64_t tw = now_ns();
             img->version = mem_watch(ts.base, sf.total_size);
@@ -5979,9 +5972,10 @@ void Renderer::load_texture(const LoadJob& j) {
     const VkFormat f = fmt::vk_format(ts.dfmt, ts.nfmt);
     if (f == VK_FORMAT_UNDEFINED || !fi.bpp || fi.bpp == 96 || !ts.base || ts.width > 16384 || ts.height > 16384) return;
     if (opt.res_current && opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
-    if (!((ts.type == 10) || (ts.type == 12) || (ts.type == 13))) {
-        const auto smi = get_stream_info(j.res, j.obj, ts, t);
-        if (!smi.valid || (smi.has_hi && smi.full_mips > 1)) return; // split-source uploads are handled on demand
+    StreamMipInfo smi{};
+    if(ts.type!=10&&ts.type!=12&&ts.type!=13){
+        smi=get_stream_info(j.res,j.obj,ts,t);
+        if(!smi.valid)return;
     }
     tiling::Surface sf;
     sf.tile_mode = ts.tiling, sf.bpp = fi.bpp, sf.block = fi.block, sf.pow2 = ts.pow2;
@@ -5993,6 +5987,9 @@ void Renderer::load_texture(const LoadJob& j) {
     sf.stored_layers=cube?ts.depth*6u:(ts.type==12||ts.type==13)?ts.depth:1u;
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
+    if(smi.has_hi&&smi.full_mips>1&&
+       !(smi.from_callback&&ts.base==smi.hi_base&&ts.width==smi.full_w&&ts.height==smi.full_h&&
+         ts.last_level+1==smi.full_mips&&smi.hi_bytes>=sf.total_size))return;
     if(j.mapping.empty()||j.size!=sf.total_size||!sf.total_size||sf.total_size>(128ull<<20))return;
     const auto key = tex_key(t, j.res);
     {
@@ -7296,10 +7293,11 @@ void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj) {
     if(j.size&&j.size<=(128ull<<20)&&guest_capture_read_spans(j.base,j.size,j.mapping))g->prefetch(j);
 }
 void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64_t low_base,uint64_t hi_base,
-                         const uint32_t* low_descriptor){
+                         const uint32_t* low_descriptor,uint64_t low_bytes,uint64_t hi_bytes){
     if(!g||!res||!obj||!g->opt.res_current||g->opt.res_current(obj)!=res)return;
     Renderer::StreamMipInfo info{};
     info.epoch=res;info.obj=obj;info.low_base=low_base;info.hi_base=hi_base;
+    info.low_bytes=low_bytes;info.hi_bytes=hi_bytes;
     info.from_callback=true;
     if(obj>=0x10000&&guest_region_extent(obj)>=0x44){
         info.full_w=*reinterpret_cast<const uint16_t*>(obj+0x28);
@@ -7341,6 +7339,16 @@ void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64
     std::memcpy(job.t,tsharp,32);
     const auto ts=fmt::decode_tsharp(job.t);
     const bool high=ts.last_level+1==info.full_mips;
+    // A fully sized high allocation is already assembled by the original
+    // relocation copy. No second allocation is needed to read its chain.
+    if(high&&info.hi_bytes&&ts.base==info.hi_base&&ts.width==info.full_w&&ts.height==info.full_h){
+        tiling::Surface full;
+        if(split_2d_surface(job.t,full)&&full.total_size&&full.total_size<=info.hi_bytes){
+            job.kind=1;job.base=ts.base;job.size=full.total_size;
+            if(guest_capture_read_spans(job.base,job.size,job.mapping))g->prefetch(job);
+            return;
+        }
+    }
     if(high?(ts.base!=info.hi_base||(info.low_base&&!info.low_words[0])):
              (ts.base!=info.low_base||ts.last_level+1!=info.full_mips-1))return;
     auto span=[&](const uint32_t* words,uint32_t levels,uint64_t& base,uint64_t& size,MappingSpans& mapping){
@@ -7351,9 +7359,12 @@ void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64
         return size&&size<=(128ull<<20)&&guest_capture_read_spans(base,size,mapping);
     };
     if(!span(job.t,high?1:info.full_mips-1,job.base,job.size,job.mapping))return;
+    const auto bytes=high?info.hi_bytes:info.low_bytes;
+    if(bytes&&job.size>bytes)return;
     if(high&&info.low_base){
         std::memcpy(job.low,info.low_words.data(),32);
-        if(!span(job.low,info.full_mips-1,job.low_base,job.low_size,job.low_mapping))return;
+        if(!span(job.low,info.full_mips-1,job.low_base,job.low_size,job.low_mapping)||
+           (info.low_bytes&&job.low_size>info.low_bytes))return;
     }
     if(g->opt.res_current(obj)==res)g->prefetch(job);
 }
@@ -7687,6 +7698,8 @@ void print_stats() {
         log("native renderer: expired/invalid upload epochs %llu, missing exact resident views %llu, high-only texture uploads %llu",
             (unsigned long long)g->expired_texture_epochs,(unsigned long long)g->texture_view_mismatches,
             (unsigned long long)g->top_only_uploads);
+        log("native renderer: allocation-verified full high chains uploaded %llu",(unsigned long long)g->contiguous_high_uploads);
+        g->contiguous_high_uploads=0;
         g->texture_view_mismatches=g->top_only_uploads=0;
         g->split_layout_guesses=g->expired_texture_epochs=0;
         log("native renderer: texture epoch cohort splits %llu, conflicting versions in one draw %llu",

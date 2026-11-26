@@ -1,4 +1,5 @@
 #include "native_resource_binding.h"
+#include "native_mip_source.h"
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -6,6 +7,16 @@
 using namespace d1::ng::binding;
 static void check(bool b){if(!b)std::abort();}
 int main(){
+    using d1::ng::MipSource;
+    using d1::ng::mip_source;
+    static_assert(mip_source(false,true,0,0x10000,0,640,640,512)==MipSource::contiguous_high);
+    static_assert(mip_source(false,true,0x20000,0x10000,128,640,640,512)==MipSource::contiguous_high);
+    static_assert(mip_source(false,true,0x20000,0x10000,128,512,640,512)==MipSource::split_chain);
+    static_assert(mip_source(false,true,0,0x10000,0,512,640,512)==MipSource::high_only);
+    static_assert(mip_source(false,true,0,0x10000,0,511,640,512)==MipSource::invalid);
+    static_assert(mip_source(true,false,0x20000,0,128,0,128,64)==MipSource::low_chain);
+    static_assert(mip_source(true,false,0x20000,0,127,0,128,64)==MipSource::invalid);
+
     std::mt19937_64 rng(0xd10133);
     for(unsigned i=0;i<100000;++i){
         std::array<uint8_t,80> obj{},expected{};
