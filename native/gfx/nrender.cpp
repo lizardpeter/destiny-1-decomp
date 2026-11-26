@@ -28,6 +28,7 @@
 #include <set>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -380,6 +381,8 @@ struct Stats {
     // geometry, descriptors, commands; frames counted for averages
     uint64_t geo_stale = 0, predicated = 0, zpass_dumps = 0, t_bind = 0, t_view = 0, t_vkimg = 0, t_heap = 0, heap_scans = 0, heap_blocks_new = 0, t_detile = 0, t_fill = 0, t_watch = 0, t_mkimg = 0, t_tgt = 0, t_tex_hit = 0, t_tex_load = 0, tex_checks = 0, tex_unwatched = 0, t_pre = 0, t_pipe = 0, t_geo = 0, t_desc = 0, t_cmd = 0, t_frames = 0, t_draws = 0, memo_hits = 0, memo_misses = 0, memo_gen = 0;
     uint64_t t_wait = 0, t_submit = 0;  // waiting for the GPU (fences), vkQueueSubmit2
+    uint64_t t_acquire = 0, t_present_call = 0, t_frame_end = 0, t_cache_save = 0;
+    uint64_t max_acquire = 0, max_present_call = 0, max_frame_end = 0, max_cache_save = 0;
     // engine resources: uses with an unchanged epoch, moves with the same contents, real changes
     uint64_t res_hits = 0, res_moves = 0, res_changed = 0, geo_res_hits = 0, geo_res_moves = 0, geo_res_changed = 0;
     uint64_t res_verify_ok = 0, res_verify_missed = 0;
@@ -531,6 +534,7 @@ struct Renderer {
     GeoEntry* geo_lookup_res(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase);
     void evict_geo();
     uint64_t pcache_saved_pipelines = 0;
+    uint64_t pcache_last_attempt_ns = 0;
     void save_pipeline_cache();
     std::unordered_map<uint64_t, std::unique_ptr<Image>> targets;   // (base, format, size)
     std::unordered_map<uint64_t, Image*> target_by_base;            // newest target at an address
@@ -995,6 +999,7 @@ struct Renderer {
     std::unordered_set<uint64_t> pipe_spec_hashes;
     std::unordered_map<uint64_t, uint64_t> obj_code_hash;      // (uint64_t(obj) << 1 | vs) -> bytecode hash
     std::unordered_map<uint64_t, const uint8_t*> hash_to_obj;  // (code_hash << 1 | vs) -> guest obj
+    mutable std::shared_mutex shader_mask_m;
     std::unordered_map<uint64_t, uint64_t> obj_tex_mask64;     // (uint64_t(obj) << 1 | vs) -> 4-bit-per-slot active mask
     uint64_t shader_code_hash(const uint8_t* obj, bool vs);
     uint64_t shader_tex_mask64(const uint8_t* obj, bool vs) const;
@@ -3012,6 +3017,7 @@ uint64_t Renderer::shader_code_hash(const uint8_t* obj, bool vs) {
 uint64_t Renderer::shader_tex_mask64(const uint8_t* obj, bool vs) const {
     if (!obj) return 0;
     const uint64_t ok = (uint64_t(obj) << 1) | (vs ? 1ull : 0ull);
+    std::shared_lock lk(shader_mask_m);
     auto it = obj_tex_mask64.find(ok);
     return it != obj_tex_mask64.end() ? it->second : ~0ull;
 }
@@ -3118,8 +3124,8 @@ Shader* Renderer::shader(const Draw& dr, bool vs, const gcn::TexDim* dims, const
     gcn::TexDim masked_dims[16];
     uint8_t masked_kinds[16] = {};
     for (int i = 0; i < 16; ++i) masked_dims[i] = dims[i], masked_kinds[i] = kinds[i];
-    if (auto mit = obj_tex_mask64.find((uint64_t(obj) << 1) | (vs ? 1ull : 0ull)); mit != obj_tex_mask64.end()) {
-        const uint64_t m64 = mit->second;
+    {
+        const uint64_t m64 = shader_tex_mask64(obj, vs);
         for (int i = 0; i < 16; ++i) {
             if (!((m64 >> (i * 4)) & 0xF)) {
                 masked_dims[i] = gcn::TexDim::Tex2D;
@@ -3194,7 +3200,10 @@ Shader* Renderer::shader(const Draw& dr, bool vs, const gcn::TexDim* dims, const
             masked_kinds[i] = 0;
         }
     }
-    obj_tex_mask64[(uint64_t(obj) << 1) | (vs ? 1ull : 0ull)] = m4;
+    {
+        std::unique_lock lk(shader_mask_m);
+        obj_tex_mask64[(uint64_t(obj) << 1) | (vs ? 1ull : 0ull)] = m4;
+    }
     shader_code_hash(obj, vs);
     uint64_t canon_key = mix(mix(uint64_t(obj), vs), hash_bytes(masked_dims, 16 * sizeof(gcn::TexDim)));
     canon_key = mix(mix(canon_key, hash_bytes(masked_kinds, 16)), uint64_t(uint_in) | uint64_t(sint_in) << 32);
@@ -3312,7 +3321,9 @@ Pipeline* Renderer::pipeline_resolve(const Draw& dr, Image* const* colors, Image
     VkPrimitiveTopology topo;
     if (!topology_of(dr.prim, topo)) return nullptr;
     // key
-    uint64_t key = mix(mix(uint64_t(vs), uint64_t(ps)), topo);
+    // Rect lists and quad lists both lower to triangle-list topology but have
+    // different geometry shader / index expansion contracts. Key the guest primitive.
+    uint64_t key = mix(mix(uint64_t(vs), uint64_t(ps)), dr.prim);
     for (const auto& a : vs->res.attribs) {
         const uint32_t* v = dr.vb[a.vb_slot & 15];
         key = mix(key, (v[1] >> 16 & 0x3FFF) | uint64_t(v[3] >> 12 & 0x7F) << 16 | uint64_t(a.index_vgpr) << 24);
@@ -3772,9 +3783,16 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
             VkImageCopy c{};
             const VkImageAspectFlags asp = img->depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | (img->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0))
                                                       : VK_IMAGE_ASPECT_COLOR_BIT;
-            c.srcSubresource = c.dstSubresource = {asp, 0, 0, 1};
             c.extent = {img->w, img->h, 1};
-            vkCmdCopyImage(rc().cmd, img->image, VK_IMAGE_LAYOUT_GENERAL, sn->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            // A depth/stencil copy region must select one aspect, not both.
+            VkImageCopy regions[2]{};
+            uint32_t nr = 0;
+            for (VkImageAspectFlagBits aspect : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
+                if (!(asp & aspect)) continue;
+                c.srcSubresource = c.dstSubresource = {VkImageAspectFlags(aspect), 0, 0, 1};
+                regions[nr++] = c;
+            }
+            vkCmdCopyImage(rc().cmd, img->image, VK_IMAGE_LAYOUT_GENERAL, sn->image, VK_IMAGE_LAYOUT_GENERAL, nr, regions);
             snaps.push_back({img, sn.get()});
             wrote_target(img);
             rc().fresh.push_back({img, sn.get(), 3});
@@ -4134,8 +4152,8 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
             p = e.p;
             ++r.memo_tl;
         } else {
-            std::unique_lock<std::mutex> lk(pipe_m, std::defer_lock);
-            if (r.parallel) lk.lock();
+            // The loader also creates shaders and pipelines, even during serial draws.
+            std::lock_guard lk(pipe_m);
             p = pipeline(dr, colors, depth);
             if (p) e = {k, p};
         }
@@ -5361,9 +5379,13 @@ void Renderer::present(uint64_t addr) {
     uint32_t index = 0;
     // (the swapchain and the queue are only used on this thread: the lock is released while
     // presentation may block, so the engine's threads keep recording)
+    const uint64_t acquire_begin = now_ns();
     m.unlock();
     VkResult r = vkAcquireNextImageKHR(ctx.device, sc.chain, UINT64_MAX, sc.acquired[slot], VK_NULL_HANDLE, &index);
+    const uint64_t acquire_ns = now_ns() - acquire_begin;
     m.lock();
+    st.t_acquire += acquire_ns;
+    st.max_acquire = std::max(st.max_acquire, acquire_ns);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         sc.stale = true;
         return;
@@ -5445,9 +5467,13 @@ void Renderer::present(uint64_t addr) {
     pi.swapchainCount = 1;
     pi.pSwapchains = &sc.chain;
     pi.pImageIndices = &index;
+    const uint64_t present_begin = now_ns();
     m.unlock();
     r = vkQueuePresentKHR(ctx.queue, &pi);
+    const uint64_t present_ns = now_ns() - present_begin;
     m.lock();
+    st.t_present_call += present_ns;
+    st.max_present_call = std::max(st.max_present_call, present_ns);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) sc.stale = r == VK_ERROR_OUT_OF_DATE_KHR;
     else if (r != VK_SUCCESS) {
         static int logged = 0;
@@ -5460,7 +5486,7 @@ void Renderer::present(uint64_t addr) {
 // without a shutdown path, so there is no "on exit").
 void Renderer::save_pipeline_cache() {
     if (!opt.pipeline_cache || !pcache || st.pipelines == pcache_saved_pipelines) return;
-    pcache_saved_pipelines = st.pipelines;
+    const uint64_t saving_pipelines = st.pipelines;
     size_t n = 0;
     if (vkGetPipelineCacheData(ctx.device, pcache, &n, nullptr) != VK_SUCCESS || !n) return;
     std::vector<char> data(n);
@@ -5472,7 +5498,7 @@ void Renderer::save_pipeline_cache() {
     std::fclose(f);
     if (ok) {
         std::remove(opt.pipeline_cache);
-        std::rename(tmp.c_str(), opt.pipeline_cache);
+        if (std::rename(tmp.c_str(), opt.pipeline_cache) == 0) pcache_saved_pipelines = saving_pipelines;
     }
     if (!pipe_specs.empty()) {
         const std::string sp_path = std::string(opt.pipeline_cache) + ".specs";
@@ -5490,6 +5516,7 @@ void Renderer::save_pipeline_cache() {
 
 // End of a frame: limit how far the CPU runs ahead, and housekeeping.
 void Renderer::end_frame() {
+    const uint64_t frame_end_begin = now_ns();
     frame_ends.push_back(serial_next - 1);
     while (frame_ends.size() > opt.frames_in_flight) {
         // (with m held by the caller: released while waiting, so lists keep being recorded)
@@ -5507,13 +5534,22 @@ void Renderer::end_frame() {
     }
     retire_completed();
     if (st.frames % 120 == 0) evict_textures(), evict_geo();
-    // pipeline cache: shortly after new pipelines appear (a burst while a level loads), at
-    // most every ~10 s
-    static uint64_t last_save_frame = 0;
-    if (st.pipelines != pcache_saved_pipelines && st.frames - last_save_frame >= 30) {
-        last_save_frame = st.frames;
-        save_pipeline_cache();
+    // Use elapsed wall time, not frame count: a 30-frame interval was only 250 ms
+    // at 120 FPS. Never serialize concurrently with loader pipeline construction.
+    const uint64_t now = now_ns();
+    if (st.frames >= 30 && (!pcache_last_attempt_ns || now - pcache_last_attempt_ns >= 10000000000ull)) {
+        std::unique_lock lk(pipe_m, std::try_to_lock);
+        if (lk.owns_lock() && st.pipelines != pcache_saved_pipelines) {
+            pcache_last_attempt_ns = now;
+            save_pipeline_cache();
+            const uint64_t ns = now_ns() - now;
+            st.t_cache_save += ns;
+            st.max_cache_save = std::max(st.max_cache_save, ns);
+        }
     }
+    const uint64_t ns = now_ns() - frame_end_begin;
+    st.t_frame_end += ns;
+    st.max_frame_end = std::max(st.max_frame_end, ns);
 }
 
 // Reads an image back and writes it as a PPM (8-bit; float formats are clamped to [0, 1],
@@ -5945,6 +5981,12 @@ void print_stats() {
             "commands %.2f ms, submit %.2f ms, waiting for the GPU %.2f ms", double(s.t_pre) / f / 1e6,
             double(s.t_pipe) / f / 1e6, double(s.t_geo) / f / 1e6, double(s.t_desc) / f / 1e6, double(s.t_cmd) / f / 1e6,
             double(s.t_submit) / f / 1e6, double(s.t_wait) / f / 1e6);
+    if (const double f = double(s.frames - s.t_frames); f > 0)
+        log("native renderer: presentation ms avg/max: acquire %.2f/%.2f, queue present %.2f/%.2f, frame end %.2f/%.2f (cache save %.2f/%.2f)",
+            double(s.t_acquire) / f / 1e6, double(s.max_acquire) / 1e6,
+            double(s.t_present_call) / f / 1e6, double(s.max_present_call) / 1e6,
+            double(s.t_frame_end) / f / 1e6, double(s.max_frame_end) / 1e6,
+            double(s.t_cache_save) / f / 1e6, double(s.max_cache_save) / 1e6);
     if (const double n = double(s.draws - s.t_draws); n > 0)
         log("native renderer: per draw (%.0f draws per frame, %.0f%% recorded in parallel): pipeline %.0f ns, geometry %.0f ns, "
             "descriptors %.0f ns, commands %.0f ns (summed over threads) | pipeline memo %llu hits, %llu misses (%llu by target changes)",
@@ -6026,6 +6068,8 @@ void print_stats() {
     s.t_vkimg = s.t_heap = s.heap_scans = s.heap_blocks_new = 0;
     s.t_detile = s.t_fill = s.t_watch = s.t_mkimg = 0;
     s.t_tgt = s.t_tex_hit = s.t_tex_load = s.tex_checks = s.tex_unwatched = 0;
+    s.t_acquire = s.t_present_call = s.t_frame_end = s.t_cache_save = 0;
+    s.max_acquire = s.max_present_call = s.max_frame_end = s.max_cache_save = 0;
     s.t_pre = s.t_pipe = s.t_geo = s.t_desc = s.t_cmd = s.t_submit = s.t_wait = 0, s.t_frames = s.frames, s.t_draws = s.draws;
     std::string why;
     for (auto& [k, v] : s.skip) why += " " + k + "=" + std::to_string(v);
