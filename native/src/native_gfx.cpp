@@ -781,6 +781,14 @@ void write_token(uint64_t cb, uint64_t id) {
 void record(List* l) {
     if (!ng::list_recording() || l->items.empty()) return;
     if (gpu_flip_count() % uint64_t(nr::g_every) != 0) return;
+    // A list containing CPU-visible resource writes must be executed in actual
+    // submission order. Recording those writes at list close can reorder them
+    // across other lists and duplicate them at submit.
+    for (const Item& it : l->items)
+        if (it.d && (it.d->kind == ng::Draw::Dma || it.d->kind == ng::Draw::WriteData))
+            return;
+    struct SavedCb { ng::Draw* draw; ng::Draw::Cb cb[ng::kStages][16]; };
+    std::vector<SavedCb> saved;
     ng::Draw::Cb local[ng::kStages][16] = {};
     bool bound[ng::kStages][16] = {};
     std::vector<ng::Draw*> items;
@@ -792,7 +800,10 @@ void record(List* l) {
             continue;
         }
         ng::Draw* d = it.d;
-        if (d->kind <= ng::Draw::Clear)
+        if (d->kind <= ng::Draw::Clear) {
+            saved.emplace_back();
+            saved.back().draw = d;
+            std::memcpy(saved.back().cb, d->cb, sizeof d->cb);
             for (int st = 0; st < ng::kStages; ++st)
                 for (int sl = 0; sl < 16; ++sl) {
                     ng::Draw::Cb& c = d->cb[st][sl];
@@ -803,9 +814,12 @@ void record(List* l) {
                         c = {ng::kLateCb | uint64_t(st) << 4 | uint64_t(sl), c.size};
                     }
                 }
+        }
         items.push_back(d);
     }
     l->recorded = ng::record_list(items, l->handle, l->late);
+    // Captured draws remain valid even if native recording fails or is discarded.
+    for (const auto& v : saved) std::memcpy(v.draw->cb, v.cb, sizeof v.cb);
 }
 List* end_list(uint64_t dev) {
     const int c = ctx_of_dev(dev);
@@ -1450,100 +1464,114 @@ void native_device_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t*
     }
     std::vector<ng::Draw*> draws;
     std::vector<uint32_t> recorded;
-    std::vector<ng::Draw*> cpu_events;
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> labels;
-    bool eop = false;
-    for (nd::List* l : lists) {
-        eop |= l->eop;
-        if (l->recorded) {
-            for (const ng::LateCb& lc : l->late) {
-                const ng::Draw::Cb& c = nr::g_ce[lc.stage][lc.slot].addr ? nr::g_ce[lc.stage][lc.slot] : l->dflt[lc.stage][lc.slot];
-                ng::fill_late(lc, c.addr, c.size);
-            }
-            recorded.push_back(l->handle);
-            for (nd::Item& it : l->items) {
-                if (!it.d) nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
-                else if (it.d->kind == ng::Draw::WriteData && it.d->prim == ng::kEopLabel) labels.push_back({it.d->caller | uint64_t(it.d->count) << 63, it.d->inline_vertices});
-                else if (it.d->kind == ng::Draw::Dma || it.d->kind == ng::Draw::WriteData) cpu_events.push_back(it.d);
-            }
-            continue;
-        }
-        for (nd::Item& it : l->items) {
-            if (!it.d) {
-                nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
-                continue;
-            }
-            ng::Draw* d = it.d;
-            if (d->kind == ng::Draw::WriteData && d->prim == ng::kEopLabel) {
-                labels.push_back({d->caller | uint64_t(d->count) << 63, d->inline_vertices});
-                continue;
-            }
-            if (d->kind <= ng::Draw::Clear)
-                for (int st = 0; st < 2; ++st)
-                    for (int sl = 0; sl < 16; ++sl)
-                        if (nr::g_ce[st][sl].addr) d->cb[st][sl] = nr::g_ce[st][sl];
-            draws.push_back(d);
-        }
-    }
     nr_every_world();
     const bool run = (gpu_flip_count() % uint64_t(nr::g_every)) == 0 && ng::active();
-    if (!recorded.empty()) {
+
+    auto flush_draws = [&] {
+        if (draws.empty()) return;
+        if (run) {
+            const auto t0 = std::chrono::steady_clock::now();
+            ng::execute(draws);
+            nr::g_exec_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+            nr::g_frame_executed = true;
+        } else {
+            for (ng::Draw* d : draws) {
+                switch (d->kind) {
+                case ng::Draw::Dma:
+                    if (d->caller < 0x10000 || guest_region_extent(d->caller) < d->count) break;
+                    if (d->prim == 2) {
+                        auto* w = reinterpret_cast<uint32_t*>(d->caller);
+                        for (uint32_t k = 0; k < d->count / 4; ++k) w[k] = d->instances;
+                    } else if (d->index_addr >= 0x10000 && guest_region_extent(d->index_addr) >= d->count) {
+                        std::memmove(reinterpret_cast<void*>(d->caller), reinterpret_cast<const void*>(d->index_addr), d->count);
+                    } else break;
+                    ng::cpu_wrote(d->caller, d->count);
+                    break;
+                case ng::Draw::WriteData:
+                    if (d->caller >= 0x10000 && guest_region_extent(d->caller) >= d->inline_vertices.size()) {
+                        std::memcpy(reinterpret_cast<void*>(d->caller), d->inline_vertices.data(), d->inline_vertices.size());
+                        ng::cpu_wrote(d->caller, d->inline_vertices.size());
+                    }
+                    break;
+                case ng::Draw::ZPass:
+                    nd::answer_zpass(d->index_addr & ~0xFull, (d->index_addr & 0xF) != 0);
+                    break;
+                default: break;
+                }
+            }
+        }
+        draws.clear();
+    };
+    auto flush_recorded = [&] {
+        if (recorded.empty()) return;
         const auto t0 = std::chrono::steady_clock::now();
         ng::submit_recorded(recorded);
-        nr::g_exec_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        nr::g_exec_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count());
         nr::g_frame_executed = true;
-        for (ng::Draw* d : cpu_events) {
-            ng::cpu_wrote(d->caller, d->kind == ng::Draw::Dma ? d->count : d->inline_vertices.size());
-            if (d->kind == ng::Draw::Dma) {
-                if (d->caller < 0x10000 || guest_region_extent(d->caller) < d->count) continue;
-                if (d->prim == 2) {
-                    auto* w = reinterpret_cast<uint32_t*>(d->caller);
-                    for (uint32_t k = 0; k < d->count / 4; ++k) w[k] = d->instances;
-                } else if (d->index_addr >= 0x10000 && guest_region_extent(d->index_addr) >= d->count) {
-                    std::memmove(reinterpret_cast<void*>(d->caller), reinterpret_cast<const void*>(d->index_addr), d->count);
-                }
-            } else if (d->caller >= 0x10000 && guest_region_extent(d->caller) >= d->inline_vertices.size()) {
-                std::memcpy(reinterpret_cast<void*>(d->caller), d->inline_vertices.data(), d->inline_vertices.size());
-            }
-        }
-    }
-    if (run && !draws.empty()) {
-        const auto t0 = std::chrono::steady_clock::now();
-        ng::execute(draws);
-        nr::g_exec_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
-        nr::g_frame_executed = true;
-    } else {
-        for (ng::Draw* d : draws) {
-            switch (d->kind) {
-            case ng::Draw::Dma:
-                if (d->caller >= 0x10000 && d->index_addr >= 0x10000 && guest_region_extent(d->caller) >= d->count &&
-                    guest_region_extent(d->index_addr) >= d->count)
-                    std::memmove(reinterpret_cast<void*>(d->caller), reinterpret_cast<const void*>(d->index_addr), d->count);
-                break;
-            case ng::Draw::WriteData:
-                if (d->caller >= 0x10000 && guest_region_extent(d->caller) >= d->inline_vertices.size())
-                    std::memcpy(reinterpret_cast<void*>(d->caller), d->inline_vertices.data(), d->inline_vertices.size());
-                break;
-            case ng::Draw::ZPass: nd::answer_zpass(d->index_addr & ~0xFull, (d->index_addr & 0xF) != 0); break;
-            default: break;
-            }
-        }
-    }
-    nd::g_lists_run += lists.size();
-    for (nd::List* l : lists) nd::free_list(l);
-    if (!labels.empty() || eop)
-        ng::after_gpu([labels = std::move(labels), eop] {
-            for (auto [tagged, bytes] : labels) {
+        recorded.clear();
+    };
+    auto complete = [&](bool eop) {
+        // Flush only at an actual completion boundary. A label must not wait
+        // for unrelated later lists, nor become visible before prior GPU work.
+        flush_recorded();
+        flush_draws();
+        ng::after_gpu([pending = std::move(labels), eop] {
+            for (auto& [tagged, bytes] : pending) {
                 const uint64_t addr = tagged & ~(1ull << 63);
-                if (tagged >> 63) {
+                if (tagged >> 63 && bytes.size() >= 8) {
                     const uint64_t t = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                    std::chrono::high_resolution_clock::now().time_since_epoch()).count());
+                        std::chrono::high_resolution_clock::now().time_since_epoch()).count());
                     std::memcpy(bytes.data(), &t, 8);
                 }
-                if (addr >= 0x10000 && guest_region_extent(addr) >= bytes.size()) std::memcpy(reinterpret_cast<void*>(addr), bytes.data(), bytes.size());
+                if (addr >= 0x10000 && guest_region_extent(addr) >= bytes.size())
+                    std::memcpy(reinterpret_cast<void*>(addr), bytes.data(), bytes.size());
             }
             if (eop) gnm_signal_eop();
         });
+        labels.clear();
+    };
+
+    for (nd::List* l : lists) {
+        if (l->recorded && run) {
+            flush_draws();
+            for (const ng::LateCb& lc : l->late) {
+                const ng::Draw::Cb& c = nr::g_ce[lc.stage][lc.slot].addr ?
+                    nr::g_ce[lc.stage][lc.slot] : l->dflt[lc.stage][lc.slot];
+                ng::fill_late(lc, c.addr, c.size);
+            }
+            recorded.push_back(l->handle);
+            for (nd::Item& it : l->items)
+                if (!it.d) nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
+        } else {
+            flush_recorded();
+            if (l->recorded) ng::discard_recorded(l->handle);
+            for (nd::Item& it : l->items) {
+                if (!it.d) {
+                    nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
+                    continue;
+                }
+                ng::Draw* d = it.d;
+                if (d->kind == ng::Draw::WriteData && d->prim == ng::kEopLabel) {
+                    labels.push_back({d->caller | uint64_t(d->count) << 63, d->inline_vertices});
+                    complete(false);
+                    continue;
+                }
+                if (d->kind <= ng::Draw::Clear)
+                    for (int st = 0; st < 2; ++st)
+                        for (int sl = 0; sl < 16; ++sl)
+                            if (nr::g_ce[st][sl].addr) d->cb[st][sl] = nr::g_ce[st][sl];
+                draws.push_back(d);
+            }
+        }
+        if (l->eop) complete(true);
+    }
+    flush_recorded();
+    flush_draws();
+    nd::g_lists_run += lists.size();
+    for (nd::List* l : lists) nd::free_list(l);
 }
 
 void native_gfx_flip(void* addr, uint32_t width, uint32_t height) {
