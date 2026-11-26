@@ -1101,6 +1101,7 @@ struct Renderer {
         bool from_callback = false;
         bool valid = true;
         fmt::TSharp low_layout{};
+        std::array<uint32_t,8> low_words{};
     };
     struct StreamHistory {std::array<StreamMipInfo,4> entries{};};
     std::mutex mip_m;
@@ -2797,6 +2798,14 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                         img->low_loaded = true;
                         img->low_base = smi.low_base;
                         img->low_size = sf_low.total_size;
+                        // This upload independently populated the low chain.
+                        // Publish its captured descriptor too, not just mip 0.
+                        if(smi.low_words[0] && low.base==smi.low_base &&
+                           low.dfmt==ts.dfmt && low.nfmt==ts.nfmt &&
+                           low.last_level+1==sf_low.levels){
+                            std::memcpy(img->resident_descriptor[0],smi.low_words.data(),32);
+                            img->descriptor_epoch[0]=res;
+                        }
                     }
                 }
             }
@@ -3432,12 +3441,14 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
     }
     auto it = textures.find(tex_key(t, res));
     Image* img = it != textures.end() ? it->second.get() : nullptr;
-    if(res&&(!img||img->res_val!=res||img->stale))
-        if(auto* old=historical_texture(tex_key(t,res),t,res))img=old;
+    if(res&&(!img||!img->matches_epoch(t,res))) {
+        auto* exact=historical_texture(tex_key(t,res),t,res);
+        if(img&&!exact)++expired_texture_epochs;
+        img=exact;
+    }
     const uint8_t fallback_kind = ts.nfmt == 4 ? 1u : ts.nfmt == 5 ? 2u : 0u;
     const ViewHandle fallback{dummy_views[int(dim) * 3 + fallback_kind], 0, uint8_t(dim), fallback_kind, fallback_kind == 0};
     if(!img||img->stale)return fallback;
-    if(res&&img->res_val!=res&&!img->matches_epoch(t,res)){++expired_texture_epochs;return fallback;}
     // A split texture has one native image, but each captured descriptor has its
     // own mip origin. A later low/high bind must not change an earlier draw.
     uint32_t origin = 0;
@@ -6682,10 +6693,14 @@ void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64
     }else info.valid=false;
     if(low_descriptor&&low_base){
         const auto low=fmt::decode_tsharp(low_descriptor);
-        if(low.base==low_base)info.low_layout=low;
+        if(low.base==low_base){info.low_layout=low;
+            std::memcpy(info.low_words.data(),low_descriptor,32);}
+
     }else if(tsharp&&!hi_base&&low_base){
         const auto low=fmt::decode_tsharp(tsharp);
-        if(low.base==low_base)info.low_layout=low;
+        if(low.base==low_base){info.low_layout=low;
+            std::memcpy(info.low_words.data(),tsharp,32);}
+
     }
     {
         std::lock_guard lk(g->mip_m);
@@ -6696,7 +6711,7 @@ void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64
             uint64_t newest=0;
             for(const auto& prior:history)
                 if(prior.epoch<res&&prior.epoch>newest&&prior.low_layout.base==low_base){
-                    info.low_layout=prior.low_layout;newest=prior.epoch;
+                    info.low_layout=prior.low_layout;info.low_words=prior.low_words;newest=prior.epoch;
                 }
         }
         auto& slot=history[uint32_t(res)&3];
