@@ -950,55 +950,94 @@ D1_SYSV bool h_blit_complete() {
 using Two = D1_SYSV void (*)(uint64_t, uint64_t);
 Two o_copy, o_swap;
 namespace relocation {
-using IdFn=D1_SYSV uint32_t(*)(uint32_t);
-using PtrFn=D1_SYSV uint64_t(*)(uint32_t);
 using Unary=D1_SYSV void(*)(uint64_t);
+using PoolLookup=D1_SYSV uint64_t(*)(uint32_t);
+using ClockFn=D1_SYSV uint32_t(*)();
 using Query=D1_SYSV uint64_t(*)(uint32_t,uint32_t,uint32_t,uint32_t);
 using Split=D1_SYSV uint64_t(*)(uint64_t,uint32_t,uint32_t,uint32_t*);
 using SetDatum=D1_SYSV void(*)(uint32_t,uint64_t,uint32_t);
-using SizeFn=D1_SYSV uint32_t(*)(const uint32_t*);
-using Link=D1_SYSV void(*)(uint32_t,uint32_t);
+using SizeFn=D1_SYSV uint64_t(*)(uint32_t*);
+using Link=D1_SYSV void(*)(uint32_t,uint16_t);
 using Finalize=D1_SYSV void(*)(uint32_t,uint32_t,uint32_t);
 template<class Fn> Fn leaf(uint64_t offset){return reinterpret_cast<Fn>(nr::g_base+offset);}
-uint32_t primary(uint32_t h){return leaf<IdFn>(0xDE720)(h);}
-uint32_t secondary(uint32_t h){return leaf<IdFn>(0xDE660)(h);}
-uint64_t entry(uint32_t id){return leaf<PtrFn>(0xDE6F0)(id);}
-void pin(uint64_t e){
-    auto* p=reinterpret_cast<uint8_t*>(e+0x16);
-    *p|=1;
+uint64_t entry(uint32_t id){
+    using namespace ng::move;
+    if(!container_valid(id))return 0;
+    const uint64_t table=nr::eb<uint64_t>(0x2587A08);
+    return table+field<uint64_t>(table,0)+uint64_t(container_index(id))*field<uint64_t>(table,0x10);
 }
-uint64_t datum(uint32_t h){
+uint64_t datum_slot(uint32_t h,uint64_t* pool_out=nullptr){
     using namespace ng::move;
     const uint64_t root=nr::eb<uint64_t>(0x1A238A0);
     const uint64_t tbl=field<uint64_t>(root,0);
     const uint64_t pool=tbl+uint64_t(pool_index(h))*0x40;
-    const uint64_t base=field<uint64_t>(pool,0x10);
-    const auto off=datum_offset(h,field<uint32_t>(pool,0x30));
-    return datum_address(base,off,field<int32_t>(pool,0x34),field<uint64_t>(base+off,8));
+    if(pool_out)*pool_out=pool;
+    return field<uint64_t>(pool,0x10)+datum_offset(h,field<uint32_t>(pool,0x30));
+}
+uint32_t primary(uint32_t h){return field<uint32_t>(datum_slot(h),0x10);}
+uint32_t secondary(uint32_t h){
+    using namespace ng::move;
+    const uint64_t slot=datum_slot(h);
+    const auto flags=field<uint16_t>(slot,4);
+    const auto id=field<uint32_t>(slot,0x10);
+    uint32_t indirect=0;
+    if(flags&4){
+        const uint64_t e=entry(id);
+        if(!e)return UINT32_MAX;
+        indirect=field<uint32_t>(e,0xc);
+    }
+    return secondary_id(flags,id,indirect);
+}
+uint32_t owner_token(uint32_t id){
+    const uint64_t e=entry(id);
+    return e?field<uint32_t>(e,8):UINT32_MAX;
+}
+uint32_t owner(uint32_t id){
+    const uint64_t e=entry(id);
+    if(!e)return UINT32_MAX;
+    return field<uint32_t>(e,field<uint8_t>(e,0x14)==2?8:0xc);
+}
+void pin(uint64_t e){
+    auto* p=reinterpret_cast<uint8_t*>(e+0x16);
+    *p|=1;
+}
+void unpin(uint64_t e){
+    auto* p=reinterpret_cast<uint8_t*>(e+0x16);
+    *p=ng::move::unpin(*p);
+}
+void stamp_unpin(uint64_t e){
+    const uint32_t value=reinterpret_cast<ClockFn>(nr::eb<uint64_t>(0x2583908))();
+    ng::binding::store(reinterpret_cast<void*>(e),0x10,value);
+    unpin(e);
+}
+uint64_t datum(uint32_t h){
+    uint64_t pool=0;
+    const uint64_t slot=datum_slot(h,&pool);
+    return ng::move::datum_address(slot,0,field<int32_t>(pool,0x34),field<uint64_t>(slot,8));
 }
 uint64_t query(uint32_t a,uint32_t b,uint32_t kind){
     return reinterpret_cast<Query>(nr::eb<uint64_t>(0x254EE98))(a,b,kind,1);
 }
-// The completion callbacks retain the actual original leaf operations
-// and their ordering, but no longer execute the original callback bodies.
+// Native lookup and pin leaves preserve the original metadata ordering;
+// the higher-level finalize and split operations remain original.
 D1_SYSV void copy_complete(uint64_t* a,uint64_t* b,uint64_t,uint64_t){
     const uint32_t id=uint32_t(*a), split=uint32_t(*b);
-    const uint32_t generation=leaf<IdFn>(0xDE760)(id);
-    const uint32_t handle=leaf<IdFn>(0xDE790)(id);
+    const uint32_t generation=owner_token(id);
+    const uint32_t handle=owner(id);
     const uint64_t owner=entry(primary(handle)), moved=entry(id), temporary=entry(split);
     leaf<Finalize>(0xE00D0)(handle,generation,handle);
-    leaf<Unary>(0xDED70)(owner);
-    leaf<Unary>(0xDED70)(moved);
-    leaf<Unary>(0xDED80)(temporary);
+    unpin(owner);
+    unpin(moved);
+    stamp_unpin(temporary);
 }
 D1_SYSV void swap_complete(uint64_t* a,uint64_t*,uint64_t,uint64_t){
     const uint32_t id=uint32_t(*a);
-    const uint32_t generation=leaf<IdFn>(0xDE760)(id);
-    const uint32_t handle=leaf<IdFn>(0xDE790)(id);
+    const uint32_t generation=owner_token(id);
+    const uint32_t handle=owner(id);
     const uint64_t owner=entry(primary(handle)), moved=entry(id);
     leaf<Finalize>(0xE00D0)(handle,generation,UINT32_MAX);
-    leaf<Unary>(0xDED70)(owner);
-    leaf<Unary>(0xDED70)(moved);
+    unpin(owner);
+    unpin(moved);
 }
 void enqueue(uint64_t dst,uint64_t src,uint32_t bytes,uint64_t callback,uint64_t a,uint64_t b){
     if(!h_blit_enqueue(dst,src,bytes,callback,&a,&b,0)){
@@ -1020,7 +1059,7 @@ void copy(uint32_t a,uint32_t b){
     uint32_t temporary=0;
     const auto split=leaf<Split>(0xDEB60)(e2,container_index(second),container_generation(second),&temporary);
     pin(split);
-    leaf<IdFn>(0xDE1D0)(a); // original return is unused
+    leaf<Unary>(0xDE1D0)(a);
     const auto p=ng::move::copy(source,destination,delta,bytes);
     enqueue(p.dst,p.src,p.bytes,reinterpret_cast<uint64_t>(&copy_complete),second,temporary);
 }
@@ -1028,8 +1067,8 @@ void swap(uint32_t a,uint32_t b){
     using namespace ng::move;
     if(a==UINT32_MAX)return;
     const uint32_t source_id=primary(b);
-    leaf<Unary>(0x6FB60)(pool_index(a));
-    leaf<Unary>(0x6FB60)(pool_index(b));
+    leaf<PoolLookup>(0x6FB60)(pool_index(a));
+    leaf<PoolLookup>(0x6FB60)(pool_index(b));
     const uint64_t source=datum(b), delta=query(a,b,1);
     const uint64_t destination=source+delta;
     const uint32_t destination_id=primary(a);
@@ -1038,7 +1077,7 @@ void swap(uint32_t a,uint32_t b){
     leaf<SetDatum>(0x6F5A0)(b,source,relocation_flags(delta));
     const uint64_t e1=entry(source_id),e2=entry(destination_id);
     ng::binding::store(reinterpret_cast<void*>(e2),0,destination);
-    leaf<Link>(0xDE1E0)(destination_id,source_id);
+    leaf<Link>(0xDE1E0)(destination_id,container_index(source_id));
     pin(e1);pin(e2);
     enqueue(0,0,0,reinterpret_cast<uint64_t>(&swap_complete),destination_id,0);
 }
