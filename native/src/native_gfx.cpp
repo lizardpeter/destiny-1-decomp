@@ -37,6 +37,7 @@
 #include "native_asset_suballocation.h"
 #include "../gfx/native_resource_move.h"
 #include "../gfx/native_texture_constructor.h"
+#include "../gfx/native_small_surface_layout.h"
 #include "native_record_registry.h"
 #include "../gfx/native_record_fifo.h"
 #include "../gfx/native_cbm_contract.h"
@@ -1098,8 +1099,25 @@ using namespace ng::texture_ctor;
 using LayoutFn=D1_SYSV uint32_t(*)(LayoutOutput*,const LayoutInput*);
 using FootprintFn=D1_SYSV uint32_t(*)(uint64_t*,uint32_t*,void*);
 FootprintFn original_footprint;
-uint32_t calculate_layout(LayoutOutput& out,const LayoutInput& in){
+uint32_t original_layout(LayoutOutput& out,const LayoutInput& in){
     return reinterpret_cast<LayoutFn>(nr::g_base+0xF85CB0)(&out,&in);
+}
+bool candidate_layout(LayoutOutput& out,const LayoutInput& in){
+    if(in.tile>=32||uint8_t(in.format)>=0x3b)return false;
+    const uint32_t table=nr::eb<uint32_t>(0x16C7880+uint64_t(in.tile)*4);
+    const uint32_t mode=array_mode(table);
+    if(mode>3)return false;
+    const uint32_t bits=nr::eb<uint32_t>(0x1609CE0+uint64_t(uint8_t(in.format))*4);
+    const uint32_t thick=mode==3?nr::eb<uint32_t>(0x160A110):1;
+    return small_surface_layout(out,in,table,bits,thick);
+}
+uint32_t calculate_layout(LayoutOutput& out,const LayoutInput& in){
+    static const bool on=[]{
+        const char* e=std::getenv("D1_PC_NATIVE_SMALL_LAYOUT");
+        return e&&std::atoi(e)!=0;
+    }();
+    if(on&&candidate_layout(out,in))return 0;
+    return original_layout(out,in);
 }
 D1_SYSV uint32_t calculate_footprint(uint64_t* bytes,uint32_t* alignment,void* descriptor){
     if(!bytes||!alignment||!descriptor)return invalid;
@@ -1121,7 +1139,7 @@ D1_SYSV uint32_t calculate_footprint(uint64_t* bytes,uint32_t* alignment,void* d
 void compare_native_layout(const uint32_t* w,const tiling::Surface& s){
     static std::mutex m;
     static std::unordered_set<uint64_t> seen;
-    static uint64_t checked=0,failed=0,oracle_errors=0;
+    static uint64_t checked=0,failed=0,oracle_errors=0,candidate_checks=0,candidate_failures=0;
     const uint32_t kind=w[3]>>28;
     if(kind<8||kind>13)return;
     uint64_t key=0;
@@ -1131,7 +1149,7 @@ void compare_native_layout(const uint32_t* w,const tiling::Surface& s){
     LayoutInput seed{};
     const uint32_t tile=(w[3]>>20)&31;
     const uint32_t table_word=nr::eb<uint32_t>(0x16C7880+uint64_t(tile)*4);
-    if(prepare(seed,w,0,0,table_word,calculate_layout)){
+    if(prepare(seed,w,0,0,table_word,original_layout)){
         ++oracle_errors;return;
     }
     uint64_t off=0;
@@ -1146,7 +1164,15 @@ void compare_native_layout(const uint32_t* w,const tiling::Surface& s){
         in.base_pitch=lv?((w[4]>>13)&0x3fff)+1:0;
         in.mip=lv;
         LayoutOutput out{};
-        if(calculate_layout(out,in)){++oracle_errors;return;}
+        if(original_layout(out,in)){++oracle_errors;return;}
+        LayoutOutput candidate{};
+        if(candidate_layout(candidate,in)){
+            ++candidate_checks;
+            if(!small_layout_equal(candidate,out)){
+                if(++candidate_failures<=16)
+                    log("native small layout differential mismatch tile=%u fmt=%#x mip=%u %ux%u",in.tile,in.format,in.mip,in.width,in.height);
+            }
+        }
         const uint64_t size=(uint64_t(out.words[4])|(uint64_t(out.words[5])<<32))*layers;
         const auto& n=s.mips[lv];
         const uint32_t pitch=out.words[0]/scale,height=out.words[1]/scale;
@@ -1162,8 +1188,9 @@ void compare_native_layout(const uint32_t* w,const tiling::Surface& s){
     }
     ++checked;if(mismatch)++failed;
     if((checked&(checked-1))==0)
-        log("native layout differential: %llu unique descriptors, %llu mismatched, %llu original errors",
-            (unsigned long long)checked,(unsigned long long)failed,(unsigned long long)oracle_errors);
+        log("native layout differential: %llu unique descriptors, %llu mismatched, %llu original errors | small leaf %llu checked, %llu mismatched",
+            (unsigned long long)checked,(unsigned long long)failed,(unsigned long long)oracle_errors,
+            (unsigned long long)candidate_checks,(unsigned long long)candidate_failures);
 }
 uint64_t build(void* p,const Request& q){
     return construct(p,q,

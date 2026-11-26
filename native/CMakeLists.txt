@@ -300,3 +300,7 @@ add_test(NAME native-shader-slots COMMAND native-shader-slots-test)
 
 add_executable(tiling-layout-contract-test gfx/tests/tiling_layout_contract_test.cpp gfx/tiling.cpp)
 add_test(NAME tiling-layout-contract COMMAND tiling-layout-contract-test)
+
+add_executable(native-small-surface-layout-test tests/native_small_surface_layout_test.cpp)
+target_include_directories(native-small-surface-layout-test PRIVATE gfx)
+add_test(NAME native-small-surface-layout COMMAND native-small-surface-layout-test)
