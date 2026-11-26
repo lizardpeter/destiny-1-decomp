@@ -1095,13 +1095,27 @@ D1_SYSV void h_swap(uint64_t a, uint64_t b) {
 }
 namespace texture_constructor {
 using namespace ng::texture_ctor;
+using LayoutFn=D1_SYSV uint32_t(*)(LayoutOutput*,const LayoutInput*);
+using FootprintFn=D1_SYSV uint32_t(*)(uint64_t*,uint32_t*,void*);
+FootprintFn original_footprint;
+uint32_t calculate_layout(LayoutOutput& out,const LayoutInput& in){
+    return reinterpret_cast<LayoutFn>(nr::g_base+0xF85CB0)(&out,&in);
+}
+D1_SYSV uint32_t calculate_footprint(uint64_t* bytes,uint32_t* alignment,void* descriptor){
+    if(!bytes||!alignment||!descriptor)return invalid;
+    LayoutInput seed{};
+    using PrepareFn=D1_SYSV uint32_t(*)(LayoutInput*,void*,uint32_t,uint32_t);
+    const auto status=reinterpret_cast<PrepareFn>(nr::g_base+0xF896C0)(&seed,descriptor,0,0);
+    // The original ignores this return. Keep its path for unsuccessful
+    // preparation rather than interpreting an incomplete layout seed.
+    if(status)return original_footprint(bytes,alignment,descriptor);
+    uint32_t words[8];
+    std::memcpy(words,descriptor,sizeof words);
+    return footprint(*bytes,*alignment,words,seed,calculate_layout);
+}
 uint64_t build(void* p,const Request& q){
-    using LayoutFn=D1_SYSV uint32_t(*)(LayoutOutput*,const LayoutInput*);
-    using FootprintFn=D1_SYSV uint32_t(*)(uint64_t*,uint32_t*,void*);
     return construct(p,q,
-        [](LayoutOutput& out,const LayoutInput& in){
-            return reinterpret_cast<LayoutFn>(nr::g_base+0xF85CB0)(&out,&in);
-        },
+        calculate_layout,
         [](uint64_t& bytes,uint32_t& alignment,void* descriptor){
             return reinterpret_cast<FootprintFn>(nr::g_base+0xF89BD0)(&bytes,&alignment,descriptor);
         });
@@ -1242,6 +1256,7 @@ bool install() {
     ok &= hook(0x7D37B0, &h_swap, o_swap, "resource_move_commit");
     ok &= hook(0x7D4480, &h_mips, o_mips, "texture_mips");
     if(native_bind_enabled()){
+        ok &= hook(0xF89BD0,&texture_constructor::calculate_footprint,texture_constructor::original_footprint,"texture_footprint");
         ok &= replace_eboot_function(0xF83530,reinterpret_cast<const void*>(&texture_constructor::build_2d));
         ok &= replace_eboot_function(0xF83AB0,reinterpret_cast<const void*>(&texture_constructor::build_3d));
         ok &= replace_eboot_function(0x7DAA60,reinterpret_cast<const void*>(&h_blit_init));

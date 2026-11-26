@@ -49,5 +49,24 @@ int main(){
     check(!construct(words,q,[](auto& o,const auto&){o.words[0]=64;return 0;},[](auto&,auto&,void*){return 1;}));
     check(words[2]==(63u|(63u<<14)));
     check(packed_result(0x100000000ull,256)==(256ull<<32));
+    Request cube{64,64,3,7,0,14,0,1,false};
+    uint32_t cw[8]{};
+    encode(cw,cube,128,14);
+    auto seed=input(cube);
+    uint64_t size=0;uint32_t align=0,count=0;
+    check(!footprint(size,align,cw,seed,[&](LayoutOutput& o,const LayoutInput& i){
+        check(i.mip==count&&i.width==(64u>>count)&&i.height==i.width&&i.depth==1);
+        check(i.base_pitch==(count?128u:0u));
+        ++count;o.words[4]=100;o.words[7]=count*256;return 0u;
+    }));
+    // Four encoded cube groups, six faces each, rounded to 32.
+    check(count==7&&size==7*100*32&&align==7*256);
+    count=0;
+    check(footprint(size,align,cw,seed,[&](LayoutOutput& o,const LayoutInput&){
+        if(count++==2)return 42u;
+        o.words[4]=100;o.words[7]=256;return 0u;
+    })==42&&size==2*100*32&&align==256);
+    seed.depth=2;
+    check(footprint(size,align,cw,seed,[](auto&,const auto&){std::abort();return 0u;})==invalid);
     std::printf("native texture constructor: %llu cases passed\n",(unsigned long long)cases);
 }

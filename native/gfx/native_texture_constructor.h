@@ -74,4 +74,35 @@ uint64_t construct(void* descriptor,const Request& q,Layout layout,Footprint foo
     if(footprint(bytes,alignment,descriptor)!=0)return 0;
     return packed_result(bytes,alignment);
 }
+// F89BD0: sum each mip's slice footprint and retain the largest alignment.
+// The seed is produced by the original F896C0 descriptor-to-layout leaf.
+constexpr uint32_t invalid=0x80d30000u;
+template<class Layout>
+uint32_t footprint(uint64_t& bytes,uint32_t& alignment,const uint32_t* w,
+                   const LayoutInput& seed,Layout layout){
+    bytes=0;alignment=1;
+    const uint32_t kind=w[3]>>28;
+    const uint32_t levels=(kind==14||kind==15)?1:((w[3]>>16)&15)+1;
+    uint64_t layers=(w[4]&0x1fff)+1;
+    if(kind==11)layers*=6;
+    else if(kind==10)layers=1;
+    if(seed.flags&0x1000)layers=next_pow2(uint32_t(layers));
+    for(uint32_t level=0;level<levels;++level){
+        auto in=seed;
+        in.width=std::max(1u,seed.width>>level);
+        in.height=std::max(1u,seed.height>>level);
+        in.depth=std::max(1u,seed.depth>>level);
+        in.base_pitch=level?((w[4]>>13)&0x3fff)+1:0;
+        in.mip=level;
+        if(in.depth!=1&&!(in.flags&0x20))return invalid;
+        LayoutOutput out{};
+        const uint32_t status=layout(out,in);
+        if(status)return status;
+        const uint64_t slice=uint64_t(out.words[4])|(uint64_t(out.words[5])<<32);
+        bytes+=slice*layers;
+        alignment=std::max(alignment,out.words[7]);
+        if(in.width==1&&in.height==1&&in.depth==1)break;
+    }
+    return 0;
+}
 } // namespace d1::ng::texture_ctor
