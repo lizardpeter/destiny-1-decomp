@@ -1,0 +1,74 @@
+#pragma once
+#include <cstdint>
+#include "native_asset_region.h"
+
+namespace d1::asset_suballocation {
+// Global region entry 0x70 bytes. These are the fields of the original
+// allocator, not a new independent allocator or a second set of cursors.
+struct State {
+    uint64_t base=0, low_backed=0, high_backed=0, capacity=0;
+    uint64_t committed=0, low_used=0, high_used=0;
+};
+enum class Path { fallback, ready, grow_low };
+struct Allocation {
+    Path path=Path::fallback;
+    uint64_t address=0, low_backed=0, high_backed=0, used=0, growth=0;
+};
+constexpr bool valid(const State& s) {
+    return s.base&&s.base<asset_region::address_limit&&s.capacity<=asset_region::address_limit-s.base&&
+        s.committed<=s.capacity&&s.low_backed<=s.capacity&&s.high_backed<=s.capacity-s.low_backed&&
+        s.low_backed+s.high_backed==s.committed&&
+        s.low_used<=s.low_backed&&s.high_used<=s.high_backed;
+}
+constexpr Allocation allocate(const State& s,uint64_t bytes,bool top,bool growable) {
+    if(!valid(s)||!bytes)return {};
+    if(!growable) {
+        if(s.high_used>s.committed-s.low_used||bytes>s.committed-s.low_used-s.high_used)return {};
+        return {Path::ready,top?s.base+s.committed-s.high_used-bytes:s.base+s.low_used,
+            s.low_backed,s.high_backed,(top?s.high_used:s.low_used)+bytes,0};
+    }
+    if(top) {
+        // GPU region top growth has a separate padding ledger at +0x50.
+        // Existing backed space needs none of that machinery.
+        if(bytes>s.high_backed-s.high_used)return {};
+        return {Path::ready,s.base+s.capacity-s.high_used-bytes,
+            s.low_backed,s.high_backed,s.high_used+bytes,0};
+    }
+    if(bytes>s.capacity-s.low_used-s.high_used)return {};
+    const uint64_t end=s.low_used+bytes;
+    if(end<=s.low_backed)
+        return {Path::ready,s.base+s.low_used,s.low_backed,s.high_backed,end,0};
+    const uint64_t missing=end-s.low_backed;
+    if(s.committed==s.capacity) {
+        // The original may move the logical split when all pages are backed.
+        return {Path::ready,s.base+s.low_used,end,s.capacity-end,end,0};
+    }
+    // 0xB2E4B: round growth to 64 KiB, capped at the uncommitted gap.
+    const uint64_t gap=s.capacity-s.committed;
+    const uint64_t rounded=(missing+asset_region::alignment-1)&~(asset_region::alignment-1);
+    const uint64_t growth=rounded<gap?rounded:gap;
+    if(!growth||(growth&(asset_region::alignment-1)))return {};
+    // If another iteration / split would be needed, retain the original
+    // slow path before mutating any state.
+    if(growth<missing)return {};
+    return {Path::grow_low,s.base+s.low_used,s.low_backed+growth,s.high_backed,end,growth};
+}
+struct Release { bool handled=false, success=false, dirty=false; uint64_t used=0; };
+constexpr Release release(const State& s,uint64_t address,uint64_t bytes,bool top,
+                          bool growable,bool relaxed_low,bool top_active) {
+    if(!valid(s)||!bytes)return {};
+    if(!top) {
+        if(bytes>s.low_used)return {};
+        const uint64_t used=s.low_used-bytes;
+        if(!relaxed_low&&address!=s.base+used)return {true,false,false,s.low_used};
+        return {true,true,false,used};
+    }
+    // With the top-active flag clear the original walks the container list
+    // and derives the new cursor from live descriptors. Do not fake it.
+    if(!top_active)return {};
+    const uint64_t end=s.base+(growable?s.capacity:s.committed);
+    if(address!=end-s.high_used)return {true,true,true,s.high_used};
+    if(bytes>s.high_used)return {};
+    return {true,true,false,s.high_used-bytes};
+}
+} // namespace d1::asset_suballocation

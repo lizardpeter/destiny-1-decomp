@@ -269,3 +269,7 @@ set_tests_properties(native-cbm-pool PROPERTIES TIMEOUT 60)
 add_executable(native-asset-region-test tests/native_asset_region_test.cpp)
 target_include_directories(native-asset-region-test PRIVATE src)
 add_test(NAME native-asset-region COMMAND native-asset-region-test)
+
+add_executable(native-asset-suballocation-test tests/native_asset_suballocation_test.cpp)
+target_include_directories(native-asset-suballocation-test PRIVATE src)
+add_test(NAME native-asset-suballocation COMMAND native-asset-suballocation-test)

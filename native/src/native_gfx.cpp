@@ -34,6 +34,7 @@
 #include "frame_telemetry.h"
 #include "host_memory.h"
 #include "native_asset_region.h"
+#include "native_asset_suballocation.h"
 #include "native_record_registry.h"
 #include "../gfx/native_record_fifo.h"
 #include "../gfx/native_cbm_contract.h"
@@ -571,11 +572,64 @@ D1_SYSV uint64_t commit(uint64_t region,uint64_t bytes,uint8_t top){
     store(region,top?8:0,p.next_cursor);
     return p.address;
 }
+// The original global GPU region is index 2. Its outer callers still own
+// the cortex allocator lock and container list. Mirror the existing fields
+// rather than inventing a competing handle or independent free-list domain.
+using AllocFn=D1_SYSV uint64_t(*)(uint64_t,uint32_t,uint8_t,int32_t);
+using FreeFn=D1_SYSV bool(*)(uint64_t,uint64_t,uint32_t,uint8_t,int32_t);
+AllocFn original_alloc;
+FreeFn original_free;
+uint64_t gpu_region(){return nr::g_base+0x1AF9D68+2*0x70;}
+asset_suballocation::State state(uint64_t r){
+    return {field<uint64_t>(r,0),field<uint64_t>(r,8),field<uint64_t>(r,0x10),
+        field<uint64_t>(r,0x18),field<uint64_t>(r,0x38),
+        field<uint64_t>(r,0x40),field<uint64_t>(r,0x48)};
+}
+void account(uint32_t tag,uint64_t bytes,bool add){
+    const uint64_t counter=nr::g_base+0x1AF9FA0+uint64_t(tag)*8;
+    const uint64_t old=field<uint64_t>(counter,0);
+    store(counter,0,add?old+bytes:old-bytes);
+}
+D1_SYSV uint64_t allocate(uint64_t bytes,uint32_t tag,uint8_t top,int32_t index){
+    if(index!=2)return original_alloc(bytes,tag,top,index);
+    const uint64_t r=gpu_region();
+    const auto s=state(r);
+    const bool growable=nr::eb<uint8_t>(0x1AF9CE8)!=0;
+    const auto a=asset_suballocation::allocate(s,bytes,top!=0,growable);
+    if(a.path==asset_suballocation::Path::fallback)return original_alloc(bytes,tag,top,index);
+    if(a.path==asset_suballocation::Path::grow_low){
+        if(!commit(r+8,a.growth,0))return 0;
+        store(r,0x38,s.committed+a.growth);
+    }
+    store(r,8,a.low_backed);store(r,0x10,a.high_backed);
+    store(r,top?0x48:0x40,a.used);
+    if(top)store(r,0x58,uint8_t(1));
+    account(tag,bytes,true);
+    return a.address;
+}
+D1_SYSV bool release(uint64_t address,uint64_t bytes,uint32_t tag,uint8_t top,int32_t index){
+    if(index!=2)return original_free(address,bytes,tag,top,index);
+    const uint64_t r=gpu_region();
+    const auto a=asset_suballocation::release(state(r),address,bytes,top!=0,
+        nr::eb<uint8_t>(0x1AF9CE8)!=0,nr::eb<uint8_t>(0x1AFA150)==1,
+        field<uint8_t>(r,0x58)!=0);
+    if(!a.handled)return original_free(address,bytes,tag,top,index);
+    if(!a.success)return false;
+    if(a.dirty)store(r,0x59,uint8_t(1));
+    else store(r,top?0x48:0x40,a.used);
+    account(tag,bytes,false);
+    return true;
+}
 bool install(){
     const char* v=std::getenv("D1_PC_NATIVE_ASSET_BACKING");
     if(v&&std::atoi(v)==0)return true;
     bool ok=hook(0xB4780,&reserve,original_reserve,"asset_region_reserve");
     ok&=hook(0xB4630,&commit,original_commit,"asset_region_commit");
+    const char* sub=std::getenv("D1_PC_NATIVE_ASSET_SUBALLOC");
+    if(!sub||std::atoi(sub)!=0){
+        ok&=hook(0xB2BD0,&allocate,original_alloc,"asset_region_suballocate");
+        ok&=hook(0xB2F40,&release,original_free,"asset_region_release");
+    }
     return ok;
 }
 } // namespace asset_backing
@@ -986,9 +1040,8 @@ D1_SYSV void h_register(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t
 bool install() {
     bool ok = true;
     nr::resreg::init();
-    // The prologue consists of relocatable register pushes; preserve the
-    // original free body and its callbacks. Failure leaves the old registry
-    // behavior rather than disabling otherwise valid resource notifications.
+    // Preserve the original free body and its callbacks. The default
+    // native resource path requires this lifetime boundary.
     ok &= hook(0x6FBC0,&h_pool_free,o_pool_free,"resource_pool_destroy");
     ok &= hook(0xCFCC0, &h_register, o_register, "resource_callbacks_register");
     if (!replace_eboot_function(0x818FA0, reinterpret_cast<const void*>(&h_unlock))) ok = false, log("nd: replacing texture_unlock failed");
