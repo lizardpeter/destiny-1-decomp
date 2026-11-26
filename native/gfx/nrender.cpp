@@ -37,6 +37,7 @@
 #include "formats.h"
 #include "tiling.h"
 #include "translate.h"
+#include "query_reduce.h"
 #include "vk/vk.h"
 
 namespace d1 {
@@ -989,11 +990,21 @@ struct Renderer {
     // occlusion queries and predication (GCN ZPASS_DONE / SET_PREDICATION)
     static constexpr uint32_t kQueries = 2048, kPredSlots = 4096;
     Buffer pred_buf;             // 32-bit predicates for conditional rendering, one slot per query address
-    std::unordered_map<uint64_t, uint32_t> pred_slots;
+    struct PredSlot { uint32_t slot; uint64_t mapping; };
+    std::unordered_map<uint64_t, PredSlot> pred_slots;
+    Buffer pred_scratch;
+    VkDescriptorSetLayout pred_set_layout = VK_NULL_HANDLE;
+    VkDescriptorPool pred_pool = VK_NULL_HANDLE;
+    VkDescriptorSet pred_set = VK_NULL_HANDLE;
+    VkPipelineLayout pred_layout = VK_NULL_HANDLE;
+    VkPipeline pred_reduce = VK_NULL_HANDLE;
+    bool pred_reduce_failed = false;
+    bool init_pred_reduce();
+    bool write_predicate(uint32_t slot, uint32_t first, uint32_t end);
     uint64_t zcount_base = 0;    // occlusion counter value before the oldest unwritten submission
     void q_begin();
     void q_end();
-    uint32_t pred_slot(uint64_t base);
+    uint32_t pred_slot(uint64_t base, uint64_t mapping);
     void zpass(uint64_t dest);
     void predicate(uint64_t base, bool draw_if_visible);
     void store_query_predicates();
@@ -5333,23 +5344,118 @@ void Renderer::zpass(uint64_t dest) {
     ++st.zpass_dumps;
 }
 
-uint32_t Renderer::pred_slot(uint64_t base) {
+uint32_t Renderer::pred_slot(uint64_t base, uint64_t mapping) {
     auto it = pred_slots.find(base);
-    if (it != pred_slots.end()) return it->second;
+    if (it != pred_slots.end()) {
+        it->second.mapping = mapping;
+        return it->second.slot;
+    }
     if (pred_slots.size() >= kPredSlots) pred_slots.clear();  // (reused from the start)
     const uint32_t slot = uint32_t(pred_slots.size());
-    pred_slots[base] = slot;
+    pred_slots[base] = {slot, mapping};
     return slot;
 }
 
+bool Renderer::init_pred_reduce() {
+    if (pred_reduce) return true;
+    if (pred_reduce_failed) return false;
+    pred_reduce_failed = true;
+    auto fail = [&]() {
+        if (pred_pool) vkDestroyDescriptorPool(ctx.device, pred_pool, nullptr);
+        if (pred_layout) vkDestroyPipelineLayout(ctx.device, pred_layout, nullptr);
+        if (pred_set_layout) vkDestroyDescriptorSetLayout(ctx.device, pred_set_layout, nullptr);
+        pred_pool = VK_NULL_HANDLE;
+        pred_layout = VK_NULL_HANDLE;
+        pred_set_layout = VK_NULL_HANDLE;
+        pred_set = VK_NULL_HANDLE;
+        if (pred_scratch.buf) free_buffer(pred_scratch);
+        log("native renderer: occlusion reduction initialization failed; multi-pass predicate unavailable");
+        return false;
+    };
+    pred_scratch = make_buffer(uint64_t(kQueries) * 8,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+    if (!pred_scratch.buf) return fail();
+    VkDescriptorSetLayoutBinding bindings[2] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+    };
+    VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    sl.bindingCount = 2; sl.pBindings = bindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &sl, nullptr, &pred_set_layout) != VK_SUCCESS) return fail();
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount = 1; pl.pSetLayouts = &pred_set_layout;
+    pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(ctx.device, &pl, nullptr, &pred_layout) != VK_SUCCESS) return fail();
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = 1; pool.poolSizeCount = 1; pool.pPoolSizes = &size;
+    if (vkCreateDescriptorPool(ctx.device, &pool, nullptr, &pred_pool) != VK_SUCCESS) return fail();
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = pred_pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &pred_set_layout;
+    if (vkAllocateDescriptorSets(ctx.device, &ai, &pred_set) != VK_SUCCESS) return fail();
+    const VkDescriptorBufferInfo infos[2] = {
+        {pred_scratch.buf, 0, pred_scratch.size}, {pred_buf.buf, 0, pred_buf.size}
+    };
+    VkWriteDescriptorSet writes[2]{};
+    for (uint32_t i = 0; i < 2; ++i) {
+        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[i].dstSet = pred_set; writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1; writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &infos[i];
+    }
+    vkUpdateDescriptorSets(ctx.device, 2, writes, 0, nullptr);
+    const auto code = query_reduce_shader();
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = code.size() * sizeof(uint32_t); mi.pCode = code.data();
+    VkShaderModule shader = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(ctx.device, &mi, nullptr, &shader) != VK_SUCCESS) return fail();
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = shader; ci.stage.pName = "main";
+    ci.layout = pred_layout;
+    const VkResult result = vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pred_reduce);
+    vkDestroyShaderModule(ctx.device, shader, nullptr);
+    if (result != VK_SUCCESS) {
+        if (pred_reduce) vkDestroyPipeline(ctx.device, pred_reduce, nullptr);
+        pred_reduce = VK_NULL_HANDLE;
+        return fail();
+    }
+    pred_reduce_failed = false;
+    return true;
+}
+
+bool Renderer::write_predicate(uint32_t slot, uint32_t first, uint32_t end) {
+    Sub& sb = subs[rc().cur];
+    if (first > end || end > sb.q_used) return false;
+    if (first == end) {
+        vkCmdFillBuffer(rc().cmd, pred_buf.buf, uint64_t(slot) * 4, 4, 0);
+    } else {
+        if (!sb.qpool || !init_pred_reduce()) return false;
+        // Order scratch reuse and any preceding conditional reads. All work
+        // remains on the Vulkan queue; the CPU never waits for query values.
+        barrier();
+        vkCmdCopyQueryPoolResults(rc().cmd, sb.qpool, first, end - first,
+            pred_scratch.buf, 0, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        barrier();
+        const uint32_t constants[2] = {end - first, slot};
+        vkCmdBindPipeline(rc().cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pred_reduce);
+        vkCmdBindDescriptorSets(rc().cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pred_layout, 0, 1, &pred_set, 0, nullptr);
+        vkCmdPushConstants(rc().cmd, pred_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof constants, constants);
+        vkCmdDispatch(rc().cmd, 1, 1, 1);
+    }
+    barrier();
+    return true;
+}
+
 // Copies the predicate for the query at `base` (begin and end dumped in this submission) into
-// its slot: the one query between the two dumps, 0 when no draw ran between them, and
-// "visible" when the stretch spans several queries (render pass changes).
+// its slot: zero when no draws ran, otherwise the OR of actual 64-bit query counts.
 static bool query_span(const std::vector<Sub::ZRec>& zr, uint64_t base, uint32_t& b0, uint32_t& b1) {
     for (size_t i = zr.size(); i-- > 0;)
         if (zr[i].dest == base + 8) {
             for (size_t j = i; j-- > 0;)
-                if (zr[j].dest == base) {
+                if (zr[j].dest == base && zr[j].mapping == zr[i].mapping && zr[j].mapping) {
                     b0 = zr[j].boundary, b1 = zr[i].boundary;
                     return true;
                 }
@@ -5362,22 +5468,23 @@ void Renderer::predicate(uint64_t base, bool draw_if_visible) {
     rc().pred_cur = -1;
     if (!ctx.conditional_rendering) return;
     if (!pred_buf.buf) {
-        pred_buf = make_buffer(kPredSlots * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT, false);
+        pred_buf = make_buffer(kPredSlots * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
         if (!pred_buf.buf) return;
     }
     Sub& sb = subs[rc().cur];
     uint32_t b0 = 0, b1 = 0;
+    const uint64_t mapping = guest_mapping_identity(base, 8 * 16);
+    if (!mapping) return;
     if (rc().q_on && query_span(sb.zrecs, base, b0, b1)) {
-        const uint32_t slot = pred_slot(base);
-        end_pass();  // (copies run outside render passes; the next draw starts a new one)
-        if (b1 - b0 == 1)
-            vkCmdCopyQueryPoolResults(rc().cmd, sb.qpool, b0, 1, pred_buf.buf, uint64_t(slot) * 4, 4, VK_QUERY_RESULT_WAIT_BIT);
-        else
-            vkCmdFillBuffer(rc().cmd, pred_buf.buf, uint64_t(slot) * 4, 4, b1 == b0 ? 0u : 1u);
-        barrier();
+        const uint32_t slot = pred_slot(base, mapping);
+        end_pass();  // (copies and compute run outside rendering)
+        if (!write_predicate(slot, b0, b1)) {
+            pred_slots.erase(base);
+            return;
+        }
         rc().pred_cur = int32_t(slot);
-    } else if (auto it = pred_slots.find(base); it != pred_slots.end()) {
-        rc().pred_cur = int32_t(it->second);  // from an earlier submission (store_query_predicates)
+    } else if (auto it = pred_slots.find(base); it != pred_slots.end() && it->second.mapping == mapping) {
+        rc().pred_cur = int32_t(it->second.slot);  // from an earlier submission
     } else {
         return;  // never counted: draw
     }
@@ -5392,21 +5499,17 @@ void Renderer::store_query_predicates() {
     if (!ctx.conditional_rendering) return;
     Sub& sb = subs[rc().cur];
     if (!pred_buf.buf)
-        pred_buf = make_buffer(kPredSlots * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT, false);
+        pred_buf = make_buffer(kPredSlots * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
     if (!pred_buf.buf) return;
-    bool any = false;
+    std::unordered_set<uint64_t> stored;
     for (const auto& z : sb.zrecs) {
-        if ((z.dest & 15) != 0) continue;  // begins
+        if ((z.dest & 15) != 0 || !stored.insert(z.dest).second) continue;
         uint32_t b0, b1;
-        if (!query_span(sb.zrecs, z.dest, b0, b1)) continue;
-        const uint32_t slot = pred_slot(z.dest);
-        if (b1 - b0 == 1)
-            vkCmdCopyQueryPoolResults(rc().cmd, sb.qpool, b0, 1, pred_buf.buf, uint64_t(slot) * 4, 4, VK_QUERY_RESULT_WAIT_BIT);
-        else
-            vkCmdFillBuffer(rc().cmd, pred_buf.buf, uint64_t(slot) * 4, 4, b1 == b0 ? 0u : 1u);
-        any = true;
+        const uint64_t mapping = guest_mapping_identity(z.dest, 8 * 16);
+        if (!mapping || mapping != z.mapping || !query_span(sb.zrecs, z.dest, b0, b1)) continue;
+        const uint32_t slot = pred_slot(z.dest, mapping);
+        if (!write_predicate(slot, b0, b1)) pred_slots.erase(z.dest);
     }
-    if (any) barrier();
 }
 
 // When the submission is done: every dump's counter into guest memory (DB 0 carries the count,
