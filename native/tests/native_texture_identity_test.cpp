@@ -1,4 +1,5 @@
 #include "native_texture_identity.h"
+#include "native_texture_leases.h"
 #include <cstdlib>
 #include <cstdio>
 using namespace d1::ng;
@@ -32,5 +33,18 @@ int main(){
         check(texture_identity_words(high)==texture_identity_words(view));
         check(texture_source_layout_equal(high,view));
     }
+    TextureLeaseRegistry registry;
+    {
+        TextureLeaseSet a(registry);
+        {auto guard=registry.capture();for(unsigned i=0;i<1000;++i)a.pin(7);a.pin(8);}
+        {
+            TextureLeaseSet b(registry);
+            {auto guard=registry.capture();b.pin(7);b.pin(9);}
+            auto guard=registry.retire();
+            check(registry.pinned(7)&&registry.pinned(8)&&registry.pinned(9));
+        }
+        check(registry.pinned(7)&&registry.pinned(8)&&!registry.pinned(9));
+    }
+    check(!registry.pinned(7)&&!registry.pinned(8));
     std::puts("split descriptor identity and independent source layout checks passed");
 }

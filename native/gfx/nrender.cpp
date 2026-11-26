@@ -16,6 +16,7 @@
 #include "native_resource_identity.h"
 #include "native_descriptor_slots.h"
 #include "native_texture_identity.h"
+#include "native_texture_leases.h"
 #include "native_epoch_cohort.h"
 #include "native_shader_slots.h"
 #include "../src/native_ranges.h"
@@ -360,8 +361,7 @@ struct Image {
     // A relocation with verified identical bytes can reuse the GPU image
     // without discarding the immediately preceding captured descriptors.
     struct Alias {uint64_t epoch=0;uint32_t words[8]{};};
-    std::array<Alias,4> aliases{};
-    unsigned alias_next=0;
+    std::vector<Alias> aliases;
     bool matches_epoch(const uint32_t* t,uint64_t res)const{
         if(stale||!res)return false;
         auto matches=[&](const uint32_t* p){
@@ -379,8 +379,18 @@ struct Image {
     }
     void remember_relocation(){
         if(!res_val||!descriptor_epoch[0]||low_size||hi_size)return;
-        auto& a=aliases[alias_next++%aliases.size()];
-        a.epoch=res_val;std::memcpy(a.words,resident_descriptor[0],32);
+        auto gate=texture_leases().retire();
+        // Keep every alias still referenced by an unconsumed list. Retain
+        // a small recent working set for otherwise unpinned relocations.
+        if(aliases.size()>=4)
+            std::erase_if(aliases,[](const Alias& a){return !texture_leases().pinned(a.epoch);});
+        Alias a{};a.epoch=res_val;std::memcpy(a.words,resident_descriptor[0],32);
+        aliases.push_back(a);
+    }
+    bool captured() const {
+        if(texture_leases().pinned(res_val))return true;
+        for(const auto& a:aliases)if(texture_leases().pinned(a.epoch))return true;
+        return false;
     }
 };
 
@@ -2538,7 +2548,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         // the same-address streamed-mip shortcut silently reuse the dirty bytes.
         prev->low_loaded = prev->hi_loaded = false;
         prev->descriptor_epoch[0]=prev->descriptor_epoch[1]=0;
-        prev->aliases={};prev->alias_next=0;
+        prev->aliases.clear();
         textures.erase(it), found = false; ++views_gen;
         ++st.tex_reloads;
     }
@@ -2628,7 +2638,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     if (prev && prev->format == f && prev->w == full_w && prev->h == full_h && prev->d == full_d &&
         prev->layers == layers && prev->levels == full_levels && prev->cube == cube && prev->is3d == is3d) {
         img = std::move(prev);
-        img->aliases={};img->alias_next=0;
+        img->aliases.clear();
         img->torn = 0;
         ++st.tex_inplace;
     } else {
@@ -3356,14 +3366,20 @@ Image* Renderer::historical_texture(uint64_t key,const uint32_t* t,uint64_t res)
 void Renderer::archive_texture(uint64_t key,std::unique_ptr<Image> img){
     if(!img)return;
     constexpr uint64_t budget=256ull<<20;
-    if(img->stale||!img->res_val||img->mem.size>budget){
+    if(img->stale||!img->res_val){
         bury(std::move(img));return;
     }
     auto& list=texture_history[key];
-    if(list.size()>=3){
-        texture_history_bytes-=list.front()->mem.size;
-        bury(std::move(list.front()));list.erase(list.begin());
-        ++texture_history_drops;
+    {
+        auto gate=texture_leases().retire();
+        if(list.size()>=3){
+            auto it=std::find_if(list.begin(),list.end(),[](const auto& old){return !old->captured();});
+            if(it!=list.end()){
+                texture_history_bytes-=(*it)->mem.size;
+                bury(std::move(*it));list.erase(it);
+                ++texture_history_drops;++views_gen;
+            }
+        }
     }
     texture_history_bytes+=img->mem.size;
     img->last_frame=st.frames;
@@ -3372,10 +3388,11 @@ void Renderer::archive_texture(uint64_t key,std::unique_ptr<Image> img){
 }
 void Renderer::trim_texture_history(bool all){
     constexpr uint64_t budget=256ull<<20;
+    auto gate=texture_leases().retire();
     for(auto it=texture_history.begin();it!=texture_history.end();){
         auto& list=it->second;
         for(auto p=list.begin();p!=list.end();){
-            if(all||(*p)->last_frame+120<st.frames||texture_history_bytes>budget){
+            if(all||(!(*p)->captured()&&((*p)->last_frame+120<st.frames||texture_history_bytes>budget))){
                 texture_history_bytes-=(*p)->mem.size;
                 bury(std::move(*p));p=list.erase(p);
                 ++texture_history_drops;++views_gen;
@@ -3391,12 +3408,13 @@ void Renderer::evict_textures() {
     // their handle in the engine's resource registry still resolves to them.
     const uint64_t horizon = 1800, now = st.frames;
     if (now < horizon) return;
+    auto gate=texture_leases().retire();
     std::vector<uint64_t> drop;
     for (auto& [k, img] : textures) {
         if (!img) continue;
         const bool still_registered = img->res_val && img->res_obj && opt.res_current &&
                                       (opt.res_current(img->res_obj) >> 32) == (img->res_val >> 32);
-        if (!still_registered && img->last_frame + horizon < now) drop.push_back(k);
+        if (!still_registered && img->last_frame + horizon < now && !img->captured()) drop.push_back(k);
     }
     for (uint64_t k : drop) {
         auto it = textures.find(k);

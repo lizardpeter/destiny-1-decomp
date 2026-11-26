@@ -45,6 +45,7 @@
 #include "native_submission.h"
 #include "../gfx/native_close_contract.h"
 #include "../gfx/native_resource_identity.h"
+#include "../gfx/native_texture_leases.h"
 #include "../gfx/native_resource_binding.h"
 #include "../gfx/native_blit_queue.h"
 #include "runtime.h"
@@ -95,6 +96,7 @@ SetVertexBufferFn o_set_vertex_buffer;
 AllocConstantsFn o_alloc_constants;
 
 bool nd_push(uint64_t dev, ng::Draw* d);
+ng::TextureLeaseSet* nd_texture_leases(uint64_t dev);
 
 namespace nr {
 
@@ -325,14 +327,24 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
         }
     }
     d->vb_sig = vbsig;
+    {
+    auto gate=ng::texture_leases().capture();
+    auto* leases=nd_texture_leases(dev);
     for (int s = 0; s < 2; ++s) {
         const uint32_t gnm = s ? 1 : 2;
         for (int i = 0; i < 16; ++i) {
             if (const uint64_t t = field<uint64_t>(dev, 0x1E78 + gnm * 0x80 + i * 8); t >= 0x10000) {
+                const auto before=resreg::g_on?resreg::get(t):0;
                 std::memcpy(d->tex[s][i], reinterpret_cast<const void*>(t), 32);
-                d->tex_mask[s] |= uint16_t(1u << i);
-                d->tex_res[s][i] = resreg::g_on ? resreg::get(t) : 0;
-                d->tex_obj[s][i] = t;
+                const auto after=resreg::g_on?resreg::get(t):0;
+                // Do not relabel captured words with a different generation.
+                // A concurrent transition must not turn into an unregistered read.
+                if(before==after){
+                    d->tex_mask[s] |= uint16_t(1u << i);
+                    d->tex_res[s][i]=after;
+                    d->tex_obj[s][i]=t;
+                    if(leases)leases->pin(after);
+                }
             }
             if (const uint64_t p = field<uint64_t>(dev, (s ? 0x2278 : 0x22F8) + i * 8); p >= 0x10000) {
                 std::memcpy(d->smp[s][i], reinterpret_cast<const void*>(p), 16);
@@ -340,6 +352,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
             }
             d->cb[s][i] = cs ? cs->cb[s][i] : ds->cb[s][i];
         }
+    }
     }
     d->clip = field<uint32_t>(dev, 0x25D0);
     d->su_sc_mode = field<uint32_t>(dev, 0x25D4);
@@ -1384,6 +1397,7 @@ struct Item {
 };
 struct List {
     uint64_t dev = 0;
+    ng::TextureLeaseSet texture_versions;
     std::vector<Item> items;
     std::vector<uint8_t*> chunks;
     size_t used = 0;
@@ -2152,6 +2166,12 @@ bool install() {
     return ok;
 }
 }  // namespace nd
+
+ng::TextureLeaseSet* nd_texture_leases(uint64_t dev){
+    if(!nd::g_on)return nullptr;
+    auto* list=nd::list_of(nd::ctx_of_dev(dev));
+    return list?&list->texture_versions:nullptr;
+}
 
 bool nd_push(uint64_t dev, ng::Draw* d) {
     if (!nd::g_on) return false;
