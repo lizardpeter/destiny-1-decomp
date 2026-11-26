@@ -760,7 +760,11 @@ bool native_bind_enabled() {
     }();
     return enabled;
 }
-bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint) {
+// The retail high-mip bind at CBAA4 is followed immediately by E01E0.
+// Keep the publication gate across that pair, not across unrelated calls.
+thread_local decltype(ng::texture_leases().retire()) pending_mip_bind;
+bool mip_pair_hooked=false;
+bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint,bool paired=false) {
     // Publish descriptor writes and their native version as a single
     // transaction relative to command-list capture. Other resource types
     // have their own binding contracts.
@@ -778,18 +782,22 @@ bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint) {
             if(nr::resreg::tracked_type(type)&&obj) {
                 // Publish once from the already resolved object. Geometry
                 // creation takes a native byte range directly from this event.
-                nr::resreg::touch(obj,true,handle);
-                nr::resreg::prefetch(type,obj);
+                if(paired&&texture_transaction.owns_lock())pending_mip_bind=std::move(texture_transaction);
+                else {nr::resreg::touch(obj,true,handle);nr::resreg::prefetch(type,obj);}
             }
             return true;
         }
     }
     const bool ok=(repoint?o_rebind:o_bind)(type,handle,addr);
-    if(ok)nr::resreg::event(type,handle,true);
+    if(ok){
+        if(paired&&texture_transaction.owns_lock())pending_mip_bind=std::move(texture_transaction);
+        else nr::resreg::event(type,handle,true);
+    }
     return ok;
 }
 D1_SYSV bool h_bind(uint32_t type,uint32_t handle,uint64_t addr) {
-    return resource_bind(type,handle,addr,false);
+    const auto caller=uint64_t(__builtin_return_address(0));
+    return resource_bind(type,handle,addr,false,mip_pair_hooked&&caller==nr::g_base+0xCBAA7&&type>=1&&type<=3);
 }
 D1_SYSV bool h_rebind(uint32_t type,uint32_t handle,uint64_t addr) {
     return resource_bind(type,handle,addr,true);
@@ -1304,6 +1312,8 @@ struct MipBoundsScope {
 };
 D1_SYSV void h_mip_handles(uint32_t tag,uint32_t low,uint32_t high){
     MipBoundsScope bounds(low,high);o_mip_handles(tag,low,high);
+    // Malformed or unbound handle: never strand the publication gate.
+    if(pending_mip_bind.owns_lock())pending_mip_bind.unlock();
 }
 D1_SYSV void h_mip_relocation(uint32_t tag,uint32_t low,uint32_t high){
     MipBoundsScope bounds(low,high);o_mip_relocation(tag,low,high);
@@ -1313,7 +1323,24 @@ MipFn o_mips;
 D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
     // A descriptor and its two source allocations belong to one published
     // generation. Draw capture cannot observe the constructor's partial writes.
-    auto transaction=ng::texture_leases().retire();
+    auto transaction=pending_mip_bind.owns_lock()?std::move(pending_mip_bind):ng::texture_leases().retire();
+    alignas(32) uint32_t low_descriptor[8]{};
+    const uint32_t* low=nullptr;
+    const uint64_t before=nr::resreg::object_of(1,handle);
+    if(before&&low_base&&hi_base&&guest_region_extent(before)>=0x44&&field<uint8_t>(before,0x34)){
+        const auto p=ng::binding::mip_plan(reinterpret_cast<const void*>(before),low_base,0);
+        if(!p.volume&&p.levels&&p.levels<=16){
+            std::memcpy(low_descriptor,reinterpret_cast<const void*>(before),32);
+            const auto old=fmt::decode_tsharp(low_descriptor);
+            if(old.width==p.width&&old.height==p.height&&old.last_level+1==p.levels){
+                ng::binding::mip_base(low_descriptor,low_base);low=low_descriptor;
+            }else{
+                using Construct2D=D1_SYSV uint64_t(*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+                const auto bytes=reinterpret_cast<Construct2D>(nr::g_base+0xF83530)(low_descriptor,p.width,p.height,1,p.levels,p.format,p.tile,p.fragments,uint32_t(p.cube));
+                if(bytes){ng::binding::mip_base(low_descriptor,low_base);low=low_descriptor;}
+            }
+        }
+    }
     if(native_bind_enabled()) {
         const uint64_t obj=nr::resreg::object_of(1,handle);
         if(!obj)return;
@@ -1335,19 +1362,6 @@ D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
         // published by another resource event between touch and lookup.
         const uint64_t res=nr::resreg::touch(o,true,handle);
         if (res && ng::active() && nr::resreg::get(o)==res) {
-            // Construct the low descriptor into private storage with the
-            // original 01.33 constructor contract, rather than guessing its
-            // tile pitch from the full-resolution high descriptor.
-            alignas(32) uint32_t low_descriptor[8]{};
-            const uint32_t* low=nullptr;
-            if(low_base&&hi_base&&guest_region_extent(o)>=0x44&&field<uint8_t>(o,0x34)){
-                const auto p=ng::binding::mip_plan(reinterpret_cast<const void*>(o),low_base,0);
-                if(!p.volume&&p.levels){
-                    using Construct2D=D1_SYSV uint64_t(*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
-                    const auto bytes=reinterpret_cast<Construct2D>(nr::g_base+0xF83530)(low_descriptor,p.width,p.height,1,p.levels,p.format,p.tile,p.fragments,uint32_t(p.cube));
-                    if(bytes){ng::binding::mip_base(low_descriptor,low_base);low=low_descriptor;}
-                }
-            }
             ng::notify_texture_mips(reinterpret_cast<const uint32_t*>(o),res,o,low_base,hi_base,low,
                 low_base&&low_base==mip_bounds.low?mip_bounds.low_size:0,
                 hi_base&&hi_base==mip_bounds.high?mip_bounds.high_size:0);
@@ -1452,8 +1466,9 @@ bool install() {
     patch_table();
     ok &= hook(0x7D3560, &h_copy, o_copy, "resource_move_copy");
     ok &= hook(0x7D37B0, &h_swap, o_swap, "resource_move_commit");
-    ok &= hook(0x7D4480, &h_mips, o_mips, "texture_mips");
-    ok &= hook(0xE01E0,&h_mip_handles,o_mip_handles,"texture_mip_handle_bounds");
+    const bool mip_hook=hook(0x7D4480, &h_mips, o_mips, "texture_mips");
+    const bool handle_hook=hook(0xE01E0,&h_mip_handles,o_mip_handles,"texture_mip_handle_bounds");
+    mip_pair_hooked=mip_hook&&handle_hook;ok &= mip_pair_hooked;
     ok &= hook(0xE00D0,&h_mip_relocation,o_mip_relocation,"texture_mip_relocation_bounds");
     if(native_bind_enabled()){
         ok &= hook(0xF89BD0,&texture_constructor::calculate_footprint,texture_constructor::original_footprint,"texture_footprint");
