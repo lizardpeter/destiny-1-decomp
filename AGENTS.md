@@ -7,6 +7,24 @@ owns its own copy of the tools and adapts them; there is no shared toolkit. It r
 repo `lizardpeter/destiny-1`, which stays as it is; a path in a note that does not exist here refers to that
 repo.
 
+## Mandatory native-only PC architecture
+
+The project owner requires a fully native, properly optimized PC game, not a faster PS4 compatibility layer. The production target is Windows/Linux x86-64, Vulkan and host-native platform services. Original gameplay logic and the faithful decomp are preserved; original console graphics/platform implementations are migration evidence, not the desired production backend.
+
+**NO LEGACY FALLBACK.** New or completed native subsystems must have exactly one production implementation. Do not add environment switches that restore retail Gnm/Gnmx, console command buffers, PS4 graphics pools, old file/platform providers, or other replaced infrastructure. Remove obsolete fallback branches as their replacements become complete. If a required contract remains unreconstructed, identify it explicitly as a blocker, reconstruct it from source evidence, and do not silently claim native completion or hide the failure. Do not turn an unsupported production case into a crash merely to inflate coverage: recover the missing contract before removing its dependency. Original code may be called by an explicitly isolated differential research harness, never as a fallback for a completed native production subsystem. Existing incomplete dependencies are migration debt, not an approved permanent exception.
+
+Priority order:
+1. Independent, fence-owned Vulkan resource lifetimes and host-native asset storage; no dependency on recycled console pool addresses.
+2. Asynchronous asset ingestion and native texture/mesh preparation before first use; no synchronous detiling/upload in the steady-state draw path.
+3. Persistent native material, shader and geometry bindings; direct native render commands from engine state, not repeated console descriptor decoding, re-resolution or synthetic command streams.
+4. Efficient multithreaded recording, native batching and GPU-driven work where equivalent; no unnecessary global locks, copies, barriers, queue waits, or per-draw allocations.
+5. Ahead-of-time shader translation and pipeline preparation, persistent validated caches; no gameplay compilation in the steady state.
+6. Native file I/O, libc, allocation, threads, synchronization, timing and other platform services; remove remaining original PRX and console platform dependencies as complete contracts are recovered.
+
+Keep original gameplay semantics and the faithful `src/` reconstruction separate from PC enhancements. Native code is not evidence of original binary equivalence by itself. Large coherent patches are preferred over tiny speculative optimizations or repetitive progress reports. Diagnose root causes from original machine code, runtime logs and measured CPU/GPU data. Never sacrifice correctness to make a benchmark look better.
+
+Acceptance: compile and run tests on Windows/Linux, launch the game, compare rendered output and streaming stability (including long runs and pool reuse), measure CPU capture/preparation/recording, GPU time, FPS, frame pacing and memory. Record build SHA, configuration and baseline. A successful compile, native API name, function count or theoretical speedup is NOT proof of PC parity. No fabricated progress or completion percentages. See [native-only architecture](docs/native-only-architecture.md) for the migration checklist.
+
 ## The one rule: generated vs authored
 
 Every file is exactly one of these. They never share a folder.
