@@ -297,34 +297,56 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
     if (const uint64_t decl = field<uint64_t>(dev, kVertexDecl)) {
         const uint32_t n = std::min(field<uint32_t>(decl, 0), 16u);
         d->num_vb = n;
+        // A vertex declaration describes attributes, not independent resources.
+        // Resolve each bound stream exactly once; all attributes in that stream
+        // consume the same native allocation identity, offset and vertex count.
+        struct StreamBinding {
+            uint64_t base=0,resource_base=0,resource_size=0,identity=0;
+            uint32_t count=0;
+            bool valid=false;
+        };
+        StreamBinding streams[32];
+        uint32_t prepared=0;
         for (uint32_t i = 0; i < n; ++i) {
             const uint32_t fmt = field<uint32_t>(decl, 0x14 + 8 * i);
             const uint32_t off = field<uint8_t>(decl, 0x18 + 8 * i), stream = field<uint8_t>(decl, 0x19 + 8 * i) & 31;
             const uint32_t stride = field<uint32_t>(decl, 4 + 4 * (stream & 3));
-            uint32_t h = field<uint32_t>(dev, 0x1D78 + 4 * stream);
-            uint32_t stream_off = field<uint32_t>(dev, 0x1DF8 + 4 * stream);
-            uint32_t vcnt = ds->vb_count[stream];
-            // 0x7DEB70 (set_vertex_decl) resets dev+0x1D78[0..31] to 0xFFFFFFFF without unbinding
-            // the CUE's vertex buffers; submesh loops (0x845DE0) switch vertex declarations between
-            // submeshes of the same mesh without re-calling set_vertex_buffer for stream 0/1.
-            if (h == 0xFFFFFFFFu && ds->vb_handle[stream] != 0xFFFFFFFFu) {
-                h = ds->vb_handle[stream];
-                stream_off = ds->vb_offset[stream];
-                const uint64_t ro = resolve_handle_safe(h);
-                if (ro >= 0x10000) {
-                    uint32_t tot = field<uint32_t>(ro, 0x30);
-                    if (stream_off != 0) tot = ds->vb_raw_count[stream] ? uint32_t(ds->vb_raw_count[stream]) : (stride ? tot - stream_off / stride : tot);
-                    vcnt = tot;
-                } else {
-                    h = 0xFFFFFFFFu;
+            if (!stride) continue;
+            auto& binding=streams[stream];
+            const uint32_t bit=1u<<stream;
+            if (!(prepared&bit)) {
+                prepared|=bit;
+                uint32_t h=field<uint32_t>(dev,0x1D78+4*stream);
+                uint32_t stream_off=field<uint32_t>(dev,0x1DF8+4*stream);
+                uint32_t vcnt=ds->vb_count[stream];
+                uint64_t obj=0;
+                // A declaration change clears the device's cached handles,
+                // but not the bound streams. Preserve the original fallback.
+                if(h==0xFFFFFFFFu&&ds->vb_handle[stream]!=0xFFFFFFFFu){
+                    h=ds->vb_handle[stream];
+                    stream_off=ds->vb_offset[stream];
+                    obj=resolve_handle_safe(h);
+                    if(obj>=0x10000){
+                        uint32_t tot=field<uint32_t>(obj,0x30);
+                        if(stream_off)tot=ds->vb_raw_count[stream]?uint32_t(ds->vb_raw_count[stream]):tot-stream_off/stride;
+                        vcnt=tot;
+                    }
+                }else if(h!=0xFFFFFFFFu) obj=resolve_handle_safe(h);
+                if(obj>=0x10000){
+                    binding.resource_base=field<uint64_t>(obj,0x28);
+                    binding.base=binding.resource_base+stream_off;
+                    binding.count=vcnt;
+                    if(resreg::g_on){
+                        binding.identity=resreg::get(obj);
+                        binding.resource_size=field<uint32_t>(obj,0);
+                    }
+                    binding.valid=true;
                 }
             }
-            if (h == 0xFFFFFFFFu || !stride) continue;
-            const uint64_t obj = resolve_handle(h);
-            const uint64_t base = field<uint64_t>(obj, 0x28) + off + stream_off;
-            build_vsharp(d->vb[i], base, fmt, stride, vcnt);
+            if(!binding.valid)continue;
+            build_vsharp(d->vb[i],binding.base+off,fmt,stride,binding.count);
             vbsig = mix(vbsig, uint64_t(i) << 48 | uint64_t(d->vb[i][1] >> 16) | uint64_t(d->vb[i][3]) << 32);
-            if (resreg::g_on) d->vres[i] = {resreg::get(obj), field<uint64_t>(obj, 0x28), field<uint32_t>(obj, 0)};
+            if(resreg::g_on)d->vres[i]={binding.identity,binding.resource_base,binding.resource_size};
         }
     }
     d->vb_sig = vbsig;
