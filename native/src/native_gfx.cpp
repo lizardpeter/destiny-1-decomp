@@ -611,6 +611,45 @@ D1_SYSV void h_release(uint32_t type, uint32_t handle) {
     o_release(type, handle);
     nr::resreg::event(type, handle, false);
 }
+// 0x7DAA60 and 0x7DB230: process-lifetime native queue storage and
+// completion label. No package allocator, GPU direct-memory allocation or
+// retail allocation handle is necessary for these CPU-only records.
+std::mutex g_blit_storage_m;
+uint8_t* g_blit_storage=nullptr;
+D1_SYSV void h_blit_init(){
+    using namespace ng::blit;
+    std::lock_guard lock(g_blit_storage_m);
+    const uint64_t original=nr::eb<uint64_t>(0x26DF268);
+    if(original&&original!=uint64_t(g_blit_storage)){
+        log("nd: cannot replace a previously initialized retail blitter allocation");
+        std::abort();
+    }
+    if(!g_blit_storage){
+        const uint64_t gran=os::granularity();
+        const uint64_t bytes=(storage_bytes+gran-1)&~(gran-1);
+        // Non-replacing hints; do not overwrite a preexisting guest mapping.
+        for(uint64_t hint:{0xC80000000ull,0xC00000000ull,0xB80000000ull,0xB00000000ull}){
+            void* p=os::alloc(hint,bytes,os::kRead|os::kWrite,false);
+            if(p&&uint64_t(p)<(1ull<<40)-bytes){
+                g_blit_storage=static_cast<uint8_t*>(p);
+                register_native_host_region(uint64_t(p),bytes);
+                break;
+            }
+            if(p)os::release(p,bytes);
+        }
+        if(!g_blit_storage){log("nd: native blitter storage allocation failed");std::abort();}
+    } else {
+        const uint64_t cursor=__atomic_load_n(reinterpret_cast<uint64_t*>(g_blit_storage+cursor_offset),__ATOMIC_ACQUIRE);
+        if(!valid(cursor)||used(cursor)){log("nd: cannot reset active native blitter");std::abort();}
+    }
+    initialize_storage(g_blit_storage,nr::eb<uint32_t>(0x26DF280));
+    auto* root=reinterpret_cast<void*>(nr::g_base+0x26DF268);
+    ng::binding::store(root,0,uint64_t(g_blit_storage));
+    ng::binding::store(root,8,uint16_t(0xffff)); // no retail allocation handle
+    ng::binding::store(root,12,uint32_t(0));
+    ng::binding::store(root,0x20,uint64_t(g_blit_storage)+label_offset);
+    log("nd: GPU blitter ring and label owned by native host memory at %p",static_cast<void*>(g_blit_storage));
+}
 // 0x7DA8B0/0x7DA910/0x7DA960: source-defined reservation and
 // enqueue using the retail consumer's exact shared cursor and record ABI.
 D1_SYSV uint64_t h_blit_reserve() {
@@ -917,6 +956,7 @@ void install() {
     ok &= hook(0x7D37B0, &h_swap, o_swap, "resource_move_commit");
     ok &= hook(0x7D4480, &h_mips, o_mips, "texture_mips");
     if(native_bind_enabled()){
+        ok &= replace_eboot_function(0x7DAA60,reinterpret_cast<const void*>(&h_blit_init));
         ok &= replace_eboot_function(0x7DA8B0,reinterpret_cast<const void*>(&h_blit_reserve));
         ok &= replace_eboot_function(0x7DA910,reinterpret_cast<const void*>(&h_blit_can_request));
         ok &= replace_eboot_function(0x7DA960,reinterpret_cast<const void*>(&h_blit_enqueue));

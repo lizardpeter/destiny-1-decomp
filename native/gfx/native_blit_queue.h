@@ -3,6 +3,13 @@
 #include "native_resource_binding.h"
 namespace d1::ng::blit {
 constexpr uint32_t capacity=0xa00;
+constexpr uint64_t record_bytes=0x40,cursor_offset=capacity*record_bytes;
+constexpr uint64_t label_offset=cursor_offset+0x40,storage_bytes=label_offset+sizeof(uint32_t);
+static_assert(cursor_offset==0x28000);
+inline void initialize_storage(void* storage,uint32_t sequence){
+    std::memset(storage,0,storage_bytes);
+    binding::store(storage,label_offset,sequence-1);
+}
 constexpr uint64_t pack(uint32_t head,uint32_t tail) {return uint64_t(tail)<<32|head;}
 constexpr uint32_t head(uint64_t cursor){return uint32_t(cursor);}
 constexpr uint32_t tail(uint64_t cursor){return uint32_t(cursor>>32);}

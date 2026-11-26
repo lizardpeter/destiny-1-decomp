@@ -6,6 +6,15 @@
 using namespace d1::ng;
 static void check(bool b){if(!b)std::abort();}
 int main(){
+    // Native host storage has the original slot/cursor layout and a separate
+    // aligned label, initialized to the predecessor of the next batch.
+    std::array<uint8_t,blit::storage_bytes> storage;
+    for(uint32_t seq:{0u,1u,0xffffffffu,0x80000000u}){
+        storage.fill(0xff);
+        blit::initialize_storage(storage.data(),seq);
+        for(size_t i=0;i<blit::label_offset;++i)check(!storage[i]);
+        check(binding::load<uint32_t>(storage.data(),blit::label_offset)==seq-1);
+    }
     for(uint32_t h=0;h<blit::capacity;++h)for(uint32_t t=0;t<blit::capacity;++t){
         const auto cursor=blit::pack(h,t);
         const auto count=(t+blit::capacity-h)%blit::capacity;
