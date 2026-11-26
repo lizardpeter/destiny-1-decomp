@@ -1154,7 +1154,20 @@ D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
         nr::resreg::touch(o, true, handle);
         const uint64_t res = nr::resreg::get(o);
         if (res && ng::active()) {
-            ng::notify_texture_mips(reinterpret_cast<const uint32_t*>(o), res, o, low_base, hi_base);
+            // Construct the low descriptor into private storage with the
+            // original 01.33 constructor contract, rather than guessing its
+            // tile pitch from the full-resolution high descriptor.
+            alignas(32) uint32_t low_descriptor[8]{};
+            const uint32_t* low=nullptr;
+            if(low_base&&hi_base&&guest_region_extent(o)>=0x44&&field<uint8_t>(o,0x34)){
+                const auto p=ng::binding::mip_plan(reinterpret_cast<const void*>(o),low_base,0);
+                if(!p.volume&&p.levels){
+                    using Construct2D=D1_SYSV uint64_t(*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+                    const auto bytes=reinterpret_cast<Construct2D>(nr::g_base+0xF83530)(low_descriptor,p.width,p.height,1,p.levels,p.format,p.tile,p.fragments,uint32_t(p.cube));
+                    if(bytes){ng::binding::mip_base(low_descriptor,low_base);low=low_descriptor;}
+                }
+            }
+            ng::notify_texture_mips(reinterpret_cast<const uint32_t*>(o),res,o,low_base,hi_base,low);
         }
     }
 }

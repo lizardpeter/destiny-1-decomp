@@ -903,7 +903,7 @@ struct Renderer {
     }
     uint64_t dma_tex_hits = 0, feedback_draws = 0, readback_stale = 0, cpu_stale = 0;
     uint64_t texture_range_rejects=0, split_partial_kept=0, split_descriptor_rejects=0, texture_upload_failures=0;
-    uint64_t resident_descriptor_hits=0,readback_unused_skipped=0,split_layout_guesses=0;
+    uint64_t resident_descriptor_hits=0,readback_unused_skipped=0,split_layout_guesses=0,expired_texture_epochs=0;
     std::atomic<uint64_t> expired_gpu_results{0};
     // The GPU's results reached guest memory (a readback): copies made from that memory (a
     // texture over a render target's memory, e.g. glyphs drawn into a cache texture) are stale.
@@ -1060,14 +1060,16 @@ struct Renderer {
     uint64_t bind_serial = 0;
     Image* target_for(const fmt::TSharp& ts);
     struct StreamMipInfo {
-        uint64_t obj = 0, low_base = 0, hi_base = 0;
+        uint64_t obj = 0, low_base = 0, hi_base = 0, epoch=0;
         uint16_t full_w = 0, full_h = 0, full_d = 1;
         uint8_t full_mips = 1, has_hi = 0;
         bool from_callback = false;
+        bool valid = true;
         fmt::TSharp low_layout{};
     };
+    struct StreamHistory {std::array<StreamMipInfo,4> entries{};};
     std::mutex mip_m;
-    std::unordered_map<uint32_t, StreamMipInfo> stream_mips;  // res_id -> authored full dimensions & mip bases
+    std::unordered_map<uint32_t, StreamHistory> stream_mips;  // bounded epoch history per resource
     StreamMipInfo get_stream_info(uint64_t res, uint64_t obj, const fmt::TSharp& ts);
     ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res = 0);
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
@@ -2320,60 +2322,45 @@ Image* Renderer::depth_target(const uint32_t* d, bool bind) {
     return img;
 }
 
-Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res, uint64_t obj, const fmt::TSharp& ts) {
+Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res,uint64_t obj,const fmt::TSharp& ts){
     StreamMipInfo info{};
-    info.full_w = uint16_t(ts.width);
-    info.full_h = uint16_t(ts.height);
-    info.full_d = uint16_t(ts.type == 10 ? ts.depth : 1);
-    info.full_mips = uint8_t(std::min(ts.last_level + 1, tiling::kMaxMips));
-    if (!res) return info;
-    const uint32_t rid = uint32_t(res >> 32);
+    info.full_w=uint16_t(ts.width);info.full_h=uint16_t(ts.height);
+    info.full_d=uint16_t(ts.type==10?ts.depth:1);
+    info.full_mips=uint8_t(std::min(ts.last_level+1,tiling::kMaxMips));
+    if(!res)return info;
+    const uint32_t rid=uint32_t(res>>32),slot=uint32_t(res)&3;
     {
         std::lock_guard lk(mip_m);
-        auto it = stream_mips.find(rid);
-        if (it != stream_mips.end()) {
-            info = it->second;
-            if (obj >= 0x10000) info.obj = obj;
+        auto it=stream_mips.find(rid);
+        if(it!=stream_mips.end()){
+            const auto& cached=it->second.entries[slot];
+            if(cached.epoch==res)return cached;
         }
     }
-    const uint64_t tag = obj >= 0x10000 ? obj : info.obj;
-    if (tag >= 0x10000 && guest_region_extent(tag) >= 0x44) {
-        const uint16_t tw = *reinterpret_cast<const uint16_t*>(tag + 0x28);
-        const uint16_t th = *reinterpret_cast<const uint16_t*>(tag + 0x2A);
-        const uint16_t td = *reinterpret_cast<const uint16_t*>(tag + 0x2C);
-        const uint8_t tm = *reinterpret_cast<const uint8_t*>(tag + 0x31);
-        const uint8_t thi = *reinterpret_cast<const uint8_t*>(tag + 0x34);
-        if (tw && th && tw <= 16384 && th <= 16384 && tm >= ts.last_level + 1 && tm <= tiling::kMaxMips) {
-            info.obj = tag;
-            info.full_w = tw;
-            info.full_h = th;
-            info.full_d = ts.type == 10 ? std::max<uint16_t>(1, td) : 1;
-            info.full_mips = tm;
-            info.has_hi = thi;
-            // The callback knows the allocation addresses; never overwrite them
-            // using a potentially half-built draw descriptor.
-            if (!info.from_callback) {
-                if (thi && tm > 1) {
-                    if (ts.last_level + 1 == tm - 1) info.low_base = ts.base;
-                    else if (ts.last_level + 1 == tm) info.hi_base = ts.base;
-                } else {
-                    info.low_base = ts.base;
-                }
-            }
-            std::lock_guard lk(mip_m);
-            auto& cur = stream_mips[rid];
-            cur.obj = info.obj;
-            cur.full_w = info.full_w, cur.full_h = info.full_h, cur.full_d = info.full_d;
-            cur.full_mips = info.full_mips, cur.has_hi = info.has_hi;
-            if (!cur.from_callback) {
-                if (info.low_base) cur.low_base = info.low_base;
-                if (info.hi_base) cur.hi_base = info.hi_base;
-            }
-            if(cur.has_hi&&cur.full_mips>1&&ts.base&&ts.base==cur.low_base&&
-               ts.last_level+1==uint32_t(cur.full_mips)-1)
-                cur.low_layout=ts;
-            info = cur;
-        }
+    // A draw captured an old epoch. Never attach today's mutable tag
+    // dimensions or mip addresses to that draw.
+    if(!obj||!opt.res_current||opt.res_current(obj)!=res){
+        info.valid=false;return info;
+    }
+    if(guest_region_extent(obj)<0x44){info.valid=false;return info;}
+    const uint16_t tw=*reinterpret_cast<const uint16_t*>(obj+0x28);
+    const uint16_t th=*reinterpret_cast<const uint16_t*>(obj+0x2a);
+    const uint16_t td=*reinterpret_cast<const uint16_t*>(obj+0x2c);
+    const uint8_t tm=*reinterpret_cast<const uint8_t*>(obj+0x31);
+    const uint8_t thi=*reinterpret_cast<const uint8_t*>(obj+0x34);
+    if(opt.res_current(obj)!=res){info.valid=false;return info;}
+    if(tw&&th&&tw<=16384&&th<=16384&&tm>=ts.last_level+1&&tm<=tiling::kMaxMips){
+        info.obj=obj;info.epoch=res;
+        info.full_w=tw;info.full_h=th;info.full_d=ts.type==10?std::max<uint16_t>(1,td):1;
+        info.full_mips=tm;info.has_hi=thi;
+        if(thi&&tm>1){
+            if(ts.last_level+1==uint32_t(tm)-1){info.low_base=ts.base;info.low_layout=ts;}
+            else if(ts.last_level+1==tm)info.hi_base=ts.base;
+        }else info.low_base=ts.base;
+        std::lock_guard lk(mip_m);
+        auto& cached=stream_mips[rid].entries[slot];
+        if(cached.epoch==res&&cached.from_callback)return cached;
+        cached=info;
     }
     return info;
 }
@@ -2410,6 +2397,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             }
         }
     }
+    // Existing exact old-epoch GPU images can still be used above. Do not
+    // reload an old captured descriptor from a recycled host allocation.
+    if(res&&obj&&opt.res_current&&opt.res_current(obj)!=res){++expired_texture_epochs;return nullptr;}
     const auto ts = fmt::decode_tsharp(t);
     const auto fi = fmt::data_format(ts.dfmt);
     const VkFormat f = fmt::vk_format(ts.dfmt, ts.nfmt);
@@ -2419,6 +2409,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     if (cube) layers = std::max(6u, layers - layers % 6);
 
     const StreamMipInfo smi = (!is3d && ts.type != 12 && ts.type != 13) ? get_stream_info(res, obj, ts) : StreamMipInfo{};
+    if(!smi.valid){++expired_texture_epochs;return nullptr;}
     const bool streamed = res != 0 && !is3d && ts.type != 12 && ts.type != 13 &&
                           smi.has_hi != 0 && smi.full_mips > 1;
     if(prepared&&(!res||streamed))return nullptr; // prepared jobs describe one contiguous registered surface
@@ -3291,7 +3282,8 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
     Image* img = it != textures.end() ? it->second.get() : nullptr;
     const uint8_t fallback_kind = ts.nfmt == 4 ? 1u : ts.nfmt == 5 ? 2u : 0u;
     const ViewHandle fallback{dummy_views[int(dim) * 3 + fallback_kind], 0, uint8_t(dim), fallback_kind, fallback_kind == 0};
-    if (!img || img->stale) return fallback;
+    if(!img||img->stale)return fallback;
+    if(res&&img->res_val!=res){++expired_texture_epochs;return fallback;}
     // A split texture has one native image, but each captured descriptor has its
     // own mip origin. A later low/high bind must not change an earlier draw.
     uint32_t origin = 0;
@@ -6460,31 +6452,44 @@ void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj) {
     j.mapping=guest_mapping_identity(j.base,1);
     if(j.mapping)g->prefetch(j);
 }
-void notify_texture_mips(const uint32_t* tsharp, uint64_t res, uint64_t obj, uint64_t low_base, uint64_t hi_base) {
-    if (!g || !res) return;
-    const uint32_t rid = uint32_t(res >> 32);
+void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64_t low_base,uint64_t hi_base,
+                         const uint32_t* low_descriptor){
+    if(!g||!res)return;
+    Renderer::StreamMipInfo info{};
+    info.epoch=res;info.obj=obj;info.low_base=low_base;info.hi_base=hi_base;
+    info.from_callback=true;
+    if(obj>=0x10000&&guest_region_extent(obj)>=0x44){
+        info.full_w=*reinterpret_cast<const uint16_t*>(obj+0x28);
+        info.full_h=*reinterpret_cast<const uint16_t*>(obj+0x2a);
+        info.full_d=std::max<uint16_t>(1,*reinterpret_cast<const uint16_t*>(obj+0x2c));
+        info.full_mips=*reinterpret_cast<const uint8_t*>(obj+0x31);
+        info.has_hi=*reinterpret_cast<const uint8_t*>(obj+0x34);
+    }else info.valid=false;
+    if(low_descriptor&&low_base){
+        const auto low=fmt::decode_tsharp(low_descriptor);
+        if(low.base==low_base)info.low_layout=low;
+    }else if(tsharp&&!hi_base&&low_base){
+        const auto low=fmt::decode_tsharp(tsharp);
+        if(low.base==low_base)info.low_layout=low;
+    }
     {
         std::lock_guard lk(g->mip_m);
-        auto& info = g->stream_mips[rid];
-        if (obj >= 0x10000 && guest_region_extent(obj) >= 0x44) {
-            info.obj = obj;
-            info.full_w = *reinterpret_cast<const uint16_t*>(obj + 0x28);
-            info.full_h = *reinterpret_cast<const uint16_t*>(obj + 0x2A);
-            info.full_d = std::max<uint16_t>(1, *reinterpret_cast<const uint16_t*>(obj + 0x2C));
-            info.full_mips = *reinterpret_cast<const uint8_t*>(obj + 0x31);
-            info.has_hi = *reinterpret_cast<const uint8_t*>(obj + 0x34);
+        auto& history=g->stream_mips[uint32_t(res>>32)].entries;
+        if(!info.low_layout.base&&low_base){
+            // Recover a previously captured physical layout for the same
+            // allocation address, not the current high descriptor's pitch.
+            uint64_t newest=0;
+            for(const auto& prior:history)
+                if(prior.epoch<res&&prior.epoch>newest&&prior.low_layout.base==low_base){
+                    info.low_layout=prior.low_layout;newest=prior.epoch;
+                }
         }
-        if(info.low_base!=low_base)info.low_layout={};
-        info.low_base = low_base;
-        info.hi_base = hi_base;
-        info.from_callback = true;
-        if(tsharp&&!hi_base&&low_base){
-            const auto low=fmt::decode_tsharp(tsharp);
-            if(low.base==low_base)info.low_layout=low;
-        }
+        auto& slot=history[uint32_t(res)&3];
+        if(slot.epoch<=res)slot=info;
     }
-    if (tsharp) prefetch_texture(tsharp, res, obj);
+    if(tsharp)prefetch_texture(tsharp,res,obj);
 }
+
 void prefetch_shader_pair(const uint8_t* vs_obj, const uint8_t* ps_obj) {
     if (!g) return;
     if (vs_obj) {
@@ -6797,7 +6802,8 @@ void print_stats() {
             double(g->ring_worker_reserved)/1048576.0,double(g->ring_worker_payload)/1048576.0);
         g->resident_descriptor_hits=g->readback_unused_skipped=g->ring_worker_reserved=g->ring_worker_payload=0;
         log("native renderer: split low layouts reconstructed without a captured descriptor %llu",(unsigned long long)g->split_layout_guesses);
-        g->split_layout_guesses=0;
+        log("native renderer: expired captured texture epochs %llu",(unsigned long long)g->expired_texture_epochs);
+        g->split_layout_guesses=g->expired_texture_epochs=0;
         {
             std::lock_guard dl(g->bindless_m);
             uint32_t live=0,peak=0,binding=0;

@@ -105,7 +105,8 @@ bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<
 void fill_late(const LateCb& l, uint64_t src, uint32_t size);
 void submit_recorded(const std::vector<uint32_t>& handles);
 void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj);
-void notify_texture_mips(const uint32_t* tsharp, uint64_t res, uint64_t obj, uint64_t low_base, uint64_t hi_base);
+void notify_texture_mips(const uint32_t* tsharp, uint64_t res, uint64_t obj, uint64_t low_base, uint64_t hi_base,
+                         const uint32_t* low_descriptor=nullptr);
 void prefetch_buffer(uint64_t base, uint64_t size, uint64_t res, uint64_t obj);
 void prefetch_shader(const uint8_t* obj, bool is_vs, uint64_t res = 0, uint64_t tag = 0);
 void prefetch_shader_pair(const uint8_t* vs_obj, const uint8_t* ps_obj);
