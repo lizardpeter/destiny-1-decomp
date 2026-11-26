@@ -5210,11 +5210,11 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         depth_target(d->depth, false);
     }
     st.t_tgt += now_ns() - t_tgt0;
-    struct Seen { uint64_t key, sub; };
-    static std::vector<Seen> seen(1u << 13);
+    struct Seen { uint64_t key, sub, res; const uint32_t* words; };
+    static thread_local std::vector<Seen> seen(1u << 13);
     // A submission can contain several resource-write boundaries. A descriptor
     // seen before one of them must be checked again in the next segment.
-    static uint64_t preparation_epoch = 0;
+    static thread_local uint64_t preparation_epoch = 0;
     const uint64_t epoch = ++preparation_epoch;
     for (size_t di = 0; di < count; ++di) {
         Draw* d = draws[di];
@@ -5229,10 +5229,22 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
             for (uint32_t mask = d->active_tex_mask[s]; mask; mask &= mask - 1) {
                     const uint32_t i = __builtin_ctz(mask);
                     const uint32_t* t = d->tex[s][i];
-                    const uint64_t k = hash_bytes(t, 32) ^ d->tex_res[s][i];
-                    Seen& e = seen[k & (seen.size() - 1)];
-                    if (e.key == k && e.sub == epoch) continue;
-                    e = {k, epoch};
+                    const uint64_t res=d->tex_res[s][i];
+                    const uint64_t k=hash_bytes(t,32)^res;
+                    const size_t home=k&(seen.size()-1);
+                    Seen* vacant=nullptr;
+                    bool already=false;
+                    // Probe nearby entries instead of repeatedly evicting an
+                    // unrelated descriptor that happens to hash to this slot.
+                    // Draws own these immutable words for this entire segment.
+                    for(size_t p=0;p<4;++p){
+                        auto& e=seen[(home+p)&(seen.size()-1)];
+                        if(e.sub!=epoch){if(!vacant)vacant=&e;continue;}
+                        if(e.key==k&&e.res==res&&std::memcmp(e.words,t,32)==0){already=true;break;}
+                    }
+                    if(already)continue;
+                    if(!vacant)vacant=&seen[home];
+                    *vacant={k,epoch,res,t};
                     const uint64_t b = fmt::decode_tsharp(t).base;
                     const bool possible_target=!d->tex_res[s][i]&&target_bases.count(b)!=0;
                     if(possible_target)tsharp_bases.insert(b);
@@ -6675,8 +6687,13 @@ void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj) {
     const auto fi=fmt::data_format(ts.dfmt);
     if(!ts.base||!fi.bpp||fi.bpp==96||ts.width>16384||ts.height>16384)return;
     if(ts.type!=10&&ts.type!=12&&ts.type!=13){
-        const auto info=g->get_stream_info(res,obj,ts,j.t);
-        if(!info.valid||(info.has_hi&&info.full_mips>1))return;
+        // A bind may precede 7D4480: its descriptor can still describe the
+        // low dimensions while its base points at the isolated high mip.
+        // Split textures have no contiguous prefetch path. Do not create
+        // speculative stream metadata as a side effect of rejecting the job.
+        if(!obj||!g->opt.res_current||g->opt.res_current(obj)!=res||guest_region_extent(obj)<0x44)return;
+        const auto has_hi=*reinterpret_cast<const uint8_t*>(obj+0x34);
+        if(g->opt.res_current(obj)!=res||has_hi)return;
     }
     tiling::Surface sf;
     sf.tile_mode=ts.tiling;sf.bpp=fi.bpp;sf.block=fi.block;sf.pow2=ts.pow2;
