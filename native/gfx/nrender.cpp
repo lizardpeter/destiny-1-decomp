@@ -1195,6 +1195,7 @@ struct Renderer {
     uint64_t captured_source_bytes=0;
     std::atomic<uint64_t> captured_source_count{0},captured_source_budget_misses{0};
     uint64_t captured_source_replays=0;
+    std::atomic<bool> source_prune_requested{false};
     void capture_owned_texture(const uint32_t* words,uint64_t res,uint64_t obj);
     std::shared_ptr<const OwnedTexture> find_owned_texture(const uint32_t* words,uint64_t res){
         std::lock_guard lk(source_m);
@@ -1231,7 +1232,9 @@ struct Renderer {
                 captured_source_bytes-=it->second.owned->size;
                 it->second.owned.reset();
             }
-            if(!ImageLifetime<Image>::resolve(it->second.ready))it=captured_sources.erase(it);
+            auto* ready=ImageLifetime<Image>::resolve(it->second.ready);
+            if(!ready||!ready->matches_epoch(it->first.words.data(),it->first.epoch))
+                it=captured_sources.erase(it);
             else ++it;
         }
     }
@@ -6291,7 +6294,11 @@ void Renderer::capture_owned_texture(const uint32_t* words,uint64_t res,uint64_t
     // by the renderer; pinned sources are never evicted to make room.
     {
         std::lock_guard lk(source_m);
-        if(captured_source_bytes+snapshot->size>budget){++captured_source_budget_misses;return;}
+        if(captured_source_bytes+snapshot->size>budget){
+            ++captured_source_budget_misses;
+            source_prune_requested.store(true,std::memory_order_relaxed);
+            return;
+        }
         captured_source_bytes+=snapshot->size;
     }
     auto copy=[&](uint64_t base,uint64_t size){
@@ -7305,7 +7312,14 @@ void Renderer::end_frame() {
         frame_ends.pop_front();
     }
     retire_completed();
+    const bool source_pressure=source_prune_requested.exchange(false,std::memory_order_relaxed);
     if (st.frames % 120 == 0) evict_textures(), evict_geo();
+    else if(source_pressure){
+        // Reclaim unpinned source snapshots at the next frame boundary,
+        // rather than losing new texture epochs for another 120 frames.
+        auto gate=texture_leases().retire();
+        prune_sources();
+    }
     // Use elapsed wall time, not frame count: a 30-frame interval was only 250 ms
     // at 120 FPS. Never serialize concurrently with loader pipeline construction.
     const uint64_t now = now_ns();
