@@ -124,3 +124,8 @@ add_test(NAME frame-time-contract COMMAND frame-time-contract-test)
 add_executable(native-ranges-test tests/native_ranges_test.cpp)
 target_include_directories(native-ranges-test PRIVATE src)
 add_test(NAME native-ranges COMMAND native-ranges-test)
+
+# Tests actual emitted SPIR-V with a narrow CPU evaluator, without a GPU.
+add_executable(query-reduce-test tests/query_reduce_test.cpp gfx/spirv.cpp)
+target_include_directories(query-reduce-test PRIVATE gfx)
+add_test(NAME query-reduce COMMAND query-reduce-test)
