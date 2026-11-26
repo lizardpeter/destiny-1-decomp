@@ -36,6 +36,7 @@ public:
     Result wait(Queue::Id id) { return queue_.wait(id); }
     bool poll(Queue::Id id, Result& result) { return queue_.poll(id, result); }
     bool forget(Queue::Id id) { return queue_.forget(id); }
+    bool delete_operation(Queue::Id id) { return queue_.delete_operation(id); }
     uint32_t open_directory(Root root, const std::filesystem::path& name, std::error_code& ec) {
         return directories_.open(paths_, root, name, ec);
     }
