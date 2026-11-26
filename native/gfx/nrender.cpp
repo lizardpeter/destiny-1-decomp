@@ -41,6 +41,9 @@
 namespace d1 {
 void log(const char* fmt, ...);
 uint64_t guest_region_extent(uint64_t addr);  // bytes from addr to the end of its guest mapping
+uint64_t guest_mapping_identity(uint64_t addr, uint64_t size);
+bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
+                                 void (*write)(void*, void*), void* context);
 }
 
 namespace d1::ng {
@@ -433,7 +436,7 @@ struct Sub {
     std::vector<VkDescriptorPool> pools;            // descriptor sets of this submission's draws
     size_t pool = 0;                                // the pool being allocated from
     // small render targets the CPU reads: copied to the ring, written to guest memory when done
-    struct Readback { uint64_t base; tiling::Surface sf; uint64_t off; };
+    struct Readback { uint64_t base; tiling::Surface sf; uint64_t off; uint64_t mapping; };
     std::vector<Readback> readbacks;
     Buffer rb;             // their copies, in host-cached memory (the ring may be write-combined VRAM)
     uint64_t rb_used = 0;
@@ -445,7 +448,7 @@ struct Sub {
     VkQueryPool qpool = VK_NULL_HANDLE;
     VkQueryPool timepool = VK_NULL_HANDLE;
     uint32_t q_used = 0;
-    struct ZRec { uint64_t dest; uint32_t boundary; };
+    struct ZRec { uint64_t dest; uint32_t boundary; uint64_t mapping; };
     std::vector<ZRec> zrecs;
     std::vector<std::array<uint64_t, 4>> copies;  // (D1_NG_VERIFY_LATE) kind, address, size, hash when recorded
     // dynamic textures (CPU-written memory, no resource) the list samples: their T# and the
@@ -869,6 +872,7 @@ struct Renderer {
             }
     }
     uint64_t dma_tex_hits = 0, feedback_draws = 0, readback_stale = 0, cpu_stale = 0;
+    std::atomic<uint64_t> expired_gpu_results{0};
     // The GPU's results reached guest memory (a readback): copies made from that memory (a
     // texture over a render target's memory, e.g. glyphs drawn into a cache texture) are stale.
     // (runs without the renderer's lock: the copies over it are marked stale when the CPU writes are applied)
@@ -1591,11 +1595,18 @@ void Renderer::write_results(uint32_t i, uint64_t serial) {
     if (res_state[i].compare_exchange_strong(z, serial << 2 | 1, std::memory_order_acq_rel)) {
         Sub& sb = subs[i];
         write_zpass_results(sb);
-        for (const auto& rb : sb.readbacks)
-            if (sb.rb.map && guest_region_extent(rb.base) >= rb.sf.total_size) {
-                tiling::tile(rb.sf, 0, sb.rb.map + rb.off, reinterpret_cast<uint8_t*>(rb.base));
+        for (const auto& rb : sb.readbacks) {
+            if (!sb.rb.map) continue;
+            struct TileResult { const Sub::Readback* rb; const uint8_t* source; };
+            TileResult data{&rb, sb.rb.map + rb.off};
+            if (guest_write_current_mapping(rb.base, rb.sf.total_size, rb.mapping,
+                    [](void* dest, void* opaque) {
+                        auto& d = *static_cast<TileResult*>(opaque);
+                        tiling::tile(d.rb->sf, 0, d.source, static_cast<uint8_t*>(dest));
+                    }, &data))
                 gpu_wrote(rb.base, rb.sf.total_size);
-            }
+            else ++expired_gpu_results;
+        }
         res_state[i].store(serial << 2 | 2, std::memory_order_release);
         return;
     }
@@ -5347,7 +5358,7 @@ void Renderer::zpass(uint64_t dest) {
     } else {
         boundary = sb.q_used;
     }
-    sb.zrecs.push_back({dest, boundary});
+    sb.zrecs.push_back({dest, boundary, guest_mapping_identity(dest, 8 * 16)});
     ++st.zpass_dumps;
 }
 
@@ -5438,10 +5449,14 @@ void Renderer::write_zpass_results(Sub& sb) {
     std::vector<uint64_t> prefix(sb.q_used + 1, 0);
     for (uint32_t i = 0; i < sb.q_used; ++i) prefix[i + 1] = prefix[i] + res[i];
     for (const auto& z : sb.zrecs) {
-        if (z.dest < 0x10000 || guest_region_extent(z.dest) < 8 * 16) continue;
-        auto* r = reinterpret_cast<volatile uint64_t*>(z.dest);
-        const uint64_t v = (zcount_base + prefix[std::min<uint32_t>(z.boundary, sb.q_used)]) & 0x7FFFFFFFFFFFFFFFull;
-        for (int k = 0; k < 8; ++k) r[k * 2] = (k == 0 ? v : 0) | 0x8000000000000000ull;
+        uint64_t v = (zcount_base + prefix[std::min<uint32_t>(z.boundary, sb.q_used)]) & 0x7FFFFFFFFFFFFFFFull;
+        if (!guest_write_current_mapping(z.dest, 8 * 16, z.mapping,
+                [](void* dest, void* opaque) {
+                    auto* r = static_cast<volatile uint64_t*>(dest);
+                    const uint64_t value = *static_cast<const uint64_t*>(opaque);
+                    for (int k = 0; k < 8; ++k) r[k * 2] = (k == 0 ? value : 0) | 0x8000000000000000ull;
+                }, &v))
+            ++expired_gpu_results;
     }
     // D1_NG_LOG_QUERIES: (diagnostics) each query's sample count
     static const bool log_q = std::getenv("D1_NG_LOG_QUERIES") != nullptr;
@@ -5488,6 +5503,8 @@ void Renderer::queue_readbacks() {
         tiling::Surface sf;
         sf.tile_mode = img->tile_mode, sf.bpp = img->bpp, sf.width = img->w, sf.height = img->h, sf.pitch = img->pitch;
         tiling::layout(sf);
+        const uint64_t mapping = guest_mapping_identity(img->base, sf.total_size);
+        if (!mapping) continue;
         const uint64_t bytes = uint64_t(img->w) * img->h * (img->bpp / 8);
         Sub& sb = subs[rc().cur];
         constexpr uint64_t kReadbackBytes = 4ull << 20;
@@ -5501,7 +5518,7 @@ void Renderer::queue_readbacks() {
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         r.imageExtent = {img->w, img->h, 1};
         vkCmdCopyImageToBuffer(rc().cmd, img->image, VK_IMAGE_LAYOUT_GENERAL, sb.rb.buf, 1, &r);
-        sb.readbacks.push_back({img->base, sf, off});
+        sb.readbacks.push_back({img->base, sf, off, mapping});
         static std::unordered_set<uint64_t> seen;
         if (seen.size() < 64 && seen.insert(img->base ^ uint64_t(img->w) << 40 ^ uint64_t(img->h) << 52).second)
             log("native renderer: reading back target %llx %ux%u (format %d, tile mode %u) to guest memory",
@@ -6336,6 +6353,8 @@ void print_stats() {
         log("native renderer: feedback loops: %llu target snapshots copied, %llu reused | texture copies made stale by copy commands %llu, by readbacks %llu, by CPU writes %llu",
             (unsigned long long)g->snap_copies, (unsigned long long)g->snap_reused, (unsigned long long)g->dma_stale,
             (unsigned long long)g->readback_stale, (unsigned long long)g->cpu_stale);
+        if (const uint64_t expired = g->expired_gpu_results.exchange(0))
+            log("native renderer: %llu delayed results rejected (mapping expired or unwritable)", (unsigned long long)expired);
         g->snap_copies = g->snap_reused = g->dma_stale = g->readback_stale = g->cpu_stale = 0;
         log("native renderer: dynamic data refreshed at submission (no mapped VRAM reads): constants %llu of %llu, vertices %llu of %llu, indices %llu of %llu",
             (unsigned long long)g->recopy_changed[0], (unsigned long long)g->recopy_n[0], (unsigned long long)g->recopy_changed[1],
