@@ -14,6 +14,7 @@
 #include "native_memory_policy.h"
 #include "native_staging_pages.h"
 #include "native_resource_identity.h"
+#include "native_geometry_sources.h"
 #include "native_descriptor_slots.h"
 #include "native_texture_identity.h"
 #include "native_mip_source.h"
@@ -576,6 +577,9 @@ struct Renderer {
         std::unordered_map<GeometryKey, GeoEntry, GeometryKeyHash> map;
     };
     GeoShard geo_shards[64];
+    GeometrySources geometry_sources;
+    std::atomic<bool> geometry_source_pressure{false};
+    void capture_geometry(const Draw::Res& res);
     std::mutex geo_block_m;
     uint64_t geo_bytes = 0;
     struct GeoHit {
@@ -3346,6 +3350,26 @@ Buffer* Renderer::geometry_staging(uint64_t bytes, StagingSpan& span) {
     return &sb.geo_staging.back();
 }
 
+void Renderer::capture_geometry(const Draw::Res& res){
+    if(!res.id||!res.object||res.base<0x10000||!res.size||res.size>=(64ull<<20))return;
+    const GeometryKey resident_key{res.id,0,res.size,0,0};
+    auto& sh=geo_shards[(uint64_t(GeometryKeyHash{}(resident_key))*0x9E3779B97F4A7C15ull)>>58];
+    {
+        std::lock_guard lk(sh.m);
+        const auto i=sh.map.find(resident_key);
+        if(i!=sh.map.end()&&i->second.valid&&i->second.res==res.id)return;
+    }
+    const GeometryKey key{res.id,res.base,res.size,0,0};
+    if(!geometry_sources.capture(key,[&](uint8_t* dst,uint64_t bytes){
+        MappingSpans spans;
+        return opt.res_current&&opt.res_current(res.object)==res.id&&
+               guest_capture_read_spans(res.base,bytes,spans)&&
+               guest_copy_current_spans(res.base,bytes,spans,dst)&&
+               opt.res_current(res.object)==res.id&&
+               guest_matches_current_spans(res.base,bytes,spans,dst);
+    })) geometry_source_pressure.store(true,std::memory_order_relaxed);
+}
+
 bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot, uint64_t object, const MappingSpans* mapping,GeoHit* prepared) {
     if (!res.id || res.base < 0x10000 || !res.size || res.size >= (64ull << 20) ||
         rc().cur == UINT32_MAX || (rc().lr&&!snapshot)) return false;
@@ -3358,14 +3382,23 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
         if(prepared)*prepared={geo_blocks[size_t(e.block)].buf.buf,e.off,e.size,e.vfirst,e.vlast};
         return false;
     }
+    // A queued native list may refer to an epoch whose original pool
+    // has already been recycled. Prefer the owned immutable source, never
+    // read its old address as if it belonged to the current allocation.
+    const auto retained=geometry_sources.get({res.id,res.base,res.size,0,0});
+    if(!object)object=res.object;
     MappingSpans local;
-    if(!snapshot){
-        if(!guest_capture_read_spans(res.base,res.size,local))return false;
-        mapping=&local;
+    if(retained){
+        snapshot=retained->data();
+    }else{
+        if(!opt.res_current||!object||opt.res_current(object)!=res.id)return false;
+        if(!snapshot){
+            if(!guest_capture_read_spans(res.base,res.size,local))return false;
+            mapping=&local;
+        }
+        if(!mapping||mapping->empty())return false;
+        if(snapshot&&!guest_matches_current_spans(res.base,res.size,*mapping,snapshot))return false;
     }
-    if(!mapping||mapping->empty())return false;
-    if(snapshot&&(!opt.res_current||opt.res_current(object)!=res.id||
-                   !guest_matches_current_spans(res.base,res.size,*mapping,snapshot)))return false;
     int block = -1;
     uint64_t off = 0;
     if (!geo_alloc(res.size, block, off, true)) return false;
@@ -3386,8 +3419,8 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
         copied=guest_copy_current_spans(res.base,res.size,*mapping,owned.data());
         source=owned.data();
     }
-    if(!copied||!guest_matches_current_spans(res.base,res.size,*mapping,source)||
-       (snapshot&&opt.res_current(object)!=res.id)){
+    if(!copied||(!retained&&(!guest_matches_current_spans(res.base,res.size,*mapping,source)||
+       opt.res_current(object)!=res.id))){
         // No GPU command references this span yet; return it to the page.
         subs[rc().cur].geo_staging_used = span.offset;
         geo_free_now(block, off, res.size);
@@ -3604,13 +3637,15 @@ thread_local Renderer::GeoHit Renderer::geo_hit_out;
 thread_local Renderer::Recorder* Renderer::tr = nullptr;
 
 void Renderer::evict_geo() {
+    auto gate=texture_leases().retire();
+    geometry_sources.prune([](uint64_t id){return texture_leases().pinned(id);});
     const uint64_t horizon = 3000, now = submit_seq.load();
     if (now < horizon) return;
     bool any = false;
     for (GeoShard& sh : geo_shards) {
         std::lock_guard lk(sh.m);
         for (auto it = sh.map.begin(); it != sh.map.end();) {
-            if (it->second.last_used + horizon < now) {
+            if (it->second.last_used + horizon < now && (!it->second.res||!texture_leases().pinned(it->second.res))) {
                 if (it->second.valid) geo_free_later(it->second.block, it->second.off, it->second.size);
                 it = sh.map.erase(it);
                 any = true;
@@ -6105,7 +6140,7 @@ void Renderer::load_buffer(const LoadJob& j) {
         up_rec.lr=true;
         if(up_rec.cur==UINT32_MAX)up_rec.submit_no=submit_seq.load(),begin_record();
         if(up_rec.cur==UINT32_MAX)return;
-        if(prepare_local_geometry({j.res,j.base,j.size},snapshot.data(),j.obj,&j.mapping)){
+        if(prepare_local_geometry({j.res,j.base,j.size,j.obj},snapshot.data(),j.obj,&j.mapping)){
             // Same graphics queue; execute() submits the shared upload slot
             // before recording the next ordered draw submission.
             barrier();
@@ -7338,12 +7373,14 @@ void Renderer::end_frame() {
     }
     retire_completed();
     const bool source_pressure=source_prune_requested.exchange(false,std::memory_order_relaxed);
+    const bool geo_pressure=geometry_source_pressure.exchange(false,std::memory_order_relaxed);
     if (st.frames % 120 == 0) evict_textures(), evict_geo();
-    else if(source_pressure){
+    else if(source_pressure||geo_pressure){
         // Reclaim unpinned source snapshots at the next frame boundary,
         // rather than losing new texture epochs for another 120 frames.
         auto gate=texture_leases().retire();
-        prune_sources();
+        if(source_pressure)prune_sources();
+        if(geo_pressure)geometry_sources.prune([](uint64_t id){return texture_leases().pinned(id);});
     }
     // Use elapsed wall time, not frame count: a 30-frame interval was only 250 ms
     // at 120 FPS. Never serialize concurrently with loader pipeline construction.
@@ -7662,6 +7699,9 @@ void prefetch_shader_pair(const uint8_t* vs_obj, const uint8_t* ps_obj) {
         const uint64_t res = g->opt.res_current ? g->opt.res_current(uint64_t(ps_obj)) : 0;
         if (res) g->prefetch({3, {}, uint64_t(ps_obj), 0, res, uint64_t(ps_obj)});
     }
+}
+void capture_geometry_source(const Draw::Res& resource){
+    if(g)g->capture_geometry(resource);
 }
 void prefetch_buffer(uint64_t base, uint64_t size, uint64_t res, uint64_t obj) {
     if (!g || !res || !g->load_on || !size || size >= (64ull<<20)) return;
