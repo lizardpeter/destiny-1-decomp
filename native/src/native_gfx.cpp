@@ -220,8 +220,11 @@ void touch(uint64_t key, bool insert, uint32_t handle = UINT32_MAX) {
     if (g_registry && key >= 0x10000 && g_registry->touch(key, insert, handle)) ++g_events;
 }
 // the resource object a (type, handle) names, 0 for the types the renderer does not track
+bool tracked_type(uint32_t type) {
+    return (type>=1&&type<=4)||type==6||type==8||type==9||type==12||type==13;
+}
 uint64_t object_of(uint32_t type, uint32_t handle) {
-    if (handle == 0xFFFFFFFFu || (!(type >= 1 && type <= 4) && type != 6 && type != 8 && type != 9 && type != 12 && type != 13)) return 0;
+    if (handle == 0xFFFFFFFFu || !tracked_type(type)) return 0;
     const uint64_t o = resolve_handle_safe(handle);
     return o >= 0x10000 ? o : 0;
 }
@@ -567,7 +570,7 @@ bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint) {
             const auto result=apply(type,repoint,reinterpret_cast<void*>(obj),addr,
                                     type==10&&obj?guest_region_extent(obj):0);
             if(result!=Result::bound)return false;
-            if(nr::resreg::object_of(type,handle)==obj&&obj) {
+            if(nr::resreg::tracked_type(type)&&obj) {
                 // Publish once from the already resolved object. Geometry
                 // creation takes a native byte range directly from this event.
                 nr::resreg::touch(obj,true,handle);
@@ -589,6 +592,20 @@ D1_SYSV bool h_rebind(uint32_t type,uint32_t handle,uint64_t addr) {
 using RelFn = D1_SYSV void (*)(uint32_t, uint32_t);
 RelFn o_release;
 D1_SYSV void h_release(uint32_t type, uint32_t handle) {
+    if(native_bind_enabled()) {
+        // 0x7D2FE0: all non-texture cases are RET-only or unsupported.
+        // 0x7D43E0: release a high mip only when the full chain is resident.
+        // The mip callback owns the actual epoch publication. Do not retire
+        // a resource identity or bump its epoch for a no-op release.
+        if(handle==UINT32_MAX||type<1||type>3)return;
+        const uint64_t obj=nr::resreg::object_of(type,handle);
+        if(obj&&ng::binding::release_top_mip(reinterpret_cast<const void*>(obj))) {
+            using Mips=D1_SYSV void(*)(uint32_t,uint64_t,uint64_t);
+            const auto base=uint64_t(field<uint32_t>(obj,0))<<8;
+            reinterpret_cast<Mips>(nr::g_base+0x7D4480)(handle,base,0);
+        }
+        return;
+    }
     o_release(type, handle);
     nr::resreg::event(type, handle, false);
 }

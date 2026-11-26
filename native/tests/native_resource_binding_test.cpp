@@ -46,7 +46,7 @@ int main(){
         const uint32_t types[]={7,9,10,11,12,13,14,16};
         const uint32_t t=types[i%8];
         const bool move=(i&8)!=0;
-        if(i%4==0)store(obj.data(),0x10,uint32_t(2));
+        if((i&16)==0)store(obj.data(),0x10,uint32_t(2));
         expected=obj;
         auto* e=expected.data();
         auto pair=[&](size_t off,uint64_t base){store(e,off,uint32_t(base>>8));store(e,off+4,uint32_t(base>>40));};
@@ -61,6 +61,16 @@ int main(){
         const auto result=apply(t,move,obj.data(),addr,obj.size());
         check(result==(t==14&&move?Result::unsupported:Result::bound)&&obj==expected);
     }
+    for(uint32_t type=0;type<16;++type)
+        for(uint32_t mip=0;mip<16;++mip)
+            for(uint32_t full=0;full<256;++full)
+                for(uint32_t high=0;high<2;++high) {
+                    std::array<uint8_t,80> object{};
+                    store(object.data(),12,(type<<28)|(mip<<16));
+                    object[0x31]=uint8_t(full);object[0x34]=uint8_t(high);
+                    check(last_mip(load<uint32_t>(object.data(),12))==(type>=14?0:mip));
+                    check(release_top_mip(object.data())==(high!=0&&full==(type>=14?1:mip+1)));
+                }
     check(apply(16,false,nullptr,0)==Result::bound);
     std::array<uint8_t,80> obj{};
     check(apply(10,false,obj.data(),1,obj.size())==Result::rejected);

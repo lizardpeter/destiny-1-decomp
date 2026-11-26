@@ -31,6 +31,15 @@ inline void texture_base(void* object,uint64_t address) {
 inline void index_fields(void* object,uint32_t count,uint64_t address,uint32_t width) {
     store(object,0x3c,count);store(object,0x30,address);store(object,0x38,uint32_t(width!=2));
 }
+// 0xF84640: the special texture kinds 14/15 report last mip zero.
+constexpr uint32_t last_mip(uint32_t word3) {
+    const uint32_t type=word3>>28;
+    return type>=14?0:(word3>>16)&15;
+}
+inline bool release_top_mip(const void* object) {
+    return load<uint8_t>(object,0x34)!=0 &&
+           load<uint8_t>(object,0x31)==last_mip(load<uint32_t>(object,12))+1;
+}
 enum class Result { unsupported, rejected, bound };
 constexpr bool supported(uint32_t type,bool repoint) {
     return (type>=1&&type<=4)||(type>=6&&type<=13)||(type==14&&!repoint)||type==16||type==18;
