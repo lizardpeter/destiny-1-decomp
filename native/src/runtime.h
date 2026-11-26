@@ -23,6 +23,7 @@ void tls_destroy_thread_block(void* tcb);
 
 // Call guest code fn(a0, a1, a2) from a terminal frame-pointer frame.
 extern "C" D1_SYSV uint64_t d1_call_guest(const void* fn, uint64_t a0, uint64_t a1, uint64_t a2);
+extern "C" D1_SYSV uint64_t d1_call_guest4(const void* fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
 
 // Run a guest thread's entry fn(arg); d1_guest_exit(*slot, value) makes it return value.
 extern "C" D1_SYSV uint64_t d1_call_guest_exitable(const void* fn, uint64_t arg, uint64_t* slot);
