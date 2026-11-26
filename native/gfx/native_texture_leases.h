@@ -4,6 +4,7 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include "native_texture_identity.h"
 
 namespace d1::ng {
 // Native command-list ownership of captured texture versions. A lease ends
@@ -40,6 +41,12 @@ inline TextureLeaseRegistry& texture_leases(){
 class TextureLeaseSet {
     TextureLeaseRegistry& registry_;
     std::unordered_set<uint64_t> ids_;
+    // A resource epoch can be bound through more than one physical source
+    // layout. Keep one lifetime lease per epoch but one preparation request
+    // per exact source. The small memo avoids a hash-table walk on repeated
+    // material binds; collisions fall back to the exact set.
+    std::unordered_set<TextureSourceKey,TextureSourceKeyHash> sources_;
+    std::array<TextureSourceKey,128> recent_sources_{};
 public:
     explicit TextureLeaseSet(TextureLeaseRegistry& registry=texture_leases()):registry_(registry){}
     TextureLeaseSet(const TextureLeaseSet&)=delete;
@@ -47,5 +54,15 @@ public:
     ~TextureLeaseSet(){for(auto id:ids_)registry_.unpin(id);}
     // One reference per distinct epoch per list, not per draw or binding.
     bool pin(uint64_t id){if(!id||!ids_.insert(id).second)return false;registry_.pin(id);return true;}
+    bool pin_source(const uint32_t* words,uint64_t id){
+        if(!id)return false;
+        const auto key=texture_source_key(words,id);
+        auto& recent=recent_sources_[(id^(id>>32))&(recent_sources_.size()-1)];
+        if(recent==key)return false;
+        recent=key;
+        if(!sources_.insert(key).second)return false;
+        pin(id);
+        return true;
+    }
 };
 } // namespace d1::ng
