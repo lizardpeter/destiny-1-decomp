@@ -25,5 +25,24 @@ int main(){
         check(mapping_allows(base,extent,stamp,addr,size,wanted,prot,required)==
               (expected&&wanted!=0&&stamp==wanted&&(prot&required)==required));
     }
-    std::puts("200000 mapping lifetime, extent and protection cases passed");
+    MappingSpans spans;
+    uint64_t second_identity=12;
+    bool second_writable=true;
+    auto lookup=[&](uint64_t a,MappingSpan& r){
+        if(a>=100&&a<120){r={100,20,11};return true;}
+        if(a>=120&&a<150&&second_writable){r={120,30,second_identity};return true;}
+        return false;
+    };
+    check(capture_mapping_spans(110,30,spans,lookup));
+    check(spans.size()==2&&spans[0].size==10&&spans[1].size==20);
+    check(validate_mapping_spans(110,30,spans,lookup));
+    check(validate_mapping_spans(110,5,spans,lookup));
+    check(!validate_mapping_spans(110,31,spans,lookup));
+    second_identity++;
+    check(!validate_mapping_spans(110,30,spans,lookup));
+    check(validate_mapping_spans(110,10,spans,lookup));
+    second_writable=false;
+    check(!capture_mapping_spans(110,30,spans,lookup)&&spans.empty());
+    check(!capture_mapping_spans(UINT64_MAX-2,4,spans,lookup));
+    std::puts("200000 mapping lifetime, extent and protection cases plus multi-region cases passed");
 }

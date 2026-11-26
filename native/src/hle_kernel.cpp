@@ -385,6 +385,33 @@ bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity
     return true;
 }
 
+static bool writable_span_locked(uint64_t addr,MappingSpan& span){
+    const auto* r=region_of(addr);
+    if(!r||!(host_prot(r->second.prot)&os::kWrite))return false;
+    span={r->first,r->second.size,r->second.identity};
+    return true;
+}
+bool guest_capture_write_spans(uint64_t addr,uint64_t size,MappingSpans& spans){
+    std::lock_guard lk(g_mem_mutex);
+    if(capture_mapping_spans(addr,size,spans,writable_span_locked))return true;
+    static unsigned failures=0;
+    if(failures++<32){
+        const auto* r=region_of(addr);
+        log("native FIOS: mapping coverage rejected addr=%#llx size=%#llx first=%#llx extent=%#llx prot=%#x name=%s",
+            (unsigned long long)addr,(unsigned long long)size,
+            (unsigned long long)(r?r->first:0),(unsigned long long)(r?r->second.size:0),
+            r?r->second.prot:0,r?r->second.name:"untracked");
+    }
+    return false;
+}
+bool guest_write_current_spans(uint64_t addr,uint64_t size,const MappingSpans& spans,const void* source){
+    if(!source)return false;
+    std::lock_guard lk(g_mem_mutex);
+    if(!validate_mapping_spans(addr,size,spans,writable_span_locked))return false;
+    std::memcpy(reinterpret_cast<void*>(addr),source,size);
+    return true;
+}
+
 uint64_t guest_region_extent(uint64_t addr) {
     static thread_local RegionExtentCache cache;
     return cache.lookup(addr, g_regions_gen, g_mem_mutex, g_regions);

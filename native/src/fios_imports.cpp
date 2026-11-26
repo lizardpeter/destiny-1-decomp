@@ -134,21 +134,21 @@ uint32_t read_at(const OperationAttributes* attr, uint32_t handle, void* dst, in
         Queue::Callback callback;
         if (!callback_for(attr, uint64_t(count), true, callback)) return uint32_t(0);
         const uint64_t addr = reinterpret_cast<uint64_t>(dst);
-        const uint64_t identity = count ? guest_mapping_identity(addr, uint64_t(count)) : 0;
-        if (count && !identity) {
-            // A queued raw pointer cannot be safely delivered after recycling.
-            log("native FIOS: async read destination has no tracked mapping");
+        MappingSpans spans;
+        if(count&&!guest_capture_write_spans(addr,uint64_t(count),spans)){
+            static std::atomic<unsigned> failures{0};
+            if(failures.fetch_add(1)<32)
+                log("native FIOS: read rejected handle=%#x dst=%p count=%#llx offset=%#llx",
+                    handle,dst,(unsigned long long)count,(unsigned long long)offset);
             return uint32_t(0);
         }
-        auto deliver = [addr, identity](std::span<const unsigned char> bytes, Result r) {
-            if (bytes.empty()) return r;
-            struct Copy { const unsigned char* src; size_t n; } copy{bytes.data(), bytes.size()};
-            if (!guest_write_current_mapping(addr, bytes.size(), identity,
-                [](void* dst, void* opaque) {
-                    auto& c = *static_cast<Copy*>(opaque);
-                    std::memcpy(dst, c.src, c.n);
-                }, &copy))
-                return Result{0, error(std::errc::operation_canceled)};
+        auto deliver = [addr, spans=std::move(spans)](std::span<const unsigned char> bytes, Result r) {
+            if(bytes.empty())return r;
+            if(!guest_write_current_spans(addr,bytes.size(),spans,bytes.data())){
+                log("native FIOS: read delivery mapping changed addr=%#llx bytes=%zu",
+                    (unsigned long long)addr,bytes.size());
+                return Result{0,error(std::errc::operation_canceled)};
+            }
             return r;
         };
         std::error_code ec;
