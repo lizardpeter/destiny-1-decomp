@@ -2724,27 +2724,35 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     // coverage check, even if its virtual address did not change.
     static thread_local std::vector<uint8_t> primary_source,secondary_source;
     MappingSpans primary_spans,secondary_spans;
+    const uint8_t* primary_data=nullptr;
+    const uint8_t* secondary_data=nullptr;
     bool primary_ready=false;
     const auto current_epoch=[&]{return owned||!res||!obj||!opt.res_current||opt.res_current(obj)==res;};
-    auto capture_source=[&](uint64_t base,uint64_t bytes,std::vector<uint8_t>& dst,MappingSpans& spans){
+    auto capture_source=[&](uint64_t base,uint64_t bytes,std::vector<uint8_t>& dst,MappingSpans& spans,const uint8_t*& data){
         if(!bytes||bytes>(512ull<<20)||!current_epoch())return false;
         if(owned){
             for(const auto& range:owned->ranges)if(range.base==base&&range.bytes.size()==bytes){
-                dst=range.bytes;return true;
+                // The shared snapshot remains alive throughout upload_texture.
+                // Detile directly from it instead of copying the entire mip chain again.
+                data=range.bytes.data();return true;
             }
             return false;
         }
         if(!guest_capture_read_spans(base,bytes,spans))return false;
         dst.resize(bytes);
+        data=dst.data();
         return guest_copy_current_spans(base,bytes,spans,dst.data())&&current_epoch();
     };
     auto primary=[&]{
-        if(!primary_ready)primary_ready=capture_source(ts.base,cur_bytes,primary_source,primary_spans);
+        if(!primary_ready)primary_ready=capture_source(ts.base,cur_bytes,primary_source,primary_spans,primary_data);
         return primary_ready;
     };
     std::unique_ptr<Image> prev;
     auto it = textures.find(key);
-    bool found = it != textures.end();
+    // Replaying a retired epoch must never evict or replace the current
+    // resident version. Both can be sampled by independently captured lists.
+    const bool historical_replay=expired&&bool(owned);
+    bool found = !historical_replay&&it != textures.end();
     if (found && !it->second) { textures.erase(it); found = false; }
     if (found && it->second && it->second->stale) {
         prev = std::move(it->second);
@@ -2782,8 +2790,8 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             }
             if ((!split_resource||contiguous_high) && matches_shape(img)&&same_layout&&img->src_size == cur_bytes &&
                 (prepared ? prepared_hash==img->content :
-                 (primary()&&hash_bytes(primary_source.data(),cur_bytes)==img->content&&
-                  (owned||guest_matches_current_spans(ts.base,cur_bytes,primary_spans,primary_source.data()))&&current_epoch()))) {
+                 (primary()&&hash_bytes(primary_data,cur_bytes)==img->content&&
+                  (owned||guest_matches_current_spans(ts.base,cur_bytes,primary_spans,primary_data))&&current_epoch()))) {
                 img->remember_relocation();
                 img->res_val = res, img->src_addr = ts.base;
                 std::memcpy(img->resident_descriptor[0],t,32);
@@ -2894,12 +2902,12 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         if(!prepared&&!split){
             if(base_addr==ts.base&&needed<=cur_bytes){
                 if(!primary()){++texture_range_rejects;return false;}
-                tiled=primary_source.data();spans=&primary_spans;captured=cur_bytes;
+                tiled=primary_data;spans=&primary_spans;captured=cur_bytes;
             }else{
-                if(!capture_source(base_addr,needed,secondary_source,secondary_spans)){
+                if(!capture_source(base_addr,needed,secondary_source,secondary_spans,secondary_data)){
                     ++texture_range_rejects;return false;
                 }
-                tiled=secondary_source.data();spans=&secondary_spans;
+                tiled=secondary_data;spans=&secondary_spans;
             }
         }
         uint64_t total = 0;
@@ -3090,13 +3098,13 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             img->res_val = res, img->res_obj = smi.obj ? smi.obj : obj;
             img->src_addr=ts.base;img->src_size=cur_bytes;img->version=~0ull;
             img->content=prepared?prepared_hash:split_prepared?
-                hash_bytes(split_prepared->front().tiled.data(),cur_bytes):hash_bytes(primary_source.data(),cur_bytes);
+                hash_bytes(split_prepared->front().tiled.data(),cur_bytes):hash_bytes(primary_data,cur_bytes);
             if(top_only)++top_only_uploads;
             if(contiguous_high)++contiguous_high_uploads;
         } else if (ok && (opt.watch || dynamic_copy)) {
             const uint64_t tw = now_ns();
             img->version = mem_watch(ts.base, sf.total_size);
-            if(dynamic_copy)img->content=hash_bytes(primary_source.data(),sf.total_size);
+            if(dynamic_copy)img->content=hash_bytes(primary_data,sf.total_size);
             st.t_watch += now_ns() - tw;
             if (img->version != ~0ull) img->src_addr = ts.base, img->src_size = sf.total_size, img->checked = rc().submit_no;
 
@@ -3113,11 +3121,14 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             img->hi_loaded=false;
             img->last_used=rc().submit_no;
             img->last_frame=st.frames;
-            textures[key]=std::move(img);
+            if(img->descriptor_epoch[0]==res&&img->resident_descriptor[0][0])
+                source_ready(img->resident_descriptor[0],res,img.get());
+            if(historical_replay)archive_texture(key,std::move(img));
+            else textures[key]=std::move(img);
             ++split_partial_kept;
         }else{
             bury(std::move(img));
-            textures.erase(key);
+            if(!historical_replay)textures.erase(key);
         }
         ++views_gen;
         return nullptr;
@@ -3132,12 +3143,14 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     out->last_used = rc().submit_no;
     out->last_frame = st.frames;
     ++st.textures;
-    textures[key] = std::move(img); ++views_gen;
     if(split_resource){
         source_ready(t,res,out);
         if(out->low_loaded&&out->descriptor_epoch[0]==res&&out->resident_descriptor[0][0])
             source_ready(out->resident_descriptor[0],res,out);
     }
+    if(historical_replay)archive_texture(key,std::move(img));
+    else textures[key]=std::move(img);
+    ++views_gen;
     if(owned)++captured_source_replays;
     return out;
 }
@@ -6185,10 +6198,22 @@ static bool split_2d_surface(const uint32_t* words,tiling::Surface& sf){
 void Renderer::capture_owned_texture(const uint32_t* words,uint64_t res,uint64_t obj){
     if(!res||!obj||!opt.res_current||(words[3]>>28)<8||(words[3]>>28)>9)return;
     const auto key=texture_source_key(words,res);
+    // The shared capture gate prevents cache retirement while an epoch is
+    // being pinned. Cache only weak image identity, never snapshot bytes.
+    // A retired or rewritten image invalidates all copies of its token.
+    struct ReadyEntry {const Renderer* owner=nullptr;TextureSourceKey key{};ImageLifetime<Image>::Token token;};
+    static thread_local std::array<ReadyEntry,1024> ready_cache{};
+    auto& fast=ready_cache[TextureSourceKeyHash{}(key)&(ready_cache.size()-1)];
+    if(fast.owner==this&&fast.key==key&&ImageLifetime<Image>::resolve(fast.token))return;
     {
         std::lock_guard lk(source_m);
         const auto it=captured_sources.find(key);
-        if(it!=captured_sources.end()&&(it->second.nonsplit||it->second.owned||ImageLifetime<Image>::resolve(it->second.ready)))return;
+        if(it!=captured_sources.end()){
+            if(ImageLifetime<Image>::resolve(it->second.ready)){
+                fast={this,key,it->second.ready};return;
+            }
+            if(it->second.nonsplit||it->second.owned)return;
+        }
     }
     if(opt.res_current(obj)!=res||guest_region_extent(obj)<0x44)return;
     if(!*reinterpret_cast<const uint8_t*>(obj+0x34)){
