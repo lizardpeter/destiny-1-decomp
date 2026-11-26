@@ -701,6 +701,10 @@ struct Renderer {
         VkDeviceSize voff[16]{}, vsize[16]{};
         VkViewport vp{};
         VkRect2D sc{};
+        int32_t raw_vp[4]{};
+        uint32_t raw_pass_w=0,raw_pass_h=0;
+        float raw_znear=0,raw_zfar=0,raw_zk=0;
+        uint32_t raw_stencil_ctl=0,raw_depth_ctl=0,raw_stencil_ref=0;
         uint32_t sref = 0, cmask = 0, wmask = 0;
         float bias[2]{};
         VkBuffer ib = VK_NULL_HANDLE;
@@ -5271,18 +5275,31 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     if (push_dirty)
         vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, ds.stage_table_dword);
     if (!ds.valid) ds.vmask = 0;
-    for (uint32_t slot = 0; slot < 16;) {
-        auto same = [&](uint32_t k) {
-            return !(vmask >> k & 1) || ((ds.vmask >> k & 1) && ds.vb[k] == vbufs[k] && ds.voff[k] == voffs[k] && ds.vsize[k] == vsizes[k]);
-        };
-        if (same(slot)) { ++slot; continue; }
-        uint32_t end = slot + 1;
-        while (end < 16 && (vmask >> end & 1) && !same(end)) ++end;
-        vkCmdBindVertexBuffers2(cmd, slot, end - slot, &vbufs[slot], &voffs[slot], &vsizes[slot], nullptr);
-        for (uint32_t k = slot; k < end; ++k) ds.vb[k] = vbufs[k], ds.voff[k] = voffs[k], ds.vsize[k] = vsizes[k], ds.vmask |= 1u << k;
-        slot = end;
+    // Only visit used bindings. Most meshes consume far fewer than 16
+    // streams; never read the uninitialized entries in vbufs/voffs/vsizes.
+    uint32_t changed=vmask&~ds.vmask;
+    for(uint32_t m=vmask&ds.vmask;m;m&=m-1){
+        const uint32_t k=__builtin_ctz(m);
+        if(ds.vb[k]!=vbufs[k]||ds.voff[k]!=voffs[k]||ds.vsize[k]!=vsizes[k])changed|=1u<<k;
+    }
+    while(changed){
+        const uint32_t slot=__builtin_ctz(changed);
+        uint32_t end=slot+1;
+        while(end<16&&(changed&(1u<<end)))++end;
+        vkCmdBindVertexBuffers2(cmd,slot,end-slot,&vbufs[slot],&voffs[slot],&vsizes[slot],nullptr);
+        for(uint32_t k=slot;k<end;++k){
+            ds.vb[k]=vbufs[k];ds.voff[k]=voffs[k];ds.vsize[k]=vsizes[k];
+        }
+        const uint32_t bound=((1u<<end)-1)&~((1u<<slot)-1);
+        ds.vmask|=bound;changed&=~bound;
     }
 
+    // Viewport/scissor arithmetic depends on raw engine state and pass
+    // extent only. Avoid recomputing floats and comparing Vulkan structs
+    // for every draw of the same camera.
+    if(!ds.valid||ds.raw_pass_w!=rc().pass_w||ds.raw_pass_h!=rc().pass_h||
+       std::memcmp(ds.raw_vp,dr.vp,sizeof dr.vp)!=0||
+       ds.raw_znear!=dr.znear||ds.raw_zfar!=dr.zfar||ds.raw_zk!=dr.zk){
     VkViewport vp{};
     vp.x = float(dr.vp[0]), vp.width = float(dr.vp[2] > 0 ? dr.vp[2] : int32_t(rc().pass_w));
     vp.y = float(dr.vp[1] + (dr.vp[3] > 0 ? dr.vp[3] : int32_t(rc().pass_h)));
@@ -5296,13 +5313,19 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
                 {std::min<uint32_t>(rc().pass_w - std::min<uint32_t>(rc().pass_w, sx), uint32_t(std::max(1.0f, vp.width))),
                  std::min<uint32_t>(rc().pass_h - std::min<uint32_t>(rc().pass_h, sy), uint32_t(std::max(1.0f, -vp.height)))}};
     if (!ds.valid || std::memcmp(&ds.sc, &sc, sizeof sc) != 0) vkCmdSetScissor(cmd, 0, 1, &sc), ds.sc = sc;
-    {
+    std::memcpy(ds.raw_vp,dr.vp,sizeof dr.vp);
+    ds.raw_pass_w=rc().pass_w;ds.raw_pass_h=rc().pass_h;
+    ds.raw_znear=dr.znear;ds.raw_zfar=dr.zfar;ds.raw_zk=dr.zk;
+    }
+    if(!ds.valid||ds.raw_stencil_ctl!=dr.stencil_ctl||
+       ds.raw_depth_ctl!=dr.depth_ctl||ds.raw_stencil_ref!=dr.stencil_ref){
         uint32_t sref, swm;
         stencil_dynamic(dr.stencil_ctl, dr.depth_ctl, dr.stencil_ref, sref, swm);
         const uint32_t cmask = dr.stencil_ref >> 8 & 0xFF;
         if (!ds.valid || ds.sref != sref) vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, sref), ds.sref = sref;
         if (!ds.valid || ds.cmask != cmask) vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, cmask), ds.cmask = cmask;
         if (!ds.valid || ds.wmask != swm) vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, swm), ds.wmask = swm;
+        ds.raw_stencil_ctl=dr.stencil_ctl;ds.raw_depth_ctl=dr.depth_ctl;ds.raw_stencil_ref=dr.stencil_ref;
     }
     if (!ds.valid || ds.bias[0] != dr.poly_offset || ds.bias[1] != dr.poly_scale)
         vkCmdSetDepthBias(cmd, dr.poly_offset, 0.0f, dr.poly_scale), ds.bias[0] = dr.poly_offset, ds.bias[1] = dr.poly_scale;
