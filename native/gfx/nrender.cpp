@@ -596,11 +596,11 @@ struct Renderer {
     std::unordered_map<uint64_t, std::unique_ptr<Image>> targets;   // (base, format, size)
     std::unordered_map<uint64_t, Image*> target_by_base;            // newest target at an address
     std::vector<std::unique_ptr<Image>> retired;                    // replaced targets (still referenced)
-    std::unordered_map<uint64_t, std::unique_ptr<Image>> textures;  // T# hash or resource ID
-    std::unordered_map<uint64_t,std::vector<std::unique_ptr<Image>>> texture_history;
+    std::unordered_map<TextureKey, std::unique_ptr<Image>, TextureKeyHash> textures;
+    std::unordered_map<TextureKey,std::vector<std::unique_ptr<Image>>,TextureKeyHash> texture_history;
     uint64_t texture_history_bytes=0,texture_history_hits=0,texture_history_drops=0;
-    Image* historical_texture(uint64_t key,const uint32_t* t,uint64_t res);
-    void archive_texture(uint64_t key,std::unique_ptr<Image> img);
+    Image* historical_texture(const TextureKey& key,const uint32_t* t,uint64_t res);
+    void archive_texture(const TextureKey& key,std::unique_ptr<Image> img);
     void trim_texture_history(bool all=false);
     std::unordered_map<uint64_t, SamplerEntry> samplers;
     std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders;
@@ -1153,13 +1153,10 @@ struct Renderer {
     void publish_shader_mask(uint64_t key, uint16_t mask);
     void warm_shader_specs(const uint8_t* obj, bool vs, uint64_t res);
     void load_pipeline_specs();
-    // 0x7D4480 (texture_mips) rewrites t[0] (base), t[2] (width/height), t[3] (last_level), and
-    // t[4] (pitch) when toggling between low-mip and hi-mip state. Keying solely by the engine
-    // resource ID (res >> 32) guarantees one persistent VkImage for the texture's lifetime.
-    static uint64_t tex_key(const uint32_t* t, uint64_t res) {
-        if (!res) return hash_bytes(t, 32) & ~(1ull << 63);
-        const auto c=texture_identity_words(t);
-        return hash_bytes(c.data(),32,(res>>32)*0x9E3779B97F4A7C15ull)|(1ull<<63);
+    // Native resource identity plus canonical image interpretation. The
+    // original T# is retained only for dynamic, unregistered allocations.
+    static TextureKey tex_key(const uint32_t* t, uint64_t res) {
+        return texture_key(t,res);
     }
     void evict_textures();
     uint16_t sampler_id(const uint32_t* s, bool nearest = false);
@@ -2425,7 +2422,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         uint64_t t0;
         ~LoadTimer() { r->st.t_tex_load += now_ns() - t0; }
     };
-    const uint64_t key = tex_key(t, res);
+    const auto key = tex_key(t, res);
     ++st.tex_checks;
     // Registered image ownership is already established by the exact epoch
     // and successfully uploaded descriptor. No tile-layout calculation,
@@ -2613,7 +2610,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     }
     if (found) {
         Image* img = it->second.get();
-        if (!res && st.unreg_tex.size() < 100000) st.unreg_tex[key] = uint64_t(img->w) * img->h * std::max(1u, img->bpp / 8);
+        if (!res && st.unreg_tex.size() < 100000) st.unreg_tex[TextureKeyHash{}(key)] = uint64_t(img->w) * img->h * std::max(1u, img->bpp / 8);
         if (img->checked == rc().submit_no || !img->src_size || (!opt.version && !dynamic_copy)) {
             st.t_tex_hit += now_ns() - t_in;
             return img;
@@ -2631,7 +2628,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     }
 
     LoadTimer load_timer{this, t_in};
-    if (!res && st.unreg_tex.size() < 100000) st.unreg_tex[key] = uint64_t(ts.width) * ts.height;
+    if (!res && st.unreg_tex.size() < 100000) st.unreg_tex[TextureKeyHash{}(key)] = uint64_t(ts.width) * ts.height;
     tsharp_bases.insert(ts.base);
 
     std::unique_ptr<Image> img;
@@ -3354,7 +3351,7 @@ void Renderer::evict_geo() {
 // Textures unused for a while are dropped (re-uploaded if the game uses them again): the
 // game streams, and an address range can hold many textures over a session. The image is
 // destroyed once the submissions that may still read it have completed.
-Image* Renderer::historical_texture(uint64_t key,const uint32_t* t,uint64_t res){
+Image* Renderer::historical_texture(const TextureKey& key,const uint32_t* t,uint64_t res){
     auto cur=textures.find(key);
     if(cur!=textures.end()&&cur->second&&cur->second->res_val!=res&&
        cur->second->matches_epoch(t,res))return cur->second.get();
@@ -3363,7 +3360,7 @@ Image* Renderer::historical_texture(uint64_t key,const uint32_t* t,uint64_t res)
         for(auto& img:it->second)if(img->matches_epoch(t,res))return img.get();
     return nullptr;
 }
-void Renderer::archive_texture(uint64_t key,std::unique_ptr<Image> img){
+void Renderer::archive_texture(const TextureKey& key,std::unique_ptr<Image> img){
     if(!img)return;
     constexpr uint64_t budget=256ull<<20;
     if(img->stale||!img->res_val){
@@ -3409,14 +3406,14 @@ void Renderer::evict_textures() {
     const uint64_t horizon = 1800, now = st.frames;
     if (now < horizon) return;
     auto gate=texture_leases().retire();
-    std::vector<uint64_t> drop;
+    std::vector<TextureKey> drop;
     for (auto& [k, img] : textures) {
         if (!img) continue;
         const bool still_registered = img->res_val && img->res_obj && opt.res_current &&
                                       (opt.res_current(img->res_obj) >> 32) == (img->res_val >> 32);
         if (!still_registered && img->last_frame + horizon < now && !img->captured()) drop.push_back(k);
     }
-    for (uint64_t k : drop) {
+    for (const auto& k : drop) {
         auto it = textures.find(k);
         bury(std::move(it->second));  // (freed once every recording that may use it has completed)
         textures.erase(it); ++views_gen;
@@ -5530,7 +5527,7 @@ void Renderer::load_texture(const LoadJob& j) {
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
     if(j.mapping.empty()||j.size!=sf.total_size||!sf.total_size||sf.total_size>(128ull<<20))return;
-    const uint64_t key = tex_key(t, j.res);
+    const auto key = tex_key(t, j.res);
     {
         std::lock_guard lk(m);
         auto it = textures.find(key);

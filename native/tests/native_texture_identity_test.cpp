@@ -2,6 +2,7 @@
 #include "native_texture_leases.h"
 #include <cstdlib>
 #include <cstdio>
+#include <unordered_map>
 using namespace d1::ng;
 static void check(bool x){if(!x)std::abort();}
 int main(){
@@ -33,6 +34,14 @@ int main(){
         check(texture_identity_words(high)==texture_identity_words(view));
         check(texture_source_layout_equal(high,view));
     }
+    struct Collision {size_t operator()(const TextureKey&)const{return 0;}};
+    std::unordered_map<TextureKey,int,Collision> images;
+    auto akey=texture_key(high,(uint64_t(17)<<32)|1);
+    auto bkey=texture_key(high,(uint64_t(18)<<32)|1);
+    auto ckey=texture_key(high,0);
+    images[akey]=1;images[bkey]=2;images[ckey]=3;
+    check(images.size()==3&&images.at(akey)==1&&images.at(bkey)==2&&images.at(ckey)==3);
+    check(akey==texture_key(high,(uint64_t(17)<<32)|99));
     TextureLeaseRegistry registry;
     {
         TextureLeaseSet a(registry);

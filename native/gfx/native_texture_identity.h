@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <array>
+#include <cstddef>
 namespace d1::ng {
 // A split texture may change its physical tile mode, pow2 padding and
 // 1D/2D descriptor type as the engine replaces the resident mip range.
@@ -27,4 +28,29 @@ inline bool texture_source_layout_equal(const uint32_t* a,const uint32_t* b){
            (a[3]&0xf3ff0000u)==(b[3]&0xf3ff0000u)&&a[4]==b[4]&&
            a[5]==b[5]&&a[6]==b[6]&&a[7]==b[7];
 }
+// Native image identity is an exact key; a hash chooses a bucket, never
+// decides whether a different asset or descriptor owns the same VkImage.
+struct TextureKey {
+    uint32_t resource=0;
+    std::array<uint32_t,8> words{};
+    bool operator==(const TextureKey&) const = default;
+};
+inline TextureKey texture_key(const uint32_t* t,uint64_t epoch){
+    TextureKey key{};
+    key.resource=uint32_t(epoch>>32);
+    if(epoch)key.words=texture_identity_words(t);
+    else for(unsigned i=0;i<8;++i)key.words[i]=t[i];
+    return key;
+}
+struct TextureKeyHash {
+    size_t operator()(const TextureKey& key) const noexcept {
+        uint64_t h=key.resource;
+        for(unsigned i=0;i<8;i+=2){
+            const uint64_t v=uint64_t(key.words[i])|(uint64_t(key.words[i+1])<<32);
+            h=(h*0xC2B2AE3D27D4EB4Full+v)*0x9E3779B97F4A7C15ull;
+            h^=h>>31;
+        }
+        return size_t(h);
+    }
+};
 } // namespace d1::ng
