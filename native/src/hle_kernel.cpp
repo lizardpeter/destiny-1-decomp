@@ -231,6 +231,15 @@ void for_each_guest_region(void (*fn)(uint64_t addr, uint64_t size)) {
     for (auto& [a, n] : v) fn(a, n);
 }
 
+// Permanent native CPU allocation arenas are host mappings too, but are
+// not PS4 direct-memory allocations and must not enter GPU write tracking.
+void register_native_host_region(uint64_t base, uint64_t size) {
+    if (!base || !size || size > UINT64_MAX - base) return;
+    std::lock_guard lk(g_mem_mutex);
+    g_regions[base] = Region{size, 3, false, 0, "native_arena"};
+    g_regions_gen.fetch_add(1, std::memory_order_release);
+}
+
 uint64_t guest_region_extent(uint64_t addr) {
     static thread_local RegionExtentCache cache;
     return cache.lookup(addr, g_regions_gen, g_mem_mutex, g_regions);
