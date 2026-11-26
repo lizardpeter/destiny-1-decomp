@@ -20,6 +20,7 @@ public:
     using Id = uint32_t;
     using Callback = std::function<void(Id, Result)>;
     using Delivery = std::function<Result(std::span<const unsigned char>, Result)>;
+    using Task = std::function<Result()>;
 private:
     struct Op {
         std::shared_ptr<File> file;
@@ -29,6 +30,7 @@ private:
         ByteBudget::Lease storage;
         std::vector<unsigned char> bytes;
         Delivery delivery;
+        Task task;
         Callback callback;
         Result result;
         bool done = false;
@@ -55,7 +57,10 @@ private:
             auto& op = in_flight.front().second;
             lock.unlock();
             Result r;
-            if (op->write) r = op->file->write_at(op->offset, op->bytes.data(), op->size);
+            if (op->task) {
+                try { r = op->task(); }
+                catch (...) { r = {0, error(std::errc::io_error)}; }
+            } else if (op->write) r = op->file->write_at(op->offset, op->bytes.data(), op->size);
             else if (op->delivery) {
                 r = op->file->read_at(op->offset, op->bytes.data(), op->size);
                 // The destination owner decides whether a completed read may
@@ -98,9 +103,9 @@ private:
         std::lock_guard lock(m_);
         ec.clear();
         auto it = files_.find(file);
-        if (it == files_.end()) { ec = error(std::errc::bad_file_descriptor); return 0; }
+        if (!op->task && it == files_.end()) { ec = error(std::errc::bad_file_descriptor); return 0; }
         if (stopping_ || !next_op_ || ops_.size() >= limit_) { ec = error(std::errc::resource_unavailable_try_again); return 0; }
-        op->file = it->second;
+        if (!op->task) op->file = it->second;
         const Id id = next_op_++;
         ops_.emplace(id, op);
         try { jobs_.emplace_back(id, std::move(op)); }
@@ -170,6 +175,13 @@ public:
         try { op->bytes.resize(size_t(n)); }
         catch (const std::bad_alloc&) { ec = error(std::errc::not_enough_memory); return 0; }
         return submit(file, std::move(op), ec);
+    }
+    // File-independent asynchronous operations (e.g. directory creation).
+    Id submit_task(Task task, Callback cb, std::error_code& ec) {
+        if (!task) { ec = error(std::errc::invalid_argument); return 0; }
+        auto op = std::make_shared<Op>();
+        op->task = std::move(task); op->callback = std::move(cb);
+        return submit(0, std::move(op), ec);
     }
     uint64_t staging_bytes() const { return budget_.used(); }
     // Wait keeps a reference even if a concurrent callback deletes the public ID.
