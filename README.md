@@ -15,8 +15,6 @@ Decompilation and native PC port of Destiny (PS4, CUSA00219, patch 01.33).
 
 No game files are in this repository. You need your own copy of the game.
 
-### Native migration switches
+### Native-only PC port
 
-The PC graphics asset backing, resource binding/blitter, command close/drain/ring, command-buffer manager and device-local geometry paths are enabled by default, as are native FIOS and libc math. For regression isolation only, set `D1_PC_NATIVE_ASSET_BACKING`, `D1_PC_NATIVE_BIND`, `D1_PC_NATIVE_CLOSE`, `D1_PC_NATIVE_DRAIN`, `D1_PC_NATIVE_RING`, `D1_PC_NATIVE_CBM`, `D1_PC_NATIVE_CBM_POOL`, `D1_NG_LOCAL_GEOMETRY`, `D1_NATIVE_FIOS` or `D1_PC_LIBC_MATH` to `0`. Dependent paths are disabled with their prerequisites. Native FIOS still requires the original libc module. These defaults have not yet been validated in live gameplay; see [native platform migration](docs/native-platform-migration.md).
-
-`D1_PC_NATIVE_ASSET_SUBALLOC=0` disables the native GPU-region suballocation subset; disabling asset backing also disables suballocation.
+The production architecture is native x86-64, Vulkan and host platform services. No legacy fallback for completed subsystems. See [the mandatory architecture contract](docs/native-only-architecture.md) and [AGENTS.md](AGENTS.md). Existing original dependencies are migration debt; historical regression switches in older documentation are not a supported production architecture. Native graphics resource management, submission, asset backing and platform services are being consolidated into one implementation. Live correctness and performance are measured separately from code coverage.
