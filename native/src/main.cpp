@@ -29,7 +29,7 @@
 
 #include "hle.h"
 #include "discord.h"
-#include "render_bridge.h"
+#include "pc_frontend.h"
 #include "settings.h"
 #include "runtime.h"
 
@@ -238,7 +238,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     install_crash_handler();
-    gpu_init();
     discord_start();
 
     pthread_attr_t a;
