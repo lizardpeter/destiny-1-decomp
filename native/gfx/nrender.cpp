@@ -983,7 +983,7 @@ struct Renderer {
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
     Image* upload_texture(const uint32_t* t, uint64_t res = 0, uint64_t obj = 0,
                           const uint8_t* prepared = nullptr, uint64_t prepared_size = 0);
-    void resolve_draw_resources(const std::vector<Draw*>& draws, bool have_lock);
+    void resolve_draw_resources(Draw* const* draws, size_t count, bool have_lock);
     struct DiskPipeSpec {
         uint64_t vs_hash = 0, ps_hash = 0;
         uint64_t tex_sig[2] = {};
@@ -1110,11 +1110,12 @@ struct Renderer {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         DrawState* ds = nullptr;
         bool parallel = false;
+        bool secondary = false; // parent holds Renderer::m while waiting for this worker
         uint64_t t_pipe = 0, t_geo = 0, t_desc = 0, t_cmd = 0, draws = 0, bytes_vtx = 0, bytes_idx = 0, bytes_cb = 0, predicated = 0, memo_tl = 0;
         uint64_t chunk_pos = 0, chunk_end = 0;  // (parallel) this worker's slice of the ring
         std::vector<Sub::ReCopy> recopy;        // (see Sub::recopy)
     };
-    std::mutex pipe_m, geo_m, tex_m, set_m, ring_m, skip_m;
+    std::mutex pipe_m, geo_m, tex_m, set_m, ring_m, skip_m, secondary_view_m;
     uint64_t rec_ring(Rec& r, uint64_t size, uint64_t align = 256);
     uint64_t rec_copy(Rec& r, const void* src, uint64_t size) {
         const uint64_t p = rec_ring(r, std::max<uint64_t>(size, 16));
@@ -1128,10 +1129,15 @@ struct Renderer {
         if (rc().lr && !r.recopy.empty()) rc().recopy.insert(rc().recopy.end(), r.recopy.begin(), r.recopy.end());
     }
     void draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run_depth);
-    void draw(const Draw& dr) {
+    void draw(Draw& dr) {
+        Image* colors[8] = {};
+        for (int i = 0; i < 5; ++i) colors[i] = color_target(dr.color[i]);
+        Image* depth = depth_target(dr.depth);
+        Draw* one = &dr;
+        resolve_draw_resources(&one, 1, true);
         Rec r;
         r.cmd = rc().cmd, r.ds = &rc().dstate;
-        draw(dr, r, nullptr, nullptr);
+        draw(dr, r, colors, depth);
         merge(r);
     }
     void clear(const Draw& dr);
@@ -3602,6 +3608,9 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
         for (size_t i = 0; i < n; ++i) skip("no target");
         return;
     }
+    // Resolve views against the targets bound for this run, not against the
+    // address aliases that happened to be current at submission start.
+    resolve_draw_resources(run, n, true);
     const uint32_t T = rec_threads + 1;
     Sub& sb = subs[rc().cur];
     if (sb.sec.size() < T) sb.sec.resize(T);
@@ -3633,7 +3642,7 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
     auto slice = [&](uint32_t t) {
         const size_t b = n * t / T, e = n * (t + 1) / T;
         Rec& r = recs[t];
-        r.cmd = cbs[t], r.ds = &states[t], r.parallel = true;
+        r.cmd = cbs[t], r.ds = &states[t], r.parallel = true, r.secondary = true;
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
         bi.pInheritanceInfo = &ii;
@@ -4052,7 +4061,7 @@ void Renderer::masked_stencil_clear(Image* depth, uint32_t value, uint32_t write
 // Pre-resolves every draw's textures and samplers to bindless IDs and 4-bit (TexDim, tex_kind)
 // signatures before the draw loop runs. Uses thread-local caches validated by views_gen so the
 // shared renderer mutex is only taken on a cache miss when called without the lock.
-void Renderer::resolve_draw_resources(const std::vector<Draw*>& draws, bool have_lock) {
+void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, bool have_lock) {
     struct TvEntry { uint64_t key = 0, gen = 0; ViewHandle vh{}; Image* tex = nullptr; };
     static thread_local std::unique_ptr<TvEntry[]> tvc_ptr;
     if (!tvc_ptr) tvc_ptr = std::make_unique<TvEntry[]>(4096);
@@ -4064,8 +4073,8 @@ void Renderer::resolve_draw_resources(const std::vector<Draw*>& draws, bool have
 
     const uint64_t gen = views_gen.load(std::memory_order_acquire) ^ (targets_gen.load(std::memory_order_acquire) * 0x9E3779B97F4A7C15ull);
     const uint64_t sub_no = rc().submit_no;
-    for (Draw* dp : draws) {
-        Draw& dr = *dp;
+    for (size_t di = 0; di < count; ++di) {
+        Draw& dr = *draws[di];
         if (dr.kind != Draw::Indexed && dr.kind != Draw::Auto) continue;
         if (!dr.vb_sig) {
             uint64_t vsig = 0;
@@ -4408,7 +4417,10 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
                 const uint64_t base = (uint64_t(T[0]) | uint64_t(T[1] & 0xFF) << 32) << 8;
                 for (auto& [att, sn] : rc().snaps)
                     if (att->base == base) {
-                        std::unique_lock<std::mutex> lk(this->m, std::defer_lock);
+                        // Secondary workers run while their parent owns m and waits
+                        // for them. Serialize their view creation with a separate
+                        // mutex; list recorders, whose parent released m, use m.
+                        std::unique_lock<std::mutex> lk(r.secondary ? secondary_view_m : this->m, std::defer_lock);
                         if (r.parallel) lk.lock();
                         const auto ts = fmt::decode_tsharp(T);
                         auto sit = stencil_by_base.find(ts.base);
@@ -4630,7 +4642,6 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
     begin_record();
     run_copies(draws);
     pre_pass(draws);
-    resolve_draw_resources(draws, true);
     rc().q_on = false;
     for (Draw* d : draws) rc().q_on |= d->kind == Draw::ZPass;
     if (rc().q_on) {
@@ -4769,7 +4780,7 @@ void Renderer::load_texture(const LoadJob& j) {
         std::lock_guard lk(m);
         if (target_bases.count(ts.base)) return;
         auto it = textures.find(key);
-        if (it != textures.end() && it->second) {
+        if (it != textures.end() && it->second && !it->second->stale) {
             Image* img = it->second.get();
             if (img->res_val == j.res && img->src_addr == ts.base) { ++ld_skipped; return; }
             if (img->content == content && img->src_size == sf.total_size) {
@@ -4926,8 +4937,7 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
             feedback_snapshots(items.data() + i, j - i, colors, depth);
             begin_pass(colors, depth);
             lk.unlock();
-            std::vector<Draw*> run_slice(items.begin() + i, items.begin() + j);
-            resolve_draw_resources(run_slice, false);
+            resolve_draw_resources(items.data() + i, j - i, false);
             for (size_t k = i; k < j; ++k) draw(*items[k], run_rec, colors, depth);
             relock();
             i = j - 1;
