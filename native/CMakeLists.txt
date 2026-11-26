@@ -84,7 +84,6 @@ if(NOT WIN32)
   target_compile_options(d1-native PRIVATE -Wno-format)
 endif()
 
-target_sources(d1-native PRIVATE src/render_null.cpp)
 # Window, input and audio (SDL2; on Windows linked in statically, so no SDL2.dll next to the exe).
 option(D1_NATIVE_WINDOW "Game window, input and audio with SDL2" ON)
 if(D1_NATIVE_WINDOW)
@@ -96,6 +95,8 @@ if(D1_NATIVE_WINDOW)
   else()
     target_link_libraries(d1-native PRIVATE SDL2::SDL2)
   endif()
+else()
+  target_sources(d1-native PRIVATE src/frontend_headless.cpp)
 endif()
 
 # Development tool for the native shader translator (decode / disassemble / translate).
