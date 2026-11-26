@@ -477,6 +477,7 @@ struct GeoEntry {
 };
 struct GeoBlock {
     Buffer buf;
+    bool device_local = false; // unmapped GPU-owned geometry pool, written by transfer commands
     std::map<uint64_t, uint64_t> free;  // offset -> size
 };
 
@@ -530,7 +531,8 @@ struct Renderer {
         uint64_t off = 0, size = 0;
         uint32_t vfirst = 0, vlast = 0;
     };
-    bool geo_alloc(uint64_t size, int& block, uint64_t& off);
+    bool geo_alloc(uint64_t size, int& block, uint64_t& off, bool device_local = false);
+    bool prepare_local_geometry(const Draw::Res& res);
     void geo_free_now(int block, uint64_t off, uint64_t size);
     void geo_free_later(int block, uint64_t off, uint64_t size);
     // res / rbase: an engine resource (id << 32 | epoch) and its memory's start: kept by
@@ -2737,11 +2739,17 @@ void Renderer::fill_missing_mips(uint32_t first, uint8_t* staging, const std::ve
 }
 
 // ---------------------------------------------------------------------------- geometry cache
-bool Renderer::geo_alloc(uint64_t size, int& block, uint64_t& off) {
+static bool local_geometry_enabled() {
+    static const bool enabled = [] { const char* v = std::getenv("D1_NG_LOCAL_GEOMETRY"); return v && std::atoi(v) != 0; }();
+    return enabled;
+}
+
+bool Renderer::geo_alloc(uint64_t size, int& block, uint64_t& off, bool device_local) {
     std::lock_guard lk(geo_block_m);
     size = (size + 255) & ~255ull;
     for (int pass = 0; pass < 2; ++pass) {
         for (size_t b = 0; b < geo_blocks.size(); ++b)
+            if (geo_blocks[b].device_local == device_local)
             for (auto it = geo_blocks[b].free.begin(); it != geo_blocks[b].free.end(); ++it)
                 if (it->second >= size) {
                     block = int(b), off = it->first;
@@ -2757,10 +2765,19 @@ bool Renderer::geo_alloc(uint64_t size, int& block, uint64_t& off) {
         }();
         if (geo_blocks.capacity() < max_blocks) geo_blocks.reserve(max_blocks);  // (first call, before any reader)
         if (pass || geo_blocks.size() >= max_blocks) return false;
-        // a new 64 MiB block: host-visible (device-local too where the GPU offers it)
+        // Preserve at least half of the budget for CPU-written/dynamic geometry.
+        // The device-local pool does not consume a BAR mapping.
+        if (device_local && size_t(std::count_if(geo_blocks.begin(), geo_blocks.end(),
+                [](const GeoBlock& b) { return b.device_local; })) >= max_blocks / 2) return false;
         GeoBlock nb;
-        nb.buf = make_buffer(64ull << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true, true);
-        if (!nb.buf.map) return false;
+        nb.device_local = device_local;
+        constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        if (device_local)
+            nb.buf = make_native_buffer(64ull << 20, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false);
+        else
+            nb.buf = make_buffer(64ull << 20, usage, true, true);
+        if (!nb.buf.buf || (!device_local && !nb.buf.map)) return false;
         nb.free[0] = nb.buf.size;
         geo_blocks.push_back(std::move(nb));
     }
@@ -2791,6 +2808,59 @@ void Renderer::geo_free_now(int block, uint64_t off, uint64_t size) {
 void Renderer::geo_free_later(int block, uint64_t off, uint64_t size) {
     std::lock_guard lk(grave_m);
     grave.push_back({submit_seq.load(), nullptr, {uint64_t(block), off, size}});
+}
+
+// Only the ordered primary pre-pass can publish device-local buffers. Recording workers
+// bind those buffers but never emit transfer commands, and the speculative loader cannot
+// publish a device-local buffer before its transfer is recorded.
+bool Renderer::prepare_local_geometry(const Draw::Res& res) {
+    if (!res.id || res.base < 0x10000 || !res.size || res.size >= (64ull << 20) ||
+        guest_region_extent(res.base) < res.size || rc().cur == UINT32_MAX || rc().lr) return false;
+    const GeometryKey key{res.id >> 32, 0, res.size, 0, 0};
+    GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
+    std::unique_lock lk(sh.m);
+    GeoEntry& e = sh.map[key];
+    e.last_used = submit_seq.load(std::memory_order_relaxed);
+    if (e.valid && e.res == res.id) return false; // already resident (including mapped fallback)
+    const auto* src = reinterpret_cast<const void*>(res.base);
+    const uint64_t content = hash_bytes(src, res.size);
+    if (e.valid && e.hash == content) {
+        e.res = res.id; // a relocation without a data change
+        return false;
+    }
+    int block = -1;
+    uint64_t off = 0;
+    if (!geo_alloc(res.size, block, off, true)) return false;
+    const uint64_t padded = (res.size + 3) & ~3ull;
+    // Use an independent staging allocation so static mesh uploads cannot exhaust
+    // the circular ring reserved for draw-time constants and dynamic geometry.
+    Buffer staging = make_native_buffer(padded, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, true);
+    if (!staging.map) {
+        geo_free_now(block, off, res.size);
+        return false;
+    }
+    std::memcpy(staging.map, src, res.size);
+    std::memset(staging.map + res.size, 0, padded - res.size);
+    if (hash_bytes(staging.map, res.size) != content ||
+        guest_region_extent(res.base) < res.size || hash_bytes(src, res.size) != content) {
+        free_buffer(staging);
+        geo_free_now(block, off, res.size);
+        return false; // resource changed during snapshot; ordinary path will retry
+    }
+    end_pass();
+    VkBufferCopy copy{0, off, padded};
+    vkCmdCopyBuffer(rc().cmd, staging.buf, geo_blocks[size_t(block)].buf.buf, 1, &copy);
+    subs[rc().cur].staging.push_back(staging); // owned until completion fence
+    if (e.valid) {
+        geo_evict_gen.fetch_add(1, std::memory_order_release);
+        geo_free_later(e.block, e.off, e.size);
+    }
+    e.block = block, e.off = off, e.size = res.size, e.hash = content;
+    e.res = res.id, e.uploaded = e.last_used, e.valid = true;
+    e.vfirst = e.vlast = 0; // whole-resource entries do not contain index-range metadata
+    __atomic_fetch_add(&st.bytes_geo, res.size, __ATOMIC_RELAXED);
+    return true;
 }
 
 // A GPU copy of guest memory [addr, addr+size), valid for this submission, or null (then the
@@ -4809,6 +4879,34 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                 }
     }
     flush_uploads();
+    if (local_geometry_enabled() && !rc().lr && !(debug_toggles() & 8)) {
+        // Prepare each exact resource epoch/range once per ordered segment, before
+        // any graphics secondary begins. Different versions remain distinct.
+        std::unordered_set<GeometryKey, GeometryKeyHash> seen_geometry;
+        bool copied = false;
+        auto prepare = [&](const Draw::Res& r) {
+            if (!r.id || !r.size) return;
+            const GeometryKey key{r.id, r.base, r.size, 0, 0};
+            if (seen_geometry.insert(key).second) copied |= prepare_local_geometry(r);
+        };
+        for (size_t di = 0; di < count; ++di) {
+            const Draw& d = *draws[di];
+            if (d.kind != Draw::Indexed && d.kind != Draw::Auto) continue;
+            if (d.kind == Draw::Indexed) prepare(d.ires);
+            if (d.inline_vertices.empty()) for (const auto& r : d.vres) prepare(r);
+        }
+        if (copied) {
+            VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
+            b.dstAccessMask = VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.memoryBarrierCount = 1;
+            di.pMemoryBarriers = &b;
+            vkCmdPipelineBarrier2(rc().cmd, &di);
+        }
+    }
     st.t_pre += now_ns() - tp;
 }
 
@@ -4956,6 +5054,7 @@ void Renderer::start_loader() {
 }
 
 void Renderer::load_buffer(const LoadJob& j) {
+    if (local_geometry_enabled()) return; // ordered pre-pass owns static GPU uploads
     if (j.base < 0x10000 || !j.size || j.size >= (64ull << 20) || guest_region_extent(j.base) < j.size) return;
     if (geo_lookup_res(j.base, j.size, 0, 0, j.res, j.base)) ++ld_buf;
 }
