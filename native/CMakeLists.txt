@@ -141,3 +141,7 @@ add_executable(pc-file-test tests/pc_file_test.cpp)
 target_include_directories(pc-file-test PRIVATE src)
 target_link_libraries(pc-file-test PRIVATE Threads::Threads)
 add_test(NAME pc-file COMMAND pc-file-test "${CMAKE_CURRENT_BINARY_DIR}/pc-file-test.bin")
+
+add_executable(pc-paths-test tests/pc_paths_test.cpp)
+target_include_directories(pc-paths-test PRIVATE src)
+add_test(NAME pc-paths COMMAND pc-paths-test "${CMAKE_CURRENT_BINARY_DIR}/pc-paths-test-dir")
