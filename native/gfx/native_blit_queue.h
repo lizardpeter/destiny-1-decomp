@@ -16,6 +16,12 @@ constexpr uint32_t used(uint64_t cursor){
 constexpr bool can_request(uint64_t cursor,uint32_t count){
     return valid(cursor)&&uint32_t(used(cursor)+count)<=capacity;
 }
+constexpr bool contains(uint64_t cursor,uint32_t slot) {
+    return valid(cursor)&&slot<capacity&&(slot+capacity-head(cursor))%capacity<used(cursor);
+}
+constexpr bool completed(uint32_t sample,uint32_t sequence){
+    return ((sample-sequence)&0x80000000u)==0;
+}
 constexpr bool reserve(uint64_t cursor,uint64_t& updated,uint32_t& slot){
     if(!valid(cursor)||next(tail(cursor))==head(cursor))return false;
     slot=tail(cursor);updated=pack(head(cursor),next(slot));return true;

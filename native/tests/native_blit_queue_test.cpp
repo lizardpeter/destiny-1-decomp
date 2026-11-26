@@ -10,6 +10,9 @@ int main(){
         const auto cursor=blit::pack(h,t);
         const auto count=(t+blit::capacity-h)%blit::capacity;
         check(blit::used(cursor)==count);
+        check(blit::contains(cursor,h)==(count!=0));
+        check(!blit::contains(cursor,t));
+        if(count)check(blit::contains(cursor,(t+blit::capacity-1)%blit::capacity));
         uint64_t updated=0;uint32_t slot=0;
         const bool ok=blit::reserve(cursor,updated,slot);
         check(ok==(count<blit::capacity-1));
@@ -29,6 +32,8 @@ int main(){
         expected[60]=0;
         blit::initialize(obj.data(),r);
         check(obj==expected);
+        const uint32_t done=rng(),seq=rng();
+        check(blit::completed(done,seq)==((uint64_t(done)+0x100000000ull-seq)%0x100000000ull<0x80000000ull));
     }
     check(!blit::valid(blit::pack(blit::capacity,0)));
     std::puts("6553600 blit cursor pairs and 100000 record layouts passed");

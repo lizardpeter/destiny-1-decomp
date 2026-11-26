@@ -638,6 +638,72 @@ D1_SYSV bool h_blit_enqueue(uint64_t dst,uint64_t src,uint32_t size,uint64_t cal
     __atomic_exchange_n(reinterpret_cast<uint32_t*>(record),1u,__ATOMIC_SEQ_CST);
     return true;
 }
+// The original blitter has a single consumer, which first issues a
+// ready prefix and later retires the completed prefix. Keep that contract
+// and the original batch device/label operations until they are migrated.
+D1_SYSV bool h_blit_submit(uint32_t mode) {
+    using namespace ng::blit;
+    const uint64_t base=nr::eb<uint64_t>(0x26DF268);
+    if(!base)return true;
+    auto* cursor=reinterpret_cast<uint64_t*>(base+0x28000);
+    auto state=__atomic_load_n(cursor,__ATOMIC_ACQUIRE);
+    if(!valid(state))std::abort();
+    uint32_t slot=head(state);
+    alignas(8) uint8_t batch[16]{};
+    ng::binding::store(batch,8,mode);
+    using BatchFn=D1_SYSV void(*)(void*);
+    using IssueFn=D1_SYSV void(*)(void*,void*);
+    bool issued=false;
+    while(contains(state,slot)){
+        const uint64_t record=base+uint64_t(slot)*0x40;
+        if(__atomic_load_n(reinterpret_cast<uint32_t*>(record),__ATOMIC_ACQUIRE)!=1)break;
+        if(field<uint8_t>(record,0x3c)==0){
+            if(!issued){
+                reinterpret_cast<BatchFn>(nr::g_base+0x7DB2D0)(batch);
+                issued=true;
+            }
+            reinterpret_cast<IssueFn>(nr::g_base+0x7DB340)(batch,reinterpret_cast<void*>(record));
+        }
+        slot=next(slot);
+        state=__atomic_load_n(cursor,__ATOMIC_ACQUIRE);
+        if(!valid(state))std::abort();
+    }
+    if(issued)reinterpret_cast<BatchFn>(nr::g_base+0x7DB4B0)(batch);
+    return !issued;
+}
+D1_SYSV bool h_blit_complete() {
+    using namespace ng::blit;
+    const uint64_t base=nr::eb<uint64_t>(0x26DF268),label=nr::eb<uint64_t>(0x26DF288);
+    if(!base||!label)return true;
+    // Sample the completed label once, as 0x7DB290 does. Never retire
+    // a later batch merely because it completed during this invocation.
+    const uint32_t sample=__atomic_load_n(reinterpret_cast<uint32_t*>(label),__ATOMIC_ACQUIRE);
+    auto* cursor=reinterpret_cast<uint64_t*>(base+0x28000);
+    for(;;){
+        uint64_t state=__atomic_load_n(cursor,__ATOMIC_ACQUIRE);
+        if(!valid(state))std::abort();
+        const uint32_t slot=head(state);
+        if(!contains(state,slot))return true;
+        const uint64_t record=base+uint64_t(slot)*0x40;
+        if(__atomic_load_n(reinterpret_cast<uint32_t*>(record),__ATOMIC_ACQUIRE)!=1)return true;
+        if(field<uint8_t>(record,0x3c)!=1||!completed(sample,field<uint32_t>(record,0x38)))return false;
+        const uint64_t cb=field<uint64_t>(record,0x20);
+        if(cb){
+            using Callback=D1_SYSV void(*)(uint64_t*,uint64_t*,uint64_t,uint64_t);
+            uint64_t a=field<uint64_t>(record,0x28),b=field<uint64_t>(record,0x30);
+            reinterpret_cast<Callback>(cb)(&a,&b,field<uint64_t>(record,8),field<uint64_t>(record,0x10));
+        }
+        ng::binding::store(reinterpret_cast<void*>(record),0x3c,uint8_t(2));
+        __atomic_exchange_n(reinterpret_cast<uint32_t*>(record),0u,__ATOMIC_SEQ_CST);
+        // Other producers may advance tail. Only this consumer advances
+        // head, so preserve the latest tail across failed CAS attempts.
+        state=__atomic_load_n(cursor,__ATOMIC_ACQUIRE);
+        do {
+            if(head(state)!=slot||!valid(state))std::abort();
+        } while(!__atomic_compare_exchange_n(cursor,&state,pack(next(slot),tail(state)),false,
+                                             __ATOMIC_SEQ_CST,__ATOMIC_ACQUIRE));
+    }
+}
 using Two = D1_SYSV void (*)(uint64_t, uint64_t);
 Two o_copy, o_swap;
 D1_SYSV void h_copy(uint64_t a, uint64_t b) {
@@ -780,6 +846,8 @@ void install() {
         ok &= replace_eboot_function(0x7DA8B0,reinterpret_cast<const void*>(&h_blit_reserve));
         ok &= replace_eboot_function(0x7DA910,reinterpret_cast<const void*>(&h_blit_can_request));
         ok &= replace_eboot_function(0x7DA960,reinterpret_cast<const void*>(&h_blit_enqueue));
+        ok &= replace_eboot_function(0x7DACF0,reinterpret_cast<const void*>(&h_blit_submit));
+        ok &= replace_eboot_function(0x7DAB10,reinterpret_cast<const void*>(&h_blit_complete));
     }
     ok &= hook(0x82B490, &h_tech_a, o_tech_a, "tfx_technique_apply_a");
     ok &= hook(0x82B5C0, &h_tech_b, o_tech_b, "tfx_technique_apply_b");
