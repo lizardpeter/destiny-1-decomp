@@ -673,6 +673,22 @@ D1_SYSV bool release(uint64_t address,uint64_t bytes,uint32_t tag,uint8_t top,in
     account(tag,bytes,false);
     return true;
 }
+// The outer callers (including AF8F0) already hold the allocator lock.
+// B34F0 is the common container-release boundary, not a GPU-only hook.
+using ContainerReleaseFn=D1_SYSV bool(*)(uint32_t);
+ContainerReleaseFn original_container_release;
+D1_SYSV bool release_container(uint32_t id){
+    const uint64_t table=nr::g_base+0x1ad5000;
+    // The recovered fixed table has 465 entries of 320 bytes. Reject
+    // invalid IDs instead of indexing outside the native contract.
+    if(id>=0x1d1||field<uint64_t>(table,0x10)!=0x140)return false;
+    return ng::pool::release_container(table,nr::g_base+0x1af9d68,
+        nr::g_base+0x1af9cc0,uint16_t(id),
+        [](uint32_t k){return nr::eb<int32_t>(0x15b5b60+uint64_t(k)*4);},
+        [](uint64_t addr,uint64_t bytes,uint32_t kind,uint8_t top,int32_t region){
+            return reinterpret_cast<FreeFn>(nr::g_base+0xb2f40)(addr,bytes,kind,top,region);
+        });
+}
 bool install(){
     const char* v=std::getenv("D1_PC_NATIVE_ASSET_BACKING");
     if(v&&std::atoi(v)==0)return true;
@@ -683,6 +699,9 @@ bool install(){
         ok&=hook(0xB2BD0,&allocate,original_alloc,"asset_region_suballocate");
         ok&=hook(0xB2F40,&release,original_free,"asset_region_release");
     }
+    const char* containers=std::getenv("D1_PC_NATIVE_CONTAINER_RELEASE");
+    if(!containers||std::atoi(containers)!=0)
+        ok&=hook(0xB34F0,&release_container,original_container_release,"asset_container_release");
     return ok;
 }
 } // namespace asset_backing
@@ -706,23 +725,15 @@ D1_SYSV void h_pool_free(uint32_t value) {
     }();
     if(native){
         using Notify=D1_SYSV void(*)(uint32_t,uint32_t);
-        using Lock=D1_SYSV void(*)();
+        using ReleaseTag=D1_SYSV bool(*)(uint32_t);
         ng::pool::destroy(value,root,[](uint32_t i,uint16_t kind){
             if(auto cb=nr::eb<uint64_t>(0x1a238f0))reinterpret_cast<Notify>(cb)(i,kind);
             if(auto cb=nr::eb<uint64_t>(0x1a238f8))reinterpret_cast<Notify>(cb)(i,kind);
         },[](uint64_t){/* 75860 is a single RET, not an allocator free. */},
           [](uint16_t tag){
-              // AF8F0 locks the original allocator around B34F0.
-              // The native release body uses its existing lock domain.
-              reinterpret_cast<Lock>(nr::g_base+0xb2a50)();
-              ng::pool::release_container(nr::g_base+0x1ad5000,nr::g_base+0x1af9d68,
-                  nr::g_base+0x1af9cc0,tag,
-                  [](uint32_t k){return nr::eb<int32_t>(0x15b5b60+uint64_t(k)*4);},
-                  [](uint64_t addr,uint64_t bytes,uint32_t kind,uint8_t top,int32_t region){
-                      using Release=D1_SYSV bool(*)(uint64_t,uint64_t,uint32_t,uint8_t,int32_t);
-                      return reinterpret_cast<Release>(nr::g_base+0xb2f40)(addr,bytes,kind,top,region);
-                  });
-              reinterpret_cast<Lock>(nr::g_base+0xb2a60)();
+              // AF8F0 supplies the existing lock domain around the
+              // now-replaced B34F0 body for every container release.
+              reinterpret_cast<ReleaseTag>(nr::g_base+0xaf8f0)(tag);
           });
     }else o_pool_free(value);
     if(retiring)registry->end_pool_retire(pool);
