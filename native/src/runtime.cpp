@@ -1,5 +1,6 @@
 // Linker, import thunks, call tracing, TLS and crash reporting.
 #include "runtime.h"
+#include "fios_imports.h"
 
 #include "os.h"
 #if D1_WINDOWS
@@ -20,6 +21,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <map>
+#include <set>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -444,6 +446,9 @@ void link_all() {
     const char* math_mode = getenv("D1_PC_LIBC_MATH");
     const bool native_math = math_mode && std::atoi(math_mode) != 0;
     const bool trace_fios = getenv("D1_FIOS_TRACE") != nullptr;
+    const bool native_fios = native_fios_enabled();
+    std::set<std::string> fios_nids;
+    size_t n_native_fios = 0;
     for (auto& m : mods) {
         for (auto& r : m.relas) {
             auto* where = reinterpret_cast<uint64_t*>(m.base + r.offset);
@@ -477,7 +482,15 @@ void link_all() {
                 const bool is_object = (s.info & 0xF) == 1;
                 std::string key = m.name + "|" + nid + "|" + lib;
                 void* leaf = native_leaves && lib == "libc" && !is_object ? native_libc_leaf(nid, native_math) : nullptr;
-                if (leaf) {
+                if (native_fios && lib == "libSceFios2") {
+                    auto* target = is_object ? nullptr : native_fios_import(nid);
+                    if (!target) throw std::runtime_error(m.name + ": uncovered native FIOS import " + nid);
+                    // The original PRX is absent in this mode. Do not silently
+                    // route any missing member of the cohort to a logging stub.
+                    value = reinterpret_cast<uint64_t>(target);
+                    fios_nids.insert(nid);
+                    ++n_native_fios;
+                } else if (leaf) {
                     auto& t = thunk_cache[key];
                     if (!t) {
                         auto nm = names.find(nid);
@@ -547,6 +560,10 @@ void link_all() {
         log("%-18s base %#llx size %#llx entry %s init %s tls(mod %d, %#llx bytes) fs:[0] patched %zu",
             m.name.c_str(), m.base, m.size, m.entry ? describe_addr(m.entry).c_str() : "-",
             m.init ? describe_addr(m.init).c_str() : "-", m.tls_modid, m.tls_memsz, p);
+    }
+    if (native_fios) {
+        if (fios_nids.size() != 25) throw std::runtime_error("native FIOS: unexpected import closure size (expected 25 distinct NIDs)");
+        log("native FIOS: linked %zu distinct NIDs, %zu relocations without original PRX", fios_nids.size(), n_native_fios);
     }
     log("imports: %zu game-module, %zu native libc leaf relocations, %zu HLE, %zu unimplemented (logging stubs), %zu data placeholders",
         n_game, n_native_libc, n_hle, n_unimpl, n_obj);
