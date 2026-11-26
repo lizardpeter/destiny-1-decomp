@@ -349,7 +349,9 @@ struct Image {
     bool low_loaded = false;
     bool hi_loaded = false;
     bool stale = false;
-    uint64_t bound_serial = 0;
+    uint64_t bound_serial = 0, last_write_submit = 0;
+    uint64_t descriptor_epoch[2] = {};
+    uint32_t resident_descriptor[2][8] = {};
 };
 
 struct Shader {
@@ -889,6 +891,7 @@ struct Renderer {
     }
     uint64_t dma_tex_hits = 0, feedback_draws = 0, readback_stale = 0, cpu_stale = 0;
     uint64_t texture_range_rejects=0, split_partial_kept=0, split_descriptor_rejects=0, texture_upload_failures=0;
+    uint64_t resident_descriptor_hits=0,readback_unused_skipped=0;
     std::atomic<uint64_t> expired_gpu_results{0};
     // The GPU's results reached guest memory (a readback): copies made from that memory (a
     // texture over a render target's memory, e.g. glyphs drawn into a cache texture) are stale.
@@ -965,6 +968,7 @@ struct Renderer {
     uint64_t min_live_submit() const;
     uint64_t oldest_ring() const;
     uint64_t ring_oldest = 0;  // a lower bound of oldest_ring()
+    uint64_t ring_worker_reserved=0,ring_worker_payload=0;
     VkSemaphore timeline = VK_NULL_HANDLE;  // value = serial of the last completed submission
     // end-of-pipe work (after_gpu): run by the completion thread when its serial is done
     struct Done { uint64_t serial; std::function<void()> fn; };
@@ -1195,6 +1199,7 @@ struct Renderer {
         bool secondary = false; // parent holds Renderer::m while waiting for this worker
         uint64_t t_pipe = 0, t_geo = 0, t_desc = 0, t_cmd = 0, draws = 0, bytes_vtx = 0, bytes_idx = 0, bytes_cb = 0, predicated = 0, memo_tl = 0;
         uint64_t chunk_pos = 0, chunk_end = 0;  // (parallel) this worker's slice of the ring
+        uint64_t chunk_reserved=0,chunk_payload=0;
         std::vector<Sub::ReCopy> recopy;        // (see Sub::recopy)
     };
     std::mutex pipe_m, geo_m, tex_m, set_m, ring_m, skip_m;
@@ -1208,6 +1213,7 @@ struct Renderer {
         st.t_pipe += r.t_pipe, st.t_geo += r.t_geo, st.t_desc += r.t_desc, st.t_cmd += r.t_cmd, st.draws += r.draws;
         st.bytes_vtx += r.bytes_vtx, st.bytes_idx += r.bytes_idx, st.bytes_cb += r.bytes_cb, st.predicated += r.predicated;
         st.memo_hits += r.memo_tl;
+        ring_worker_reserved+=r.chunk_reserved;ring_worker_payload+=r.chunk_payload;
         if (rc().lr && !r.recopy.empty()) rc().recopy.insert(rc().recopy.end(), r.recopy.begin(), r.recopy.end());
     }
     void draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run_depth);
@@ -2087,8 +2093,10 @@ uint64_t Renderer::rec_ring(Rec& r, uint64_t size, uint64_t align) {
     if (!r.parallel) return ring_alloc(size, align);
     uint64_t p = (r.chunk_pos + align - 1) & ~(align - 1);
     if (p + size > r.chunk_end) {
-        constexpr uint64_t kChunk = 1ull << 20;
-        const uint64_t want = std::max(kChunk, size + align);
+        // A secondary containing a handful of changed constants needs KiB,
+        // not a dedicated MiB. Grow only after actually filling a chunk.
+        const uint64_t chunk=r.chunk_reserved ? (256ull<<10) : (64ull<<10);
+        const uint64_t want = std::max(chunk, size + align);
         uint64_t c;
         {
             std::lock_guard lk(ring_m);
@@ -2096,9 +2104,11 @@ uint64_t Renderer::rec_ring(Rec& r, uint64_t size, uint64_t align) {
         }
         if (c == UINT64_MAX) return UINT64_MAX;
         r.chunk_pos = c, r.chunk_end = c + want;
+        r.chunk_reserved+=want;
         p = (r.chunk_pos + align - 1) & ~(align - 1);
     }
     r.chunk_pos = p + size;
+    r.chunk_payload+=size;
     return p;
 }
 
@@ -2367,6 +2377,27 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     };
     const uint64_t key = tex_key(t, res);
     ++st.tex_checks;
+    // Registered image ownership is already established by the exact epoch
+    // and successfully uploaded descriptor. No tile-layout calculation,
+    // mutable tag read or host mapping lock is needed on this hot path.
+    if(res){
+        auto cached=textures.find(key);
+        if(cached!=textures.end()&&cached->second){
+            Image* img=cached->second.get();
+            if(!img->stale&&img->res_val==res){
+                for(unsigned slot=0;slot<2;++slot){
+                    if(img->descriptor_epoch[slot]!=res||
+                       std::memcmp(img->resident_descriptor[slot],t,32)!=0)continue;
+                    if((img->low_size||img->hi_size)&&
+                       (!img->low_loaded||(slot==1&&!img->hi_loaded)))continue;
+                    img->last_used=rc().submit_no;img->last_frame=st.frames;
+                    ++resident_descriptor_hits;++st.res_hits;
+                    st.t_tex_hit+=now_ns()-t_in;
+                    return img;
+                }
+            }
+        }
+    }
     const auto ts = fmt::decode_tsharp(t);
     const auto fi = fmt::data_format(ts.dfmt);
     const VkFormat f = fmt::vk_format(ts.dfmt, ts.nfmt);
@@ -2424,6 +2455,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         // A write event invalidates contents, not just the cache entry. Do not let
         // the same-address streamed-mip shortcut silently reuse the dirty bytes.
         prev->low_loaded = prev->hi_loaded = false;
+        prev->descriptor_epoch[0]=prev->descriptor_epoch[1]=0;
         textures.erase(it), found = false; ++views_gen;
         ++st.tex_reloads;
     }
@@ -2438,6 +2470,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                               : (img->hi_loaded && img->hi_base == ts.base && img->low_loaded && img->low_base == smi.low_base)))
                 : (img->res_val == res && img->src_addr == ts.base);
             if (have_want) {
+                const unsigned slot=streamed&&!cur_is_low?1:0;
+                std::memcpy(img->resident_descriptor[slot],t,32);
+                img->descriptor_epoch[slot]=res;
                 img->res_val = res;
                 ++st.res_hits;
                 st.t_tex_hit += now_ns() - t_in;
@@ -2447,6 +2482,8 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 (prepared ? prepared_hash==img->content :
                  (guest_readable_range(ts.base,cur_bytes)&&hash_bytes(reinterpret_cast<const void*>(ts.base),cur_bytes)==img->content))) {
                 img->res_val = res, img->src_addr = ts.base;
+                std::memcpy(img->resident_descriptor[0],t,32);
+                img->descriptor_epoch[0]=res;img->descriptor_epoch[1]=0;
                 ++views_gen;
                 ++st.res_moves;
                 st.t_tex_hit += now_ns() - t_in;
@@ -2457,6 +2494,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 // Epoch changes may represent writes at unchanged addresses. Until
                 // per-mip content identities are proven, refresh conservatively.
                 img->low_loaded = img->hi_loaded = false;
+                img->descriptor_epoch[0]=img->descriptor_epoch[1]=0;
             }
             prev = std::move(it->second);
             textures.erase(it), found = false; ++views_gen;
@@ -2708,6 +2746,12 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         return nullptr;
     }
     Image* out = img.get();
+    if(res){
+        const unsigned slot=streamed&&!cur_is_low?1:0;
+        std::memcpy(out->resident_descriptor[slot],t,32);
+        out->descriptor_epoch[slot]=res;
+        if(!streamed)out->descriptor_epoch[1]=0;
+    }
     out->last_used = rc().submit_no;
     out->last_frame = st.frames;
     ++st.textures;
@@ -4105,7 +4149,7 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
             if (img) {
                 const uint8_t a = writes(img);
                 put(rc().pass_written, img, a);
-                if (a) wrote_target(img, a);
+                if (a) {wrote_target(img, a);img->last_write_submit=rc().submit_no;}
             }
     };
     if (snap_need.empty()) {
@@ -4287,9 +4331,17 @@ void Renderer::clear(const Draw& dr) {
     Image* depth = depth_target(dr.depth);
     if (rc().in_pass && rc().pass_key == pass_key_of(colors, depth) && !rc().pass_live.empty()) end_pass();  // (it writes what the pass reads in place)
     begin_pass(colors, depth);
-    for (Image* x : colors)
-        if (x) wrote_target(x), rc().pass_written.push_back({x, 3});
-    if (depth) wrote_target(depth), rc().pass_written.push_back({depth, 3});
+    // A bind is not a write. Clear only the aspects actually requested.
+    for(unsigned i=0;i<4;++i)
+        if(colors[i]&&(dr.clear_flags>>(2+i)&1)){
+            wrote_target(colors[i]);rc().pass_written.push_back({colors[i],3});
+            colors[i]->last_write_submit=rc().submit_no;
+        }
+    if(depth&&(dr.clear_flags&0xc0)){
+        const uint8_t aspects=uint8_t((dr.clear_flags&0x40?1:0)|(dr.clear_flags&0x80?2:0));
+        wrote_target(depth,aspects);rc().pass_written.push_back({depth,aspects});
+        depth->last_write_submit=rc().submit_no;
+    }
     VkClearAttachment att[6];
     uint32_t n = 0;
     for (uint32_t i = 0; i < 4; ++i)
@@ -4700,7 +4752,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         const uint64_t off = rec_ring(r, std::max<uint64_t>(size, 16), 256);
         if (off == UINT64_MAX) return skip("ring full");
         std::memcpy(ring.map + off, reinterpret_cast<const void*>(src), size);
-        if (dr.inline_vertices.empty()) note_copy(1, src, size), r.recopy.push_back({src, off, size, 1});
+        if (dr.inline_vertices.empty()&&rc().lr) note_copy(1, src, size), r.recopy.push_back({src, off, size, 1});
         r.bytes_vtx += size;
         if (size < 16) std::memset(ring.map + off + size, 0, 16 - size);
         vbufs[slot] = ring.buf, voffs[slot] = off, vsizes[slot] = std::max<uint64_t>(size, 16);
@@ -4748,7 +4800,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
                 }
                 r.bytes_cb += c.size;
                 note_copy(0, c.addr, c.size);
-                if (off != UINT64_MAX && c.addr < 0xD00000000ull) r.recopy.push_back({c.addr, off, c.size, 0});
+                if (rc().lr && off != UINT64_MAX && c.addr < 0xD00000000ull) r.recopy.push_back({c.addr, off, c.size, 0});
             } else {
                 off = rec_ring(r, size);
                 if (off != UINT64_MAX) std::memset(ring.map + off, 0, size);
@@ -4834,7 +4886,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         note_copy(2, dr.index_addr, ibytes);
         r.bytes_idx += ibytes;
         if (ioff == UINT64_MAX) return skip("ring full");
-        r.recopy.push_back({dr.index_addr, ioff, ibytes, 2});
+        if(rc().lr)r.recopy.push_back({dr.index_addr, ioff, ibytes, 2});
         first_index = 0;
         vertex_offset = ige_whole ? 0 : -int32_t(vfirst);
     }
@@ -5810,6 +5862,7 @@ void Renderer::queue_readbacks() {
         if (!img || img->last_used != rc().submit_no || img->depth || img->is3d || img->swap || !img->bpp || img->bpp % 8 ||
             uint64_t(img->w) * img->h > max_pix || !img->base)
             continue;
+        if(img->last_write_submit!=rc().submit_no){++readback_unused_skipped;continue;}
         if (img->sampled || sampled_bases.count(img->base) || base_targets[img->base] != 1 || tsharp_bases.count(img->base)) {
             static std::unordered_set<uint64_t> told;
             if (std::getenv("D1_NG_LOG_READBACK") && told.insert(img->base).second)
@@ -6684,6 +6737,10 @@ void print_stats() {
             (unsigned long long)g->texture_range_rejects,(unsigned long long)g->split_descriptor_rejects,
             (unsigned long long)g->texture_upload_failures,(unsigned long long)g->split_partial_kept);
         g->texture_range_rejects=g->split_descriptor_rejects=g->texture_upload_failures=g->split_partial_kept=0;
+        log("native renderer: fast resident descriptor hits %llu, unwritten target readbacks avoided %llu, worker ring reserved %.1f MiB / payload %.1f MiB",
+            (unsigned long long)g->resident_descriptor_hits,(unsigned long long)g->readback_unused_skipped,
+            double(g->ring_worker_reserved)/1048576.0,double(g->ring_worker_payload)/1048576.0);
+        g->resident_descriptor_hits=g->readback_unused_skipped=g->ring_worker_reserved=g->ring_worker_payload=0;
         {
             std::lock_guard dl(g->bindless_m);
             uint32_t live=0,peak=0,binding=0;
