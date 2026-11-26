@@ -2000,7 +2000,7 @@ ViewHandle Renderer::view(Image* img, VkImageViewType type, VkComponentMapping c
                             : type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_3D ? 1u
                                                                                             : img->layers};
     VkImageView v = VK_NULL_HANDLE;
-    vkCreateImageView(ctx.device, &vci, nullptr, &v);
+    const VkResult view_result = vkCreateImageView(ctx.device, &vci, nullptr, &v);
     const uint8_t dim = type == VK_IMAGE_VIEW_TYPE_2D       ? uint8_t(gcn::TexDim::Tex2D)
                       : type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? uint8_t(gcn::TexDim::Tex2DArray)
                       : type == VK_IMAGE_VIEW_TYPE_3D       ? uint8_t(gcn::TexDim::Tex3D)
@@ -2011,7 +2011,17 @@ ViewHandle Renderer::view(Image* img, VkImageViewType type, VkComponentMapping c
                                                     : 0u;
     const bool filterable = !stencil_aspect && (format_props(img->format).optimalTilingFeatures &
                                                 VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+    if (view_result != VK_SUCCESS || !v) {
+        static unsigned failed = 0;
+        if (failed++ < 32) log("native renderer: sampled view creation failed (%d), format %d, type %d, mip %u",
+            int(view_result), int(img->format), int(type), base_level);
+        return {dummy_views[uint32_t(dim) * 3 + kind], 0, dim, kind, kind == 0};
+    }
     const uint16_t id = alloc_bindless_view(v, dim, kind);
+    if (!id) {
+        vkDestroyImageView(ctx.device, v, nullptr);
+        return {dummy_views[uint32_t(dim) * 3 + kind], 0, dim, kind, kind == 0};
+    }
     ViewHandle vh{v, id, dim, kind, filterable};
     img->views[key] = vh;
     return vh;
@@ -3938,11 +3948,17 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
                                      std::any_of(rc().snaps.begin(), rc().snaps.end(), [&](auto& p) { return p.first == x.img; });
                 if (!snapped) split = true;
             }
-        if (split) end_pass();
+        if (split) {
+            end_pass();
+            rc().pass_live.clear();
+            rc().pass_written.clear();
+        }
     }
-    // what is copied: what the run reads and writes, and what the pass already reads from a copy
+    // A matching attachment set is not sufficient to reuse an old snapshot:
+    // a new rendering instance can have newer writes to those same images.
+    // Cross-pass reuse must go through the per-command-buffer freshness test.
     std::vector<Need> snap_need;
-    const bool keep = rc().snap_key == key;
+    const bool keep = rc().in_pass && rc().snap_key == key;
     for (const Need& x : need) {
         const bool copied = keep && std::any_of(rc().snaps.begin(), rc().snaps.end(), [&](auto& p) { return p.first == x.img; });
         if (copied || (writes(x.img) & x.asp)) snap_need.push_back(x);
