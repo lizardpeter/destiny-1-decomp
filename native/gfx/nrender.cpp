@@ -1106,7 +1106,7 @@ struct Renderer {
     struct StreamHistory {std::array<StreamMipInfo,4> entries{};};
     std::mutex mip_m;
     std::unordered_map<uint32_t, StreamHistory> stream_mips;  // bounded epoch history per resource
-    StreamMipInfo get_stream_info(uint64_t res, uint64_t obj, const fmt::TSharp& ts);
+    StreamMipInfo get_stream_info(uint64_t res, uint64_t obj, const fmt::TSharp& ts, const uint32_t* words);
     ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res = 0);
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
     Image* upload_texture(const uint32_t* t, uint64_t res = 0, uint64_t obj = 0,
@@ -2358,7 +2358,7 @@ Image* Renderer::depth_target(const uint32_t* d, bool bind) {
     return img;
 }
 
-Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res,uint64_t obj,const fmt::TSharp& ts){
+Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res,uint64_t obj,const fmt::TSharp& ts,const uint32_t* words){
     StreamMipInfo info{};
     info.full_w=uint16_t(ts.width);info.full_h=uint16_t(ts.height);
     info.full_d=uint16_t(ts.type==10?ts.depth:1);
@@ -2390,7 +2390,8 @@ Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res,uint64_t obj,cons
         info.full_w=tw;info.full_h=th;info.full_d=ts.type==10?std::max<uint16_t>(1,td):1;
         info.full_mips=tm;info.has_hi=thi;
         if(thi&&tm>1){
-            if(ts.last_level+1==uint32_t(tm)-1){info.low_base=ts.base;info.low_layout=ts;}
+            if(ts.last_level+1==uint32_t(tm)-1){info.low_base=ts.base;info.low_layout=ts;
+                std::memcpy(info.low_words.data(),words,32);}
             else if(ts.last_level+1==tm)info.hi_base=ts.base;
         }else info.low_base=ts.base;
         std::lock_guard lk(mip_m);
@@ -2419,17 +2420,13 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         auto cached=textures.find(key);
         if(cached!=textures.end()&&cached->second){
             Image* img=cached->second.get();
-            if(!img->stale&&img->res_val==res){
-                for(unsigned slot=0;slot<2;++slot){
-                    if(img->descriptor_epoch[slot]!=res||
-                       std::memcmp(img->resident_descriptor[slot],t,32)!=0)continue;
-                    if((img->low_size||img->hi_size)&&
-                       (!img->low_loaded||(slot==1&&!img->hi_loaded)))continue;
-                    img->last_used=rc().submit_no;img->last_frame=st.frames;
-                    ++resident_descriptor_hits;++st.res_hits;
-                    st.t_tex_hit+=now_ns()-t_in;
-                    return img;
-                }
+            // The cached bytes depend on the source layout, not view-only
+            // swizzle, minimum LOD or base mip selection.
+            if(img->res_val==res&&img->matches_epoch(t,res)){
+                img->last_used=rc().submit_no;img->last_frame=st.frames;
+                ++resident_descriptor_hits;++st.res_hits;
+                st.t_tex_hit+=now_ns()-t_in;
+                return img;
             }
         }
     }
@@ -2452,7 +2449,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     uint32_t layers = (ts.type == 13 || ts.type == 12 || cube) ? ts.last_array + 1 : 1;
     if (cube) layers = std::max(6u, layers - layers % 6);
 
-    const StreamMipInfo smi = (!is3d && ts.type != 12 && ts.type != 13) ? get_stream_info(res, obj, ts) : StreamMipInfo{};
+    const StreamMipInfo smi = (!is3d && ts.type != 12 && ts.type != 13) ? get_stream_info(res, obj, ts, t) : StreamMipInfo{};
     if(!smi.valid){++expired_texture_epochs;return nullptr;}
     const bool streamed = res != 0 && !is3d && ts.type != 12 && ts.type != 13 &&
                           smi.has_hi != 0 && smi.full_mips > 1;
@@ -2470,6 +2467,17 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                                ts.last_level + 1 == smi.full_mips && smi.hi_base && ts.base == smi.hi_base;
         if ((!low_desc && !high_desc) || !smi.low_base) {
             ++split_descriptor_rejects;
+            // Bounded evidence: distinguish missing allocation links from
+            // dimension, mip-count and address mismatches. No per-draw spam.
+            static uint64_t reports=0;
+            if(reports<64){
+                ++reports;
+                log("ng split reject: res=%u epoch=%u callback=%u T#=%#llx %ux%u levels=%u fmt=%u/%u tile=%u authored=%ux%u levels=%u low=%#llx high=%#llx low_desc=%u high_desc=%u",
+                    uint32_t(res>>32),uint32_t(res),unsigned(smi.from_callback),
+                    (unsigned long long)ts.base,ts.width,ts.height,ts.last_level+1,ts.dfmt,ts.nfmt,ts.tiling,
+                    unsigned(smi.full_w),unsigned(smi.full_h),unsigned(smi.full_mips),
+                    (unsigned long long)smi.low_base,(unsigned long long)smi.hi_base,unsigned(low_desc),unsigned(high_desc));
+            }
             return nullptr;
         }
     }
@@ -6663,7 +6671,7 @@ void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj) {
     const auto fi=fmt::data_format(ts.dfmt);
     if(!ts.base||!fi.bpp||fi.bpp==96||ts.width>16384||ts.height>16384)return;
     if(ts.type!=10&&ts.type!=12&&ts.type!=13){
-        const auto info=g->get_stream_info(res,obj,ts);
+        const auto info=g->get_stream_info(res,obj,ts,j.t);
         if(!info.valid||(info.has_hi&&info.full_mips>1))return;
     }
     tiling::Surface sf;
