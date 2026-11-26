@@ -44,5 +44,20 @@ int main(){
     second_writable=false;
     check(!capture_mapping_spans(110,30,spans,lookup)&&spans.empty());
     check(!capture_mapping_spans(UINT64_MAX-2,4,spans,lookup));
-    std::puts("200000 mapping lifetime, extent and protection cases plus multi-region cases passed");
+    // Reproduce the exact rejected live relocation from c63143a.
+    const uint64_t base=0x4ca400000ull,src=0x4ca4ea000ull,dst=0x4d0feee00ull,n=269824;
+    uint64_t epoch=22;
+    auto asset=[&](uint64_t a,MappingSpan& r){
+        if(a>=base&&a<base+0x100000){r={base,0x100000,21};return true;}
+        if(a>=base+0x100000&&a<base+0x7b600000){r={base+0x100000,0x7b500000,epoch};return true;}
+        return false;
+    };
+    MappingSpans from,to;
+    check(capture_mapping_spans(src,n,from,asset)&&from.size()==2);
+    check(from[0].size==0x16000&&from[1].size==n-0x16000);
+    check(capture_mapping_spans(dst,n,to,asset)&&to.size()==1);
+    check(validate_mapping_spans(src,n,from,asset)&&validate_mapping_spans(dst,n,to,asset));
+    ++epoch;
+    check(!validate_mapping_spans(src,n,from,asset)&&!validate_mapping_spans(dst,n,to,asset));
+    std::puts("200000 mapping cases and exact live asset relocation regression passed");
 }

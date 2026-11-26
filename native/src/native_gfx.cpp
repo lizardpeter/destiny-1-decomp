@@ -371,7 +371,7 @@ ng::Draw* alloc_draw() {
     d->kind = ng::Draw::Auto, d->prim = 4, d->index32 = 0, d->clear_flags = 0;
     d->count = 0, d->instances = 1, d->index_addr = 0, d->order = 0, d->seq = 0, d->frame = 0, d->caller = 0;
     d->vs = d->ps = nullptr, d->num_vb = 0;
-    d->dma_src_mapping=d->dma_dst_mapping=0;d->dma_checked=false;
+    d->dma_src_spans.clear();d->dma_dst_spans.clear();d->dma_checked=false;
     d->shader_res[0] = d->shader_res[1] = 0;
     std::memset(d->vb, 0, sizeof d->vb);
     for (auto& r : d->vres) r = {};
@@ -1946,8 +1946,7 @@ D1_SYSV void s_dma(uint64_t cb, uint64_t dst, uint64_t src, uint32_t bytes) {
     d->index_addr = src, d->caller = dst, d->count = bytes, d->prim = 0, d->index32 = 0;
     if(resev::native_bind_enabled()){
         d->dma_checked=true;
-        d->dma_src_mapping=guest_mapping_identity(src,bytes);
-        d->dma_dst_mapping=guest_mapping_identity(dst,bytes);
+        guest_capture_move_spans(dst,src,bytes,d->dma_dst_spans,d->dma_src_spans);
     }
     add(c, d);
 }

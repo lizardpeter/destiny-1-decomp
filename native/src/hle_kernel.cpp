@@ -391,6 +391,30 @@ static bool writable_span_locked(uint64_t addr,MappingSpan& span){
     span={r->first,r->second.size,r->second.identity};
     return true;
 }
+static bool readable_span_locked(uint64_t addr,MappingSpan& span){
+    const auto* r=region_of(addr);
+    if(!r||!(host_prot(r->second.prot)&os::kRead))return false;
+    span={r->first,r->second.size,r->second.identity};
+    return true;
+}
+bool guest_capture_move_spans(uint64_t dst,uint64_t src,uint64_t size,MappingSpans& dst_spans,MappingSpans& src_spans){
+    std::lock_guard lk(g_mem_mutex);
+    const bool ok=capture_mapping_spans(src,size,src_spans,readable_span_locked)&&
+                  capture_mapping_spans(dst,size,dst_spans,writable_span_locked);
+    if(!ok){
+        src_spans.clear();dst_spans.clear();
+        log("native copy: range capture failed src=%#llx dst=%#llx size=%#llx",
+            (unsigned long long)src,(unsigned long long)dst,(unsigned long long)size);
+    }
+    return ok;
+}
+bool guest_move_current_spans(uint64_t dst,uint64_t src,uint64_t size,const MappingSpans& dst_spans,const MappingSpans& src_spans){
+    std::lock_guard lk(g_mem_mutex);
+    if(!validate_mapping_spans(src,size,src_spans,readable_span_locked)||
+       !validate_mapping_spans(dst,size,dst_spans,writable_span_locked))return false;
+    std::memmove(reinterpret_cast<void*>(dst),reinterpret_cast<const void*>(src),size);
+    return true;
+}
 bool guest_capture_write_spans(uint64_t addr,uint64_t size,MappingSpans& spans){
     std::lock_guard lk(g_mem_mutex);
     if(capture_mapping_spans(addr,size,spans,writable_span_locked))return true;

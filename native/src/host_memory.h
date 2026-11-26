@@ -14,6 +14,8 @@ bool guest_matches_current_mapping(uint64_t addr, uint64_t size, uint64_t identi
 bool guest_move_current_mapping(uint64_t dst,uint64_t src,uint64_t size,uint64_t dst_id,uint64_t src_id);
 bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
                                  void (*write)(void*, void*), void* context);
+bool guest_capture_move_spans(uint64_t dst,uint64_t src,uint64_t size,MappingSpans& dst_spans,MappingSpans& src_spans);
+bool guest_move_current_spans(uint64_t dst,uint64_t src,uint64_t size,const MappingSpans& dst_spans,const MappingSpans& src_spans);
 bool guest_capture_write_spans(uint64_t addr,uint64_t size,MappingSpans& spans);
 bool guest_write_current_spans(uint64_t addr,uint64_t size,const MappingSpans& spans,const void* source);
 void register_native_host_region(uint64_t base, uint64_t size);

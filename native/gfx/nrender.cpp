@@ -822,7 +822,7 @@ struct Renderer {
             }
             if (d->kind != Draw::Dma)continue;
             if(d->dma_checked){
-                if(!guest_move_current_mapping(d->caller,d->index_addr,d->count,d->dma_dst_mapping,d->dma_src_mapping)){
+                if(!guest_move_current_spans(d->caller,d->index_addr,d->count,d->dma_dst_spans,d->dma_src_spans)){
                     log("native renderer: rejected expired or invalid ordered copy %#llx -> %#llx (%u bytes)",
                         (unsigned long long)d->index_addr,(unsigned long long)d->caller,d->count);
                     // Completion callbacks must not claim a copy succeeded.
