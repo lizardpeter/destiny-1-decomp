@@ -33,6 +33,7 @@
 #include "os.h"
 #include "frame_telemetry.h"
 #include "host_memory.h"
+#include "native_record_registry.h"
 #include "runtime.h"
 #include "tiling.h"
 
@@ -714,12 +715,9 @@ struct List {
     bool eop = false;
     uint64_t made = 0;
 };
-std::mutex g_lists_m;
-// 0x7DD060 submits record+0x30 directly. Associate the owned list with
-// that array's address, not with a GPU packet encoded in its contents.
-std::unordered_map<uint64_t, List*> g_lists;
-std::vector<List*> g_abandoned;
-constexpr uint64_t kRecordDcbArray = 0x30;
+// 0x7DD060 submits record+0x30 directly. The registry transfers the native
+// list once for each record use.
+NativeRecordRegistry<List> g_records;
 constexpr int kMaxCtx = 16;
 std::atomic<uint64_t> g_devs[kMaxCtx];
 std::atomic<int> g_ndevs{0};
@@ -765,10 +763,7 @@ List* list_of(int c) {
 void begin_list(uint64_t dev) {
     const int c = ctx_of_dev(dev);
     if (c < 0) return;
-    if (List* old = g_ctx[c].cur.exchange(nullptr)) {
-        std::lock_guard lk(g_lists_m);
-        g_abandoned.push_back(old);
-    }
+    if (List* old = g_ctx[c].cur.exchange(nullptr)) g_records.abandon(old);
     auto* l = new List;
     l->dev = dev, l->made = gpu_flip_count();
     g_ctx[c].cur.store(l, std::memory_order_relaxed);
@@ -792,7 +787,7 @@ bool mark_record_nonempty(uint64_t cb) {
     *reinterpret_cast<uint32_t**>(cb + 0x10) = p + 1;
     return true;
 }
-void end_list(uint64_t dev) {
+List* end_list(uint64_t dev) {
     const int c = ctx_of_dev(dev);
     const uint64_t gfx = field<uint64_t>(dev, 0x50), rec = field<uint64_t>(dev, 0x58);
     if (c < 0 || !gfx || !rec || !mark_record_nonempty(gfx)) {
@@ -802,11 +797,15 @@ void end_list(uint64_t dev) {
     List* l = list_of(c);
     // The original close appends its EOP label through our device callback,
     // then publishes the record ready flag. Do not record speculatively here.
-    std::lock_guard lk(g_lists_m);
-    if (!g_lists.emplace(rec + kRecordDcbArray, l).second) {
+    if (!g_records.publish(rec, l)) {
         log("nd: native list record reused before submission (%#llx)", (unsigned long long)rec);
         std::abort();
     }
+    return l;
+}
+void clear_current(uint64_t dev, List* list) {
+    const int c = ctx_of_dev(dev);
+    if (c >= 0) g_ctx[c].cur.compare_exchange_strong(list, nullptr);
 }
 
 void add(int c, ng::Draw* d) {
@@ -829,15 +828,14 @@ D1_SYSV void h_begin_inherit(uint64_t dev, uint64_t rec, uint64_t a, uint64_t sa
     begin_list(dev);
 }
 D1_SYSV void h_end(uint64_t dev, uint64_t rec, uint64_t kind) {
-    end_list(dev);
+    List* list = end_list(dev);
     o_end(dev, rec, kind);
-    if (const int c = ctx_of_dev(dev); c >= 0) g_ctx[c].cur.store(nullptr, std::memory_order_relaxed);
+    clear_current(dev, list);
 }
 D1_SYSV void h_end_submit(uint64_t dev) {
-    end_list(dev);
-    const int c = ctx_of_dev(dev);
+    List* list = end_list(dev);
     o_end_submit(dev);
-    if (c >= 0) g_ctx[c].cur.store(nullptr, std::memory_order_relaxed);
+    clear_current(dev, list);
 }
 
 D1_SYSV uint64_t s_noop() { return 0; }
@@ -1410,17 +1408,14 @@ struct NativeSubmission {
 };
 NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
     auto batch = std::make_unique<NativeSubmission>();
-    {
-        std::lock_guard lk(nd::g_lists_m);
-        const auto it = nd::g_lists.find(uint64_t(dcbs));
-        if (it == nd::g_lists.end() || !count || count > 64) {
-            log("nd: unknown retail submission record %#llx (%u segments); no compatibility packet fallback",
-                (unsigned long long)uint64_t(dcbs), count);
-            std::abort();
-        }
-        batch->lists.push_back(it->second);
-        nd::g_lists.erase(it);
+    nd::List* submitted = nd::g_records.take(uint64_t(dcbs), count);
+    if (!submitted) {
+        log("nd: unknown retail submission record %#llx (%u segments); no compatibility packet fallback",
+            (unsigned long long)uint64_t(dcbs), count);
+        std::abort();
     }
+    nd::clear_current(submitted->dev, submitted);
+    batch->lists.push_back(submitted);
     // These labels outlive the submission API. Capture the destination's
     // identity here, before the GPU queue is allowed to delay the operation.
     for (const nd::List* list : batch->lists)
@@ -1436,11 +1431,7 @@ void native_device_execute_submit(NativeSubmission* batch) {
     auto& lists = owned->lists;
     // Only abandoned *unpublished* lists are reclaimed here. A published
     // record may legitimately wait behind a worker; never age it out.
-    std::vector<nd::List*> orphans;
-    {
-        std::lock_guard lk(nd::g_lists_m);
-        orphans.swap(nd::g_abandoned);
-    }
+    std::vector<nd::List*> orphans = nd::g_records.take_abandoned();
     for (nd::List* l : orphans) {
         ++nd::g_orphans;
         nd::free_list(l);
