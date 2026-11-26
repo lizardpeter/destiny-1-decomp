@@ -51,6 +51,12 @@ struct Draw {
     uint64_t tex_res[kStages][16] = {};
     uint64_t tex_obj[kStages][16] = {};
     struct Res { uint64_t id = 0, base = 0, size = 0; } vres[16], ires;
+    // Native geometry references are produced by the ordered preparation
+    // segment, not derived from guest memory during command recording.
+    // Slot 16 is the index allocation; invalid slots need not be cleared.
+    struct NativeGeometry {uint64_t buffer=0,offset=0;};
+    NativeGeometry native_geo[17];
+    uint32_t native_geo_mask=0;
     // Resolved bindless descriptor table indices and pipeline signature words (populated once before draw):
     uint16_t tex_view[kStages][16] = {};  // bindless view_id in global descriptor table
     uint8_t tex_dk[kStages][16] = {};     // bits 0..1: TexDim, bits 2..3: tex_kind, bit 4: filterable, bit 5: kTexIsTarget

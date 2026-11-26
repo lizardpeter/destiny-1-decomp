@@ -580,7 +580,7 @@ struct Renderer {
         uint32_t vfirst = 0, vlast = 0;
     };
     bool geo_alloc(uint64_t size, int& block, uint64_t& off, bool device_local = false);
-    bool prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot=nullptr, uint64_t object=0, const MappingSpans* mapping=nullptr);
+    bool prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot=nullptr, uint64_t object=0, const MappingSpans* mapping=nullptr,GeoHit* prepared=nullptr);
     Buffer* geometry_staging(uint64_t bytes, StagingSpan& span);
     void geo_free_now(int block, uint64_t off, uint64_t size);
     void geo_free_later(int block, uint64_t off, uint64_t size);
@@ -1276,6 +1276,7 @@ struct Renderer {
     uint64_t par_runs = 0, par_draws = 0;
     uint64_t native_stage_reuse=0,inline_run_draws=0,inline_runs=0;
     uint64_t native_view_cache_hits=0,native_view_cache_misses=0;
+    uint64_t native_geometry_bindings=0;
     uint64_t batched_draws=0,indirect_batches=0;
     void start_workers();
     void run_parallel(Draw* const* run, size_t n);
@@ -1301,7 +1302,7 @@ struct Renderer {
         const Draw* last_pipeline_draw=nullptr;
         Pipeline* last_pipeline=nullptr;
         uint64_t last_pipeline_mask_epoch=0;
-        uint64_t batched_draws=0,indirect_batches=0;
+        uint64_t batched_draws=0,indirect_batches=0,native_geometry_bindings=0;
         uint64_t chunk_pos = 0, chunk_end = 0;  // (parallel) this worker's slice of the ring
         uint64_t chunk_reserved=0,chunk_payload=0;
         std::vector<Sub::ReCopy> recopy;        // (see Sub::recopy)
@@ -1318,6 +1319,7 @@ struct Renderer {
         st.bytes_vtx += r.bytes_vtx, st.bytes_idx += r.bytes_idx, st.bytes_cb += r.bytes_cb, st.predicated += r.predicated;
         st.memo_hits += r.memo_tl;
         batched_draws+=r.batched_draws;indirect_batches+=r.indirect_batches;
+        native_geometry_bindings+=r.native_geometry_bindings;
         ring_worker_reserved+=r.chunk_reserved;ring_worker_payload+=r.chunk_payload;
         if (rc().lr && !r.recopy.empty()) rc().recopy.insert(rc().recopy.end(), r.recopy.begin(), r.recopy.end());
     }
@@ -3154,7 +3156,7 @@ Buffer* Renderer::geometry_staging(uint64_t bytes, StagingSpan& span) {
     return &sb.geo_staging.back();
 }
 
-bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot, uint64_t object, const MappingSpans* mapping) {
+bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot, uint64_t object, const MappingSpans* mapping,GeoHit* prepared) {
     if (!res.id || res.base < 0x10000 || !res.size || res.size >= (64ull << 20) ||
         rc().cur == UINT32_MAX || (rc().lr&&!snapshot)) return false;
     const GeometryKey key{res.id, 0, res.size, 0, 0};
@@ -3162,7 +3164,10 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
     std::unique_lock lk(sh.m);
     GeoEntry& e = sh.map[key];
     e.last_used = submit_seq.load(std::memory_order_relaxed);
-    if (e.valid && e.res == res.id) return false; // already resident (including mapped fallback)
+    if(e.valid&&e.res==res.id){
+        if(prepared)*prepared={geo_blocks[size_t(e.block)].buf.buf,e.off,e.size,e.vfirst,e.vlast};
+        return false;
+    }
     MappingSpans local;
     if(!snapshot){
         if(!guest_capture_read_spans(res.base,res.size,local))return false;
@@ -3211,6 +3216,7 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
     e.block = block, e.off = off, e.size = res.size, e.hash = content;
     e.res = res.id, e.uploaded = e.last_used, e.valid = true;
     e.vfirst = e.vlast = 0; // whole-resource entries do not contain index-range metadata
+    if(prepared)*prepared={geo_blocks[size_t(block)].buf.buf,off,res.size,0,0};
     __atomic_fetch_add(&st.bytes_geo, res.size, __ATOMIC_RELAXED);
     return true;
 }
@@ -5011,7 +5017,13 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
                           ((dr.index_addr - dr.ires.base) % istride == 0);
         if (!dr.ires.id) __atomic_fetch_add(&st.why_ib_noid, 1, __ATOMIC_RELAXED);
         else if (!ires) __atomic_fetch_add(&st.why_ib_range, 1, __ATOMIC_RELAXED);
-        if (ires && !no_geo_cache) {
+        if(ires&&!no_geo_cache&&(dr.native_geo_mask&(1u<<16))){
+            ige=ige_whole=true;
+            ige_buf=(VkBuffer)dr.native_geo[16].buffer;
+            ige_off=dr.native_geo[16].offset;
+            first_index=uint32_t((dr.index_addr-dr.ires.base)/istride);
+            ++r.native_geometry_bindings;
+        }else if (ires && !no_geo_cache) {
             const uint64_t tk = mix(dr.ires.id, dr.ires.size);
             TlGeo& te = tlg[tk & 2047];
             if (te.res == dr.ires.id && te.rbase == dr.ires.base && te.rsize == dr.ires.size && te.gen == ggen && te.buf) {
@@ -5076,17 +5088,23 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
             const uint32_t voff_idx = (!per_instance && !ige_whole) ? vfirst : 0;
             const uint64_t src = base + uint64_t(voff_idx) * stride;
             if (src < R.base + R.size) {
-                const uint64_t tk = mix(R.id, R.size);
-                TlGeo& te = tlg[tk & 2047];
-                VkBuffer gbuf = VK_NULL_HANDLE;
-                uint64_t goff = 0;
-                if (te.res == R.id && te.rbase == R.base && te.rsize == R.size && te.gen == ggen && te.buf) {
-                    gbuf = te.buf, goff = te.off;
-                } else {
-                    GeoHit h;
-                    if (geo_get(R.base, R.size, 0, 0, h, R.id, R.base)) {
-                        te = {R.id, R.base, R.size, ggen, h.buf, h.off};
-                        gbuf = h.buf, goff = h.off;
+                VkBuffer gbuf=VK_NULL_HANDLE;
+                uint64_t goff=0;
+                if(dr.native_geo_mask&(1u<<slot)){
+                    gbuf=(VkBuffer)dr.native_geo[slot].buffer;
+                    goff=dr.native_geo[slot].offset;
+                    ++r.native_geometry_bindings;
+                }else{
+                    const uint64_t tk=mix(R.id,R.size);
+                    TlGeo& te=tlg[tk&2047];
+                    if(te.res==R.id&&te.rbase==R.base&&te.rsize==R.size&&te.gen==ggen&&te.buf){
+                        gbuf=te.buf;goff=te.off;
+                    }else{
+                        GeoHit h;
+                        if(geo_get(R.base,R.size,0,0,h,R.id,R.base)){
+                            te={R.id,R.base,R.size,ggen,h.buf,h.off};
+                            gbuf=h.buf;goff=h.off;
+                        }
                     }
                 }
                 if (gbuf) {
@@ -5469,6 +5487,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         d->active_tex_mask[0]=d->tex_mask[0]&shader_slots(shader_tex_mask64(d->vs,true,d->shader_res[0]));
         d->active_tex_mask[1]=d->tex_mask[1]&shader_slots(shader_tex_mask64(d->ps,false,d->shader_res[1]));
         d->native_tex_ready[0]=d->native_tex_ready[1]=0;
+        d->native_geo_mask=0;
         d->tex_filter_mask[0]=d->tex_filter_mask[1]=0;
         auto use_native=[&](int stage,uint32_t slot,const ViewHandle& vh){
             if(!vh.id)return;
@@ -5558,23 +5577,43 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     if (local_geometry_enabled() && !rc().lr && !(debug_toggles() & 8)) {
         // Prepare each exact resource epoch/range once per ordered segment, before
         // any graphics secondary begins. Different versions remain distinct.
-        static thread_local SegmentTable<GeometryKey,bool,GeometryKeyHash> seen_geometry;
+        static thread_local SegmentTable<GeometryKey,Draw::NativeGeometry,GeometryKeyHash> seen_geometry;
         seen_geometry.clear();
-        bool copied = false;
-        auto prepare = [&](const Draw::Res& r) {
-            if (!r.id || !r.size) return;
-            const GeometryKey key{r.id, r.base, r.size, 0, 0};
-            if (seen_geometry.insert(key,true).second) copied |= prepare_local_geometry(r);
+        static const bool verify=std::getenv("D1_NG_GEO_VERIFY")!=nullptr;
+        bool copied=false;
+        auto prepare=[&](Draw& d,unsigned slot,const Draw::Res& r){
+            if(!r.id||!r.size)return;
+            const GeometryKey key{r.id,r.base,r.size,0,0};
+            const auto [native,added]=seen_geometry.get_or_insert(key,[&]{
+                GeoHit hit{};
+                copied|=prepare_local_geometry(r,nullptr,0,nullptr,&hit);
+                return Draw::NativeGeometry{uint64_t(hit.buf),hit.off};
+            });
+            if(native.buffer&&!verify){
+                d.native_geo[slot]=native;d.native_geo_mask|=1u<<slot;
+            }
         };
         const Draw* prev=nullptr;
-        for (size_t di = 0; di < count; ++di) {
-            const Draw& d = *draws[di];
-            if (d.kind != Draw::Indexed && d.kind != Draw::Auto) continue;
-            if (d.kind == Draw::Indexed&&(!prev||prev->kind!=Draw::Indexed||
-                std::memcmp(&d.ires,&prev->ires,sizeof d.ires)!=0))prepare(d.ires);
-            if (d.inline_vertices.empty()&&(!prev||!prev->inline_vertices.empty()||
-                std::memcmp(d.vres,prev->vres,sizeof d.vres)!=0))
-                for (const auto& r : d.vres) prepare(r);
+        for(size_t di=0;di<count;++di){
+            Draw& d=*draws[di];
+            if(d.kind!=Draw::Indexed&&d.kind!=Draw::Auto)continue;
+            d.native_geo_mask=0;
+            if(d.kind==Draw::Indexed){
+                if(prev&&prev->kind==Draw::Indexed&&std::memcmp(&d.ires,&prev->ires,sizeof d.ires)==0){
+                    if(prev->native_geo_mask&(1u<<16)){
+                        d.native_geo[16]=prev->native_geo[16];d.native_geo_mask|=1u<<16;
+                    }
+                }else prepare(d,16,d.ires);
+            }
+            if(d.inline_vertices.empty()){
+                if(prev&&prev->inline_vertices.empty()&&std::memcmp(d.vres,prev->vres,sizeof d.vres)==0){
+                    const uint32_t mask=prev->native_geo_mask&0xffffu;
+                    for(uint32_t m=mask;m;m&=m-1){
+                        const unsigned slot=__builtin_ctz(m);d.native_geo[slot]=prev->native_geo[slot];
+                    }
+                    d.native_geo_mask|=mask;
+                }else for(unsigned slot=0;slot<16;++slot)prepare(d,slot,d.vres[slot]);
+            }
             prev=&d;
         }
         if (copied) {
@@ -7473,6 +7512,8 @@ void print_stats() {
     log("native renderer: persistent native material views: %llu hits, %llu misses",
         (unsigned long long)g->native_view_cache_hits,(unsigned long long)g->native_view_cache_misses);
     g->native_view_cache_hits=g->native_view_cache_misses=0;
+    log("native renderer: %llu prepared native geometry bindings consumed without recording-thread resource lookup",(unsigned long long)g->native_geometry_bindings);
+    g->native_geometry_bindings=0;
     g->native_stage_reuse=g->inline_run_draws=g->inline_runs=0;
     s.memo_hits = s.memo_misses = s.memo_gen = 0, g->par_draws = g->par_runs = 0;
     if (const double f = double(s.frames - s.t_frames); f > 0 && g->list_rec)

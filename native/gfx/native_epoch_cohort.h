@@ -28,17 +28,22 @@ class SegmentTable {
         for(const auto& e:old)if(e.stamp==stamp_)insert(e.key,e.value);
     }
 public:
-    std::pair<Value,bool> insert(const Key& key,const Value& value){
+    template<class Create>
+    std::pair<Value,bool> get_or_insert(const Key& key,Create create){
         if(entries_.empty()||used_*2>=entries_.size())grow();
         const size_t mask=entries_.size()-1;
         size_t i=hash(key)&mask;
         for(;;i=(i+1)&mask){
             auto& e=entries_[i];
             if(e.stamp!=stamp_){
+                Value value=create();
                 e={key,value,stamp_};++used_;return {value,true};
             }
             if(e.key==key)return {e.value,false};
         }
+    }
+    std::pair<Value,bool> insert(const Key& key,const Value& value){
+        return get_or_insert(key,[&]{return value;});
     }
     void clear(){
         used_=0;

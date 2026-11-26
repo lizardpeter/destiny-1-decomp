@@ -393,6 +393,7 @@ ng::Draw* alloc_draw() {
     std::memset(d->vb, 0, sizeof d->vb);
     for (auto& r : d->vres) r = {};
     d->ires = {};
+    d->native_geo_mask=0;
     d->tex_mask[0] = d->tex_mask[1] = d->smp_mask[0] = d->smp_mask[1] = 0;
     d->tex_filter_mask[0] = d->tex_filter_mask[1] = 0;
     d->native_tex_ready[0]=d->native_tex_ready[1]=0;
