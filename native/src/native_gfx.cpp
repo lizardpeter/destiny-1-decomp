@@ -48,6 +48,9 @@ namespace d1 {
 void* hook_eboot_function(uint64_t off, const void* host);  // hooks.cpp
 bool replace_eboot_function(uint64_t off, const void* host);  // hooks.cpp
 uint64_t guest_region_extent(uint64_t addr);                // hle_kernel.cpp
+uint64_t guest_mapping_identity(uint64_t addr, uint64_t size);
+bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
+                                 void (*write)(void*, void*), void* context);
 void register_native_host_region(uint64_t base, uint64_t size);
 uint64_t gpu_flip_count();                                  // hle_gpu.cpp
 uint64_t gpu_queue_wait_ns();                               // hle_gpu.cpp
@@ -1464,6 +1467,7 @@ void gnm_signal_eop();  // hle_gpu.cpp
 // reusable console-shaped command buffers. Tokens are decoded at the API boundary.
 struct NativeSubmission {
     std::vector<nd::List*> lists;
+    std::unordered_map<const ng::Draw*, uint64_t> completion_mappings;
 };
 NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
     auto batch = std::make_unique<NativeSubmission>();
@@ -1482,6 +1486,13 @@ NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* 
             if (bad++ < 16) log("nd: truncated retail list token stream at native submission boundary");
         }
     }
+    // These labels outlive the submission API. Capture the destination's
+    // identity here, before the GPU queue is allowed to delay the operation.
+    for (const nd::List* list : batch->lists)
+        for (const nd::Item& item : list->items)
+            if (item.d && item.d->kind == ng::Draw::WriteData && item.d->prim == ng::kEopLabel)
+                batch->completion_mappings.emplace(item.d,
+                    guest_mapping_identity(item.d->caller, item.d->inline_vertices.size()));
     return batch.release();
 }
 void native_device_execute_submit(NativeSubmission* batch) {
@@ -1508,7 +1519,8 @@ void native_device_execute_submit(NativeSubmission* batch) {
     }
     std::vector<ng::Draw*> draws;
     std::vector<uint32_t> recorded;
-    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> labels;
+    struct PendingLabel { uint64_t addr, mapping; bool timestamp; std::vector<uint8_t> bytes; };
+    std::vector<PendingLabel> labels;
     nr_every_world();
     const bool run = (gpu_flip_count() % uint64_t(nr::g_every)) == 0 && ng::active();
 
@@ -1563,15 +1575,23 @@ void native_device_execute_submit(NativeSubmission* batch) {
         flush_recorded();
         flush_draws();
         ng::after_gpu([pending = std::move(labels), eop] {
-            for (auto& [tagged, bytes] : pending) {
-                const uint64_t addr = tagged & ~(1ull << 63);
-                if (tagged >> 63 && bytes.size() >= 8) {
+            for (auto& label : pending) {
+                auto& bytes = label.bytes;
+                if (label.timestamp && bytes.size() >= 8) {
                     const uint64_t t = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::high_resolution_clock::now().time_since_epoch()).count());
                     std::memcpy(bytes.data(), &t, 8);
                 }
-                if (addr >= 0x10000 && guest_region_extent(addr) >= bytes.size())
-                    std::memcpy(reinterpret_cast<void*>(addr), bytes.data(), bytes.size());
+                if (!guest_write_current_mapping(label.addr, bytes.size(), label.mapping,
+                        [](void* dest, void* data) {
+                            const auto& value = *static_cast<const std::vector<uint8_t>*>(data);
+                            std::memcpy(dest, value.data(), value.size());
+                        }, &bytes)) {
+                    static std::atomic<unsigned> expired{0};
+                    if (expired.fetch_add(1, std::memory_order_relaxed) < 16)
+                        log("nd: expired EOP destination %#llx; not writing into a different allocation",
+                            (unsigned long long)label.addr);
+                }
             }
             if (eop) gnm_signal_eop();
         });
@@ -1603,7 +1623,9 @@ void native_device_execute_submit(NativeSubmission* batch) {
                 }
                 ng::Draw* d = it.d;
                 if (d->kind == ng::Draw::WriteData && d->prim == ng::kEopLabel) {
-                    labels.push_back({d->caller | uint64_t(d->count) << 63, d->inline_vertices});
+                    auto stamp = owned->completion_mappings.find(d);
+                    labels.push_back({d->caller, stamp == owned->completion_mappings.end() ? 0 : stamp->second,
+                                      d->count != 0, d->inline_vertices});
                     complete(false);
                     continue;
                 }
