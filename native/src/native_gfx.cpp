@@ -34,6 +34,7 @@
 #include "frame_telemetry.h"
 #include "host_memory.h"
 #include "native_record_registry.h"
+#include "native_submission.h"
 #include "../gfx/native_close_contract.h"
 #include "../gfx/native_resource_identity.h"
 #include "runtime.h"
@@ -779,6 +780,8 @@ void add(int c, ng::Draw* d) {
 }
 
 using Dev1Fn = D1_SYSV void (*)(uint64_t);
+using DrainFn = D1_SYSV bool (*)(uint64_t);
+DrainFn o_drain;
 using Dev3Fn = D1_SYSV void (*)(uint64_t, uint64_t, uint64_t);
 using Dev4Fn = D1_SYSV void (*)(uint64_t, uint64_t, uint64_t, uint64_t);
 Dev1Fn o_begin, o_end_submit;
@@ -801,6 +804,94 @@ bool native_close_enabled() {
 }
 template<class T> void put_field(uint64_t base,uint64_t offset,T value) {
     std::memcpy(reinterpret_cast<void*>(base+offset),&value,sizeof value);
+}
+bool native_drain_enabled() {
+    static const bool enabled=[] {
+        const char* v=std::getenv("D1_PC_NATIVE_DRAIN");
+        return native_close_enabled()&&v&&std::atoi(v)!=0;
+    }();
+    return enabled;
+}
+// 01.33 0x7DD060: retain the original producer ring ABI for now, but consume
+// native record identities rather than importing a Gnm submission. The
+// original scheduler lock and cooperative progress helper are still required.
+D1_SYSV bool h_drain(uint64_t dev) {
+    if(!native_drain_enabled())return reinterpret_cast<DrainFn>(nr::g_base+0x7DD060)(dev);
+    const uint64_t global=field<uint64_t>(dev,0);
+    using LockFn=D1_SYSV void(*)(uint32_t,uint32_t);
+    using HelpFn=D1_SYSV bool(*)();
+    using TickFn=D1_SYSV uint64_t(*)();
+    using FrequencyFn=D1_SYSV int64_t(*)();
+    const auto lock=reinterpret_cast<LockFn>(nr::g_base+0xF2C60);
+    const auto unlock=reinterpret_cast<LockFn>(nr::g_base+0xF2DC0);
+    const auto help=reinterpret_cast<HelpFn>(nr::g_base+0xFB860);
+    const auto ticks=reinterpret_cast<TickFn>(nr::g_base+0x68E80);
+    const auto frequency=reinterpret_cast<FrequencyFn>(nr::g_base+0x68EA0);
+    const bool threaded=field<uint8_t>(global,0x2D8)!=0;
+    const uint32_t lock_id=field<uint32_t>(global,0x2D4);
+    if(threaded)lock(lock_id,0);
+    auto sample_addr=[&](uint32_t slot){return global+0x13310+uint64_t(slot&7)*0x20;};
+    const auto status=native_flip_completion();
+    if(status.arg>=0) {
+        const auto start=uint32_t(field<uint64_t>(global,0x13410))&7;
+        for(uint32_t i=0;i<8;++i) {
+            const auto addr=sample_addr(start+i);
+            if(field<int64_t>(addr,0)!=status.arg)continue;
+            if(!field<uint64_t>(addr,0x10)){
+                put_field(addr,0x10,status.tsc);
+                put_field(addr,0x18,status.queue_count);
+                put_field(addr,0x1C,status.pending_count);
+            }
+            break;
+        }
+    }
+    for(;;){
+        const uint32_t head=field<uint32_t>(global,0x2CC);
+        const uint32_t tail=__atomic_load_n(reinterpret_cast<uint32_t*>(global+0x2C8),__ATOMIC_ACQUIRE);
+        if(!ng::ring_pending(head,tail))break;
+        const auto slot=global+0xC8+uint64_t(ng::record_ring_slot(head))*8;
+        const auto record=field<uint64_t>(slot,0);
+        if(!record) {log("nd: pending native ring slot is empty");std::abort();}
+        if(!__atomic_load_n(reinterpret_cast<uint32_t*>(record+0x18),__ATOMIC_ACQUIRE))break;
+        put_field(slot,0,uint64_t(0));
+        put_field(global,0x2CC,head+1);
+        for(;;){
+            const auto progress=field<uint64_t>(nr::g_base+0x26E4840,0x20);
+            if(ng::progress_ready(__atomic_load_n(reinterpret_cast<uint32_t*>(progress),__ATOMIC_ACQUIRE),
+                                   field<uint32_t>(global,0xBC)))break;
+            if(!help())os::sleep_us(300);
+        }
+        const bool flip=field<uint8_t>(record,0x28)!=0;
+        uint64_t arg=0;
+        if(flip){
+            const uint64_t stamp=ticks();
+            const auto cursor=__atomic_fetch_add(reinterpret_cast<uint64_t*>(global+0x13410),uint64_t(1),__ATOMIC_SEQ_CST);
+            arg=__atomic_fetch_add(reinterpret_cast<uint64_t*>(global+0x13418),uint64_t(1),__ATOMIC_SEQ_CST)+1;
+            const auto addr=sample_addr(uint32_t(cursor));
+            put_field(addr,0,arg);put_field(addr,8,stamp);
+            put_field(addr,0x10,uint64_t(0));put_field(addr,0x18,uint64_t(0));
+            const auto start=uint32_t(field<uint64_t>(global,0x13410))&7;
+            for(uint32_t i=0;i<8;++i){
+                const auto sample=sample_addr(start+i);
+                const uint64_t finished=field<uint64_t>(sample,0x10);
+                const int64_t id=field<int64_t>(sample,0);
+                if(!finished||!ng::flip_sample_newer(id,field<int64_t>(global,0x13420)))continue;
+                if(!field<uint32_t>(global,0x13428))put_field(global,0x13428,uint32_t(1));
+                else {
+                    const auto hz=frequency();
+                    if(hz>0&&double(finished-field<uint64_t>(sample,8))/double(hz)>57.0)
+                        put_field(global,0x13428,uint32_t(0));
+                }
+                put_field(global,0x13430,finished);
+                put_field(global,0x13420,id);
+            }
+            native_flip_rate_hint(field<uint32_t>(global,0x13428));
+        }
+        native_queue_submit(native_device_capture_record(record),flip,
+                            int32_t(field<uint32_t>(global,0xB0)),int64_t(arg));
+    }
+    if(threaded)unlock(lock_id,0);
+    return true;
 }
 // Source-defined close for ordinary and worker command lists. The engine
 // still owns its ordered ring and its progress labels, but native work does
@@ -858,7 +949,7 @@ void native_close(uint64_t dev,uint32_t kind,bool worker) {
     put_field(dev,0x58,uint64_t(0));
     // Worker records were enqueued by 0x7DEA90 before recording started.
     if(worker&&ng::worker_should_submit(completed,previous,nr::eb<uint8_t>(0x18DCC30)))
-        reinterpret_cast<Dev1Fn>(nr::g_base+0x7DD060)(dev);
+        h_drain(dev);
 }
 D1_SYSV void h_end(uint64_t dev, uint64_t rec, uint64_t kind) {
     if(native_close_enabled()) {native_close(dev,uint32_t(kind),false);return;}
@@ -1074,6 +1165,7 @@ bool install() {
     ok &= hook(0x7DD6A0, &h_begin_inherit, o_begin_inherit, "cmdlist_begin_inherit");
     ok &= hook(0x7DCEC0, &h_end, o_end, "cmdlist_end");
     ok &= hook(0x7DE950, &h_end_submit, o_end_submit, "cmdlist_end_and_submit");
+    if (native_drain_enabled()) ok &= hook(0x7DD060, &h_drain, o_drain, "native_device_drain");
     g_on = ok;
     log("nd: native device layer: %zu Gnm entry points replaced%s",
         sizeof kNoops / sizeof kNoops[0] + 8, ok ? "" : " - REQUIRED REPLACEMENTS FAILED");
@@ -1441,19 +1533,12 @@ struct NativeSubmission {
     std::vector<nd::List*> lists;
     std::unordered_map<const ng::Draw*, uint64_t> completion_mappings;
 };
-NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
-    auto batch = std::make_unique<NativeSubmission>();
-    // In the experimental close path a native list can have zero actual
-    // retail command-buffer segments. The record identity remains authoritative.
-    const uint64_t array=uint64_t(dcbs);
-    nd::List* submitted = nd::native_close_enabled() && count<=64 && array>0x30
-        ? nd::g_records.take_record(array-0x30)
-        : nd::g_records.take(array,count);
-    if (!submitted) {
-        log("nd: unknown retail submission record %#llx (%u segments); no compatibility packet fallback",
-            (unsigned long long)uint64_t(dcbs), count);
+static NativeSubmission* capture_native_list(nd::List* submitted) {
+    if(!submitted) {
+        log("nd: unknown or already consumed native submission record");
         std::abort();
     }
+    auto batch=std::make_unique<NativeSubmission>();
     nd::clear_current(submitted->dev, submitted);
     batch->lists.push_back(submitted);
     // These labels outlive the submission API. Capture the destination's
@@ -1464,6 +1549,16 @@ NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* 
                 batch->completion_mappings.emplace(item.d,
                     guest_mapping_identity(item.d->caller, item.d->inline_vertices.size()));
     return batch.release();
+}
+NativeSubmission* native_device_capture_record(uint64_t record) {
+    return capture_native_list(nd::g_records.take_record(record));
+}
+NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
+    const uint64_t array=uint64_t(dcbs);
+    auto* list=nd::native_close_enabled() && count<=64 && array>0x30
+        ? nd::g_records.take_record(array-0x30) : nd::g_records.take(array,count);
+    if(!list)log("nd: unknown retail submission record %#llx (%u segments)",(unsigned long long)array,count);
+    return capture_native_list(list);
 }
 void native_device_execute_submit(NativeSubmission* batch) {
     if (!batch) return;

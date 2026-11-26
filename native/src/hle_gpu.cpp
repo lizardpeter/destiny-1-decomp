@@ -14,6 +14,7 @@
 #include "hle.h"
 #include "os.h"
 #include "frame_telemetry.h"
+#include "native_submission.h"
 #include "host_memory.h"
 #include "runtime.h"
 #include "settings.h"
@@ -230,6 +231,14 @@ static int32_t sceVideoOutGetFlipStatus(int32_t, FlipStatus* s) {
     return SCE_OK;
 }
 HLE("sceVideoOutGetFlipStatus", sceVideoOutGetFlipStatus)
+NativeFlipCompletion native_flip_completion() {
+    std::lock_guard lk(g_vo.m);
+    const auto& s=g_vo.status;
+    return {s.flip_arg,s.tsc,s.gc_queue_num,s.flip_pending_num};
+}
+void native_flip_rate_hint(uint32_t rate) {
+    sceVideoOutSetFlipRate(kVoHandle,int32_t(rate));
+}
 static int32_t sceVideoOutIsFlipPending(int32_t) {
     std::lock_guard lk(g_vo.m);
     return g_vo.status.flip_pending_num;
@@ -467,6 +476,27 @@ void push_flip(int32_t buf, int64_t arg) {
 
 uint64_t gpu_queue_wait_ns() { return gpuq::wait_ns.load(); }
 
+void native_queue_submit(NativeSubmission* batch,bool flip,int32_t buffer,int64_t arg) {
+    if (!batch || !native_device_active()) {
+        log("native GPU: invalid native queue submission");
+        std::abort();
+    }
+    gpuq::Job j;
+    j.native=batch;
+    j.flip=flip;
+    j.buf=buffer;
+    j.arg=arg;
+    if(flip)note_guest_frame();
+    if(gpuq::enabled()) {
+        if(flip) {
+            std::lock_guard lk(g_vo.m);
+            ++g_vo.status.flip_pending_num;
+            ++g_vo.status.gc_queue_num;
+        }
+        gpuq::push(std::move(j));
+    } else gpuq::run(j);
+}
+
 static int32_t submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* dcb_sizes) {
     if (gpuq::enabled()) gpuq::push_submit(count, dcbs, dcb_sizes);
     else submit_now(count, dcbs, dcb_sizes);
@@ -481,15 +511,7 @@ HLE("sceGnmSubmitCommandBuffers", sceGnmSubmitCommandBuffers)
 static int32_t sceGnmSubmitAndFlipCommandBuffers(uint32_t count, uint32_t* const* dcbs, const uint32_t* dcb_sizes,
                                                  uint32_t* const* ccbs, const uint32_t* ccb_sizes, uint32_t,
                                                  uint32_t buf, uint32_t, int64_t arg) {
-    note_guest_frame();
-    if (gpuq::enabled()) {
-        { std::lock_guard lk(g_vo.m); ++g_vo.status.flip_pending_num; ++g_vo.status.gc_queue_num; }
-        gpuq::push_submit_and_flip(count, dcbs, dcb_sizes, int32_t(buf), arg);
-        return SCE_OK;
-    }
-    submit(count, dcbs, dcb_sizes);
-    if (buf < 16) native_gfx_flip(g_vo.buffers[buf], g_vo.attr.width, g_vo.attr.height);
-    do_flip(int32_t(buf), arg);
+    native_queue_submit(native_device_capture_submit(count, dcbs, dcb_sizes),true,int32_t(buf),arg);
     return SCE_OK;
 }
 HLE("sceGnmSubmitAndFlipCommandBuffers", sceGnmSubmitAndFlipCommandBuffers)

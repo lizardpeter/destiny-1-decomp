@@ -21,5 +21,15 @@ int main(){
         check(record_ring_slot(a)==a%64);
     }
     check(worker_should_submit(0,UINT32_MAX,1)&&!worker_should_submit(UINT32_MAX,0,1));
+    for(unsigned i=0;i<100000;++i){
+        uint32_t head=rng(),count=rng()%65,tail=head+count;
+        check(ring_pending(head,tail)==(count!=0));
+        check(progress_ready(tail,head));
+        check(progress_ready(head,tail)==(count==0));
+        check(!ring_pending(tail,head));
+    }
+    check(!ring_pending(0,0x80000000u));
+    check(flip_sample_newer(1,1000001)&&!flip_sample_newer(1,1000000));
+    check(flip_sample_newer(9,8)&&!flip_sample_newer(8,9));
     std::puts("65536 close plans and 100000 native submission wrap cases passed");
 }
