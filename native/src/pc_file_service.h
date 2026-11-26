@@ -43,6 +43,9 @@ public:
         return directories_.next(id, ec);
     }
     bool close_directory(uint32_t id) { return directories_.close(id); }
+    bool valid_directory(uint32_t id) { return bool(directories_.get(id)); }
+    bool valid_operation(Queue::Id id) { return queue_.has_operation(id); }
+    void drain() { queue_.drain(); }
     const Paths& paths() const { return paths_; }
 };
 } // namespace d1::pc_io
