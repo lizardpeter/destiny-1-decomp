@@ -44,7 +44,7 @@
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) \
     X(vkQueuePresentKHR) \
     X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdResetQueryPool) \
-    X(vkGetQueryPoolResults) X(vkCmdCopyQueryPoolResults) X(vkCmdFillBuffer)
+    X(vkGetQueryPoolResults) X(vkCmdCopyQueryPoolResults) X(vkCmdFillBuffer) X(vkCmdWriteTimestamp2)
 
 // optional (VK_EXT_conditional_rendering: GCN draw predication)
 #define D1_VK_OPTIONAL_DEVICE_FUNCS(X) X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT)
