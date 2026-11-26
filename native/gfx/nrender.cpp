@@ -1037,7 +1037,8 @@ struct Renderer {
     ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res = 0);
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
     Image* upload_texture(const uint32_t* t, uint64_t res = 0, uint64_t obj = 0,
-                          const uint8_t* prepared = nullptr, uint64_t prepared_size = 0);
+                          const uint8_t* prepared = nullptr, uint64_t prepared_size = 0,
+                          uint64_t prepared_source_size = 0, uint64_t prepared_hash = 0);
     void resolve_draw_resources(Draw* const* draws, size_t count);
     struct DiskPipeSpec {
         uint64_t vs_hash = 0, ps_hash = 0;
@@ -1160,7 +1161,7 @@ struct Renderer {
     void end_pass();
     void queue_readbacks();
     bool target_current(uint64_t base);
-    uint32_t first_missing_mip(const fmt::TSharp& ts, const fmt::FormatInfo& fi, const tiling::Surface& sf, bool is3d);
+    uint32_t first_missing_mip(const fmt::TSharp& ts, const fmt::FormatInfo& fi, const tiling::Surface& sf, bool is3d, const uint8_t* source=nullptr);
     void fill_missing_mips(uint32_t first, uint8_t* staging, const std::vector<uint64_t>& off, const std::vector<uint64_t>& sizes,
                            const fmt::TSharp& ts, const fmt::FormatInfo& fi, const tiling::Surface& sf, bool is3d);
     void skip(const char* why) {
@@ -2343,7 +2344,8 @@ Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res, uint64_t obj, co
 }
 
 Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
-                                const uint8_t* prepared, uint64_t prepared_size) {
+                                const uint8_t* prepared, uint64_t prepared_size,
+                                uint64_t prepared_source_size, uint64_t prepared_hash) {
     const uint64_t t_in = now_ns();
     struct LoadTimer {
         Renderer* r;
@@ -2363,6 +2365,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     const StreamMipInfo smi = (!is3d && ts.type != 12 && ts.type != 13) ? get_stream_info(res, obj, ts) : StreamMipInfo{};
     const bool streamed = res != 0 && !is3d && ts.type != 12 && ts.type != 13 &&
                           smi.has_hi != 0 && smi.full_mips > 1;
+    if(prepared&&(!res||streamed))return nullptr; // prepared jobs describe one contiguous registered surface
     if (streamed) {
         // 7D4480 constructs a half-size low descriptor (BC dimensions may be
         // rounded up to four) or a full-size high descriptor.
@@ -2390,7 +2393,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
     const uint64_t cur_bytes = cur_is_low ? sf.total_size : (streamed ? sf.mips[0].size : sf.total_size);
-    if (guest_region_extent(ts.base) < cur_bytes) return nullptr;
+    if(prepared ? prepared_source_size!=cur_bytes : guest_region_extent(ts.base)<cur_bytes)return nullptr;
 
     std::unique_ptr<Image> prev;
     auto it = textures.find(key);
@@ -2421,8 +2424,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 st.t_tex_hit += now_ns() - t_in;
                 return img;
             }
-            if (!streamed && img->src_size == cur_bytes && guest_region_extent(ts.base) >= cur_bytes &&
-                hash_bytes(reinterpret_cast<const void*>(ts.base), cur_bytes) == img->content) {
+            if (!streamed && img->src_size == cur_bytes &&
+                (prepared ? prepared_hash==img->content :
+                 (guest_region_extent(ts.base)>=cur_bytes&&hash_bytes(reinterpret_cast<const void*>(ts.base),cur_bytes)==img->content))) {
                 img->res_val = res, img->src_addr = ts.base;
                 ++views_gen;
                 ++st.res_moves;
@@ -2488,7 +2492,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         if (!src_lv_count || src_lv_begin >= s_src.levels || src_lv_count > s_src.levels - src_lv_begin ||
             dst_lv_begin >= full_levels || src_lv_count > full_levels - dst_lv_begin) return false;
         const auto& last = s_src.mips[src_lv_begin + src_lv_count - 1];
-        if (!base_addr || guest_region_extent(base_addr) < last.offset + last.size) return false;
+        if (!base_addr || (prepared ? prepared_source_size : guest_region_extent(base_addr)) < last.offset + last.size) return false;
         uint64_t total = 0;
         std::vector<uint64_t> sizes(src_lv_count), level_off(src_lv_count);
         // The engine rounds the compressed low descriptor to a block boundary.
@@ -2523,6 +2527,10 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         const uint64_t tf0 = now_ns();
         const bool use_prepared = !streamed && prepared && prepared_size == total &&
                                   src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count == full_levels;
+        if(prepared&&(!use_prepared||crop)) {
+            if(own)free_buffer(sb);
+            return false; // do not silently fall back to guest memory
+        }
         const uint32_t missing = (!use_prepared && src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count > 1) ? first_missing_mip(ts, fi, s_src, is3d) : src_lv_count;
         const uint64_t td = now_ns();
         st.t_fill += td - tf0;
@@ -2646,7 +2654,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         if (ok && res) {
             img->res_val = res, img->res_obj = smi.obj ? smi.obj : obj;
             img->src_addr = ts.base, img->src_size = sf.total_size, img->version = ~0ull;
-            img->content = hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size);
+            img->content = prepared ? prepared_hash : hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size);
         } else if (ok && (opt.watch || dynamic_copy)) {
             const uint64_t tw = now_ns();
             img->version = mem_watch(ts.base, sf.total_size);
@@ -2680,7 +2688,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
 // Read from guest memory (the tiled bytes): a few spread samples per level decide quickly that
 // a level has data; only levels whose samples are all zero are scanned in full (small ones) or
 // taken as unwritten (large ones).
-uint32_t Renderer::first_missing_mip(const fmt::TSharp& ts, const fmt::FormatInfo& fi, const tiling::Surface& sf, bool is3d) {
+uint32_t Renderer::first_missing_mip(const fmt::TSharp& ts, const fmt::FormatInfo& fi, const tiling::Surface& sf, bool is3d, const uint8_t* source) {
     if (sf.levels < 2 || is3d || !fi.bpp || fi.bpp % 8) return sf.levels;
     auto zero = [](const uint8_t* p, uint64_t n) {
         uint64_t acc = 0, i = 0;
@@ -2701,7 +2709,7 @@ uint32_t Renderer::first_missing_mip(const fmt::TSharp& ts, const fmt::FormatInf
         }
         return n > (256u << 10) || zero(p, n);
     };
-    const uint8_t* guest = reinterpret_cast<const uint8_t*>(ts.base);
+    const uint8_t* guest = source ? source : reinterpret_cast<const uint8_t*>(ts.base);
     if (level_zero(guest + sf.mips[0].offset, sf.mips[0].size)) return sf.levels;
     for (uint32_t lv = 1; lv < sf.levels; ++lv)
         if (level_zero(guest + sf.mips[lv].offset, sf.mips[lv].size)) return lv;
@@ -2845,14 +2853,14 @@ Buffer* Renderer::geometry_staging(uint64_t bytes, StagingSpan& span) {
 bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot, uint64_t object, uint64_t mapping) {
     if (!res.id || res.base < 0x10000 || !res.size || res.size >= (64ull << 20) ||
         rc().cur == UINT32_MAX || (rc().lr&&!snapshot)) return false;
-    if(!snapshot)mapping=guest_mapping_identity(res.base,res.size);
-    if(!mapping)return false;
     const GeometryKey key{res.id, 0, res.size, 0, 0};
     GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
     std::unique_lock lk(sh.m);
     GeoEntry& e = sh.map[key];
     e.last_used = submit_seq.load(std::memory_order_relaxed);
     if (e.valid && e.res == res.id) return false; // already resident (including mapped fallback)
+    if(!snapshot)mapping=guest_mapping_identity(res.base,res.size);
+    if(!mapping)return false;
     if(snapshot && (!opt.res_current || opt.res_current(object)!=res.id ||
                     guest_mapping_identity(res.base,res.size)!=mapping))return false;
     int block = -1;
@@ -5088,6 +5096,13 @@ void Renderer::start_loader() {
 void Renderer::load_buffer(const LoadJob& j) {
     if (j.base < 0x10000 || !j.size || j.size >= (64ull << 20) || !j.mapping) return;
     if(!opt.res_current||opt.res_current(j.obj)!=j.res){++ld_stale;return;}
+    {
+        const GeometryKey key{local_geometry_enabled()?j.res:j.res>>32,0,j.size,0,0};
+        auto& sh=geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
+        std::lock_guard lk(sh.m);
+        const auto it=sh.map.find(key);
+        if(it!=sh.map.end()&&it->second.valid&&it->second.res==j.res){++ld_skipped;return;}
+    }
     // Copy outside Renderer::m. The mapping identity was captured at bind,
     // not at dequeue, so a reused virtual address cannot feed an old job.
     static thread_local std::vector<uint8_t> snapshot;
@@ -5136,7 +5151,7 @@ void Renderer::load_texture(const LoadJob& j) {
     if (cube) sf.layers = std::max(6u, sf.layers - sf.layers % 6);
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
-    if (guest_region_extent(ts.base) < sf.total_size) return;
+    if (!j.mapping||!sf.total_size||sf.total_size>(128ull<<20))return;
     const uint64_t key = tex_key(t, j.res);
     {
         std::lock_guard lk(m);
@@ -5144,11 +5159,16 @@ void Renderer::load_texture(const LoadJob& j) {
         if (it != textures.end() && it->second && !it->second->stale &&
             it->second->res_val == j.res && it->second->src_addr == ts.base) { ++ld_skipped; return; }
     }
-    // Hash only real loads or relocation candidates, never unchanged binds.
-    const uint64_t content = hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size);
+    // Own a complete tiled snapshot before detiling; the loader may be
+    // delayed past the original package's mapping lifetime.
+    static thread_local std::vector<uint8_t> source;
+    source.resize(sf.total_size);
+    if(!guest_copy_current_mapping(ts.base,sf.total_size,j.mapping,source.data())||
+       opt.res_current(j.obj)!=j.res){++ld_stale;return;}
+    const uint64_t content = hash_bytes(source.data(),sf.total_size);
     {
         std::lock_guard lk(m);
-        if (opt.res_current && opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
+        if (opt.res_current(j.obj)!=j.res||!guest_matches_current_mapping(ts.base,sf.total_size,j.mapping,source.data())) { ++ld_stale; return; }
         auto it = textures.find(key);
         if (it != textures.end() && it->second && !it->second->stale) {
             Image* img = it->second.get();
@@ -5172,16 +5192,13 @@ void Renderer::load_texture(const LoadJob& j) {
         total += (sizes[lv] + 15) & ~15ull;
     }
     static thread_local std::vector<uint8_t> scratch;
+    if(total>(128ull<<20))return; // speculative loader stays bounded
     scratch.resize(total);
-    const uint32_t missing = first_missing_mip(ts, fi, sf, is3d);
+    const uint32_t missing = first_missing_mip(ts, fi, sf, is3d,source.data());
     for (uint32_t lv = 0; lv < std::min(missing, sf.levels); ++lv)
-        tiling::detile(sf, lv, reinterpret_cast<const uint8_t*>(ts.base), scratch.data() + level_off[lv]);
+        tiling::detile(sf, lv, source.data(), scratch.data() + level_off[lv]);
     if (missing < sf.levels) fill_missing_mips(missing, scratch.data(), level_off, sizes, ts, fi, sf, is3d);
-    if ((opt.res_current && opt.res_current(j.obj) != j.res) ||
-        hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size) != content) {
-        ++ld_stale;
-        return;
-    }
+    if(opt.res_current(j.obj)!=j.res){++ld_stale;return;}
     std::lock_guard lk(m);
     Recorder* const prev_tr = tr;
     struct Restore { Recorder* p; ~Restore() { tr = p; } } restore{prev_tr};
@@ -5192,8 +5209,10 @@ void Renderer::load_texture(const LoadJob& j) {
     if (up_rec.cur == UINT32_MAX) return;
     // Recheck the resource epoch after acquiring m. For a normal surface the
     // upload consumes the already-detiled CPU scratch; streaming uses its own ranges.
-    if (opt.res_current && opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
-    if (upload_texture(t, j.res, j.obj, scratch.data(), total)) ++ld_tex;
+    if(opt.res_current(j.obj)!=j.res||!guest_matches_current_mapping(ts.base,sf.total_size,j.mapping,source.data())){
+        ++ld_stale;return;
+    }
+    if (upload_texture(t,j.res,j.obj,scratch.data(),total,sf.total_size,content)) ++ld_tex;
 }
 
 void Renderer::load_shader(const LoadJob& j) {
@@ -6283,10 +6302,12 @@ void fill_late(const LateCb& l, uint64_t src, uint32_t size) {
     }
 }
 void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj) {
-    if (!g || !res) return;
+    if (!g || !res || !g->load_on) return;
     Renderer::LoadJob j{1, {}, 0, 0, res, obj};
     std::memcpy(j.t, tsharp, 32);
-    g->prefetch(j);
+    j.base=fmt::decode_tsharp(j.t).base;
+    j.mapping=guest_mapping_identity(j.base,1);
+    if(j.mapping)g->prefetch(j);
 }
 void notify_texture_mips(const uint32_t* tsharp, uint64_t res, uint64_t obj, uint64_t low_base, uint64_t hi_base) {
     if (!g || !res) return;

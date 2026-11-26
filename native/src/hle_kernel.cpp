@@ -269,6 +269,14 @@ bool guest_copy_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
     std::memcpy(destination,reinterpret_cast<const void*>(addr),size);
     return true;
 }
+bool guest_matches_current_mapping(uint64_t addr,uint64_t size,uint64_t identity,const void* snapshot) {
+    if(!identity||!size||!snapshot)return false;
+    std::lock_guard lk(g_mem_mutex);
+    const auto* r=region_of(addr);
+    return r&&r->second.identity==identity&&size<=r->second.size-(addr-r->first)&&
+           (host_prot(r->second.prot)&os::kRead)&&
+           std::memcmp(reinterpret_cast<const void*>(addr),snapshot,size)==0;
+}
 bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
                                  void (*write)(void*, void*), void* context) {
     if (!identity || !size || !write) return false;
