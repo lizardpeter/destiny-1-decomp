@@ -18,7 +18,7 @@
 
 #include "frontend.h"
 #include "settings.h"
-#include "render_bridge.h"
+#include "pc_frontend.h"
 #include "../gfx/nrender.h"
 
 namespace d1 {
