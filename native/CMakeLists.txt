@@ -186,3 +186,13 @@ target_include_directories(fios-native-core-test PRIVATE src)
 target_link_libraries(fios-native-core-test PRIVATE Threads::Threads)
 add_test(NAME fios-native-core COMMAND fios-native-core-test "${CMAKE_CURRENT_BINARY_DIR}/fios-native-core-test-dir")
 set_tests_properties(fios-native-core PROPERTIES TIMEOUT 30)
+
+# Uses the real production adapter and callback assembly, with simulated retail
+# runtime/TLS/mapping hooks. Does not load game modules or require a GPU.
+if(NOT WIN32)
+  add_executable(fios-imports-test tests/fios_imports_test.cpp src/fios_imports.cpp)
+  target_include_directories(fios-imports-test PRIVATE src)
+  target_link_libraries(fios-imports-test PRIVATE Threads::Threads)
+  add_test(NAME fios-imports COMMAND fios-imports-test "${CMAKE_CURRENT_BINARY_DIR}/fios-imports-test-dir")
+  set_tests_properties(fios-imports PROPERTIES TIMEOUT 30)
+endif()
