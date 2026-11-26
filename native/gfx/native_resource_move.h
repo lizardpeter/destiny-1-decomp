@@ -32,4 +32,17 @@ struct Copy {
 constexpr Copy copy(uint64_t source,uint64_t destination,uint64_t delta,uint64_t bytes) {
     return {destination+delta,source,uint32_t(bytes)};
 }
+// 0xDE860: a memory link is either an inline resource handle or the
+// head of a 16-bit linked list. Read the successor AFTER the callback,
+// exactly as the retail walker does.
+template<class HandleAt,class NextAt,class Visit>
+void visit_memory_links(uint32_t token,HandleAt handle_at,NextAt next_at,Visit visit){
+    if(token==UINT32_MAX)return;
+    if((token&0xc0000000u)==0x80000000u){visit(token);return;}
+    for(uint16_t i=uint16_t(token);i!=0xffffu;i=next_at(i))
+        visit(handle_at(i));
+}
+constexpr bool memory_link_container(uint32_t id){
+    return id!=UINT32_MAX&&(id&0xc0000000u)==0xc0000000u&&container_valid(id);
+}
 } // namespace d1::ng::move
