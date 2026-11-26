@@ -19,6 +19,7 @@
 #include "hle.h"
 #include "os.h"
 #include "frame_telemetry.h"
+#include "host_memory.h"
 #include "runtime.h"
 #include "settings.h"
 
