@@ -1043,14 +1043,22 @@ struct Renderer {
     std::vector<DiskPipeSpec> pipe_specs;
     std::vector<uint8_t> spec_warmed;
     std::unordered_set<uint64_t> pipe_spec_hashes;
-    std::unordered_map<uint64_t, uint64_t> obj_code_hash;      // (uint64_t(obj) << 1 | vs) -> bytecode hash
-    std::unordered_map<uint64_t, const uint8_t*> hash_to_obj;  // (code_hash << 1 | vs) -> guest obj
+    // Shader object addresses are recyclable. Native modules are keyed by
+    // code + metadata; pointer/epoch keys are only fast lookup handles.
+    static uint64_t shader_object_key(const uint8_t* obj, bool vs, uint64_t res) {
+        return mix(mix(uint64_t(obj), res), vs);
+    }
+    struct ShaderRef { const uint8_t* obj = nullptr; uint64_t res = 0; };
+    std::unordered_map<uint64_t, uint64_t> obj_code_hash;
+    std::unordered_map<uint64_t, ShaderRef> hash_to_obj;
+    std::unordered_map<uint64_t, std::vector<size_t>> warm_specs_by_shader;
     mutable std::shared_mutex shader_mask_m;
     std::atomic<uint64_t> shader_mask_epoch{1};
-    std::unordered_map<uint64_t, uint64_t> obj_tex_mask64;     // (uint64_t(obj) << 1 | vs) -> 4-bit-per-slot active mask
-    uint64_t shader_code_hash(const uint8_t* obj, bool vs);
-    uint64_t shader_tex_mask64(const uint8_t* obj, bool vs) const;
-    void warm_shader_specs(const uint8_t* obj, bool vs);
+    std::unordered_map<uint64_t, uint64_t> obj_tex_mask64;
+    uint64_t shader_code_hash(const uint8_t* obj, bool vs, uint64_t res);
+    uint64_t shader_tex_mask64(const uint8_t* obj, bool vs, uint64_t res) const;
+    void publish_shader_mask(uint64_t key, uint16_t mask);
+    void warm_shader_specs(const uint8_t* obj, bool vs, uint64_t res);
     void load_pipeline_specs();
     // 0x7D4480 (texture_mips) rewrites t[0] (base), t[2] (width/height), t[3] (last_level), and
     // t[4] (pitch) when toggling between low-mip and hi-mip state. Keying solely by the engine
@@ -3147,23 +3155,28 @@ uint16_t Renderer::sampler_id(const uint32_t* s, bool nearest) {
     return id;
 }
 
-uint64_t Renderer::shader_code_hash(const uint8_t* obj, bool vs) {
+uint64_t Renderer::shader_code_hash(const uint8_t* obj, bool vs, uint64_t res) {
     if (!obj || uint64_t(obj) < 0x10000) return 0;
-    const uint64_t ok = (uint64_t(obj) << 1) | (vs ? 1ull : 0ull);
+    const uint64_t ok = shader_object_key(obj, vs, res);
     auto it = obj_code_hash.find(ok);
     if (it != obj_code_hash.end()) return it->second;
     const GnmShader g = parse_shader(obj, vs);
     if (!g.code || !g.code_size) return 0;
     uint64_t h = mix(hash_bytes(g.code, g.code_size), g.fetch && g.fetch_size ? hash_bytes(g.fetch, g.fetch_size) : 0);
-    h = mix(h, uint64_t(g.user_sgprs) | (uint64_t(g.ps_input_addr) << 32)) | 1ull;
+    h = mix(h, uint64_t(g.user_sgprs) | (uint64_t(g.ps_input_addr) << 32));
+    for (const auto& u : g.slots)
+        h = mix(h, uint64_t(u.type) | uint64_t(u.api_slot) << 8 | uint64_t(u.start_reg) << 16 | uint64_t(u.flags) << 24);
+    h = mix(h, g.slots.size());
+    for (uint16_t semantic : g.semantics) h = mix(h, semantic);
+    h = mix(h, g.semantics.size()) | 1ull;
     obj_code_hash[ok] = h;
-    hash_to_obj[(h << 1) | (vs ? 1ull : 0ull)] = obj;
+    hash_to_obj[mix(h, vs)] = {obj, res};
     return h;
 }
 
-uint64_t Renderer::shader_tex_mask64(const uint8_t* obj, bool vs) const {
+uint64_t Renderer::shader_tex_mask64(const uint8_t* obj, bool vs, uint64_t res) const {
     if (!obj) return 0;
-    const uint64_t ok = (uint64_t(obj) << 1) | (vs ? 1ull : 0ull);
+    const uint64_t ok = shader_object_key(obj, vs, res);
     // Avoid contending on a shared mutex twice per draw. Only cache published
     // masks; a missing entry may become known during shader translation.
     struct Entry { const Renderer* owner = nullptr; uint64_t key = 0, epoch = 0, mask = 0; };
@@ -3178,27 +3191,45 @@ uint64_t Renderer::shader_tex_mask64(const uint8_t* obj, bool vs) const {
     return e.mask;
 }
 
-void Renderer::warm_shader_specs(const uint8_t* obj, bool vs) {
-    if (!obj || uint64_t(obj) < 0x10000 || pipe_specs.empty()) return;
-    const uint64_t ch = shader_code_hash(obj, vs);
+void Renderer::publish_shader_mask(uint64_t key, uint16_t mask) {
+    uint64_t m4 = 0;
+    for (int i = 0; i < 16; ++i) if (mask >> i & 1) m4 |= 0xFull << (i * 4);
+    std::unique_lock lk(shader_mask_m);
+    auto [it, inserted] = obj_tex_mask64.try_emplace(key, m4);
+    if (inserted || it->second != m4) {
+        it->second = m4;
+        shader_mask_epoch.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void Renderer::warm_shader_specs(const uint8_t* obj, bool vs, uint64_t res) {
+    if (!obj || uint64_t(obj) < 0x10000 || warm_specs_by_shader.empty()) return;
+    const uint64_t ch = shader_code_hash(obj, vs, res);
     if (!ch) return;
-    for (size_t i = 0; i < pipe_specs.size(); ++i) {
+    auto candidates = warm_specs_by_shader.find(mix(ch, vs));
+    if (candidates == warm_specs_by_shader.end()) return;
+    auto live = [&](const ShaderRef& ref) {
+        return ref.obj && ref.res && opt.res_current && opt.res_current(uint64_t(ref.obj)) == ref.res;
+    };
+    for (size_t i : candidates->second) {
         if (spec_warmed[i]) continue;
-        const DiskPipeSpec& sp = pipe_specs[i];
-        if (vs ? (sp.vs_hash != ch) : (sp.ps_hash != ch)) continue;
-        auto vit = hash_to_obj.find((sp.vs_hash << 1) | 1ull);
-        if (vit == hash_to_obj.end() || !vit->second) continue;
-        const uint8_t* ps_ptr = nullptr;
+        const DiskPipeSpec sp = pipe_specs[i];
+        auto vit = hash_to_obj.find(mix(sp.vs_hash, true));
+        if (vit == hash_to_obj.end() || !live(vit->second)) continue;
+        const ShaderRef vref = vit->second;
+        ShaderRef pref{};
         if (sp.ps_hash) {
-            auto pit = hash_to_obj.find((sp.ps_hash << 1) | 0ull);
-            if (pit == hash_to_obj.end() || !pit->second) continue;
-            ps_ptr = pit->second;
+            auto pit = hash_to_obj.find(mix(sp.ps_hash, false));
+            if (pit == hash_to_obj.end() || !live(pit->second)) continue;
+            pref = pit->second;
         }
         spec_warmed[i] = 1;
         Draw d{};
         d.kind = Draw::Indexed;
-        d.vs = vit->second;
-        d.ps = ps_ptr;
+        d.vs = vref.obj;
+        d.ps = pref.obj;
+        d.shader_res[0] = vref.res;
+        d.shader_res[1] = pref.res;
         d.prim = sp.prim;
         d.blend = sp.blend;
         d.target_mask = sp.target_mask;
@@ -3232,6 +3263,7 @@ void Renderer::warm_shader_specs(const uint8_t* obj, bool vs) {
             d_ptr = &d_img;
         }
         Pipeline* p = pipeline_resolve(d, c_ptrs, d_ptr);
+        if (!p) spec_warmed[i] = 0;
         if (p) {
             const uint64_t pk = pipe_key(d, c_ptrs, d_ptr);
             const size_t mask = pipe_memo.size() - 1;
@@ -3245,7 +3277,7 @@ void Renderer::warm_shader_specs(const uint8_t* obj, bool vs) {
 
 void Renderer::load_pipeline_specs() {
     if (!opt.pipeline_cache) return;
-    const std::string path = std::string(opt.pipeline_cache) + ".specs";
+    const std::string path = std::string(opt.pipeline_cache) + ".specs.v2";
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return;
     std::fseek(f, 0, SEEK_END);
@@ -3256,7 +3288,12 @@ void Renderer::load_pipeline_specs() {
         pipe_specs.resize(cnt);
         if (std::fread(pipe_specs.data(), sizeof(DiskPipeSpec), cnt, f) == cnt) {
             spec_warmed.assign(cnt, 0);
-            for (const auto& sp : pipe_specs) pipe_spec_hashes.insert(hash_bytes(&sp, sizeof sp));
+            for (size_t i = 0; i < pipe_specs.size(); ++i) {
+                const auto& sp = pipe_specs[i];
+                pipe_spec_hashes.insert(hash_bytes(&sp, sizeof sp));
+                warm_specs_by_shader[mix(sp.vs_hash, true)].push_back(i);
+                if (sp.ps_hash) warm_specs_by_shader[mix(sp.ps_hash, false)].push_back(i);
+            }
             log("native renderer: loaded %zu persistent pipeline specs from %s", cnt, path.c_str());
         } else {
             pipe_specs.clear();
@@ -3268,20 +3305,19 @@ void Renderer::load_pipeline_specs() {
 Shader* Renderer::shader(const Draw& dr, bool vs, const gcn::TexDim* dims, const uint8_t* kinds, uint32_t uint_in,
                          uint32_t sint_in, uint32_t scaled_in) {
     const uint8_t* obj = vs ? dr.vs : dr.ps;
-    // Fast base lookup with default Tex2D float slots: once a shader is translated once, we know its
-    // active res.tex_mask and mask dims/kinds to only the slots the shader actually samples.
-    gcn::TexDim def_dims[16];
-    uint8_t def_kinds[16] = {};
-    for (int i = 0; i < 16; ++i) def_dims[i] = gcn::TexDim::Tex2D;
-    uint64_t base_key = mix(mix(uint64_t(obj), vs), hash_bytes(def_dims, sizeof def_dims));
-    base_key = mix(mix(base_key, hash_bytes(def_kinds, 16)), uint64_t(uint_in) | uint64_t(sint_in) << 32);
-    if (scaled_in) base_key = mix(base_key, scaled_in);
-    if (!vs) base_key = mix(base_key, uint64_t(dr.vs));
+    const uint64_t res = dr.shader_res[vs ? 0 : 1];
+    const uint64_t object_key = shader_object_key(obj, vs, res);
+    const uint64_t code_hash = shader_code_hash(obj, vs, res);
+    const uint64_t vs_hash = vs ? 0 : shader_code_hash(dr.vs, true, dr.shader_res[0]);
+    const uint64_t native_id = code_hash ? code_hash : object_key;
+    const uint64_t link_id = vs_hash ? vs_hash : shader_object_key(dr.vs, true, dr.shader_res[0]);
+    // Active texture slots are learned per object epoch. Modules are shared
+    // between different objects only when their shader content and linkage match.
     gcn::TexDim masked_dims[16];
     uint8_t masked_kinds[16] = {};
     for (int i = 0; i < 16; ++i) masked_dims[i] = dims[i], masked_kinds[i] = kinds[i];
     {
-        const uint64_t m64 = shader_tex_mask64(obj, vs);
+        const uint64_t m64 = shader_tex_mask64(obj, vs, res);
         for (int i = 0; i < 16; ++i) {
             if (!((m64 >> (i * 4)) & 0xF)) {
                 masked_dims[i] = gcn::TexDim::Tex2D;
@@ -3289,12 +3325,15 @@ Shader* Renderer::shader(const Draw& dr, bool vs, const gcn::TexDim* dims, const
             }
         }
     }
-    uint64_t key = mix(mix(uint64_t(obj), vs), hash_bytes(masked_dims, 16 * sizeof(gcn::TexDim)));
+    uint64_t key = mix(mix(native_id, vs), hash_bytes(masked_dims, 16 * sizeof(gcn::TexDim)));
     key = mix(mix(key, hash_bytes(masked_kinds, 16)), uint64_t(uint_in) | uint64_t(sint_in) << 32);
     if (scaled_in) key = mix(key, scaled_in);
-    if (!vs) key = mix(key, uint64_t(dr.vs));  // the input mapping depends on the VS
+    if (!vs) key = mix(key, link_id);  // the input mapping depends on the VS
     auto it = shaders.find(key);
-    if (it != shaders.end()) return it->second.get();
+    if (it != shaders.end()) {
+        if (it->second->ok) publish_shader_mask(object_key, it->second->res.tex_mask);
+        return it->second.get();
+    }
     auto sh = std::make_unique<Shader>();
     const GnmShader g = parse_shader(obj, vs);
     gcn::ShaderDesc d;
@@ -3347,29 +3386,20 @@ Shader* Renderer::shader(const Draw& dr, bool vs, const gcn::TexDim* dims, const
     if (!sh->ok) ++st.bad_shaders;
     Shader* out = sh.get();
     const uint16_t actual_tmask = out->res.tex_mask;
-    uint64_t m4 = 0;
-    for (int i = 0; i < 16; ++i) {
-        if (actual_tmask >> i & 1) {
-            m4 |= 0xFull << (i * 4);
-        } else {
-            masked_dims[i] = gcn::TexDim::Tex2D;
-            masked_kinds[i] = 0;
-        }
+    // A failed translation must not publish an empty usage mask or poison a
+    // canonical key used by a later valid variant.
+    if (out->ok) {
+        for (int i = 0; i < 16; ++i)
+            if (!(actual_tmask >> i & 1)) {
+                masked_dims[i] = gcn::TexDim::Tex2D;
+                masked_kinds[i] = 0;
+            }
+        publish_shader_mask(object_key, actual_tmask);
     }
-    {
-        std::unique_lock lk(shader_mask_m);
-        const uint64_t mask_key = (uint64_t(obj) << 1) | (vs ? 1ull : 0ull);
-        auto [it, inserted] = obj_tex_mask64.try_emplace(mask_key, m4);
-        if (inserted || it->second != m4) {
-            it->second = m4;
-            shader_mask_epoch.fetch_add(1, std::memory_order_release);
-        }
-    }
-    shader_code_hash(obj, vs);
-    uint64_t canon_key = mix(mix(uint64_t(obj), vs), hash_bytes(masked_dims, 16 * sizeof(gcn::TexDim)));
+    uint64_t canon_key = mix(mix(native_id, vs), hash_bytes(masked_dims, 16 * sizeof(gcn::TexDim)));
     canon_key = mix(mix(canon_key, hash_bytes(masked_kinds, 16)), uint64_t(uint_in) | uint64_t(sint_in) << 32);
     if (scaled_in) canon_key = mix(canon_key, scaled_in);
-    if (!vs) canon_key = mix(canon_key, uint64_t(dr.vs));
+    if (!vs) canon_key = mix(canon_key, link_id);
     auto [cit, inserted] = shaders.try_emplace(canon_key, std::move(sh));
     if (!inserted && sh && sh->module) vkDestroyShaderModule(ctx.device, sh->module, nullptr);
     return cit->second.get();
@@ -3400,11 +3430,12 @@ gcn::TexDim slot_dim(const uint32_t* t) {
 uint64_t Renderer::pipe_key(const Draw& dr, Image* const* colors, Image* depth) const {
     // Mask dr.tex_sig[0..1] to the active texture slots actually sampled by dr.vs and dr.ps,
     // and exclude dr.tex_mask[0..1] so leftover textures in unused device slots never cause misses.
-    uint64_t k = mix(mix(uint64_t(dr.vs), uint64_t(dr.ps)), uint64_t(dr.prim));
+    uint64_t k = mix(mix(shader_object_key(dr.vs, true, dr.shader_res[0]),
+                         shader_object_key(dr.ps, false, dr.shader_res[1])), uint64_t(dr.prim));
     k = mix(mix(k, uint64_t(dr.blend) | uint64_t(dr.target_mask) << 32), uint64_t(dr.su_sc_mode) | uint64_t(dr.depth_ctl) << 32);
     k = mix(mix(k, dr.stencil_ctl), dr.vb_sig);
-    const uint64_t tsig0 = dr.tex_sig[0] & shader_tex_mask64(dr.vs, true);
-    const uint64_t tsig1 = dr.ps ? (dr.tex_sig[1] & shader_tex_mask64(dr.ps, false)) : 0;
+    const uint64_t tsig0 = dr.tex_sig[0] & shader_tex_mask64(dr.vs, true, dr.shader_res[0]);
+    const uint64_t tsig1 = dr.ps ? (dr.tex_sig[1] & shader_tex_mask64(dr.ps, false, dr.shader_res[1])) : 0;
     k = mix(mix(k, tsig0), tsig1);
     uint64_t cpack = 0;
     for (int i = 0; i < 8; ++i)
@@ -3422,16 +3453,8 @@ Pipeline* Renderer::pipeline(const Draw& dr, Image* const* colors, Image* depth)
         if (e.key == k && e.p) return ++st.memo_hits, e.p;
         if (!e.p) break;
     }
-    if (!pipe_specs.empty()) {
-        warm_shader_specs(dr.vs, true);
-        if (dr.ps) warm_shader_specs(dr.ps, false);
-        k = pipe_key(dr, colors, depth);
-        for (size_t pr = 0; pr < 4; ++pr) {
-            PipeMemo& e = pipe_memo[(k + pr) & mask];
-            if (e.key == k && e.p) return ++st.memo_hits, e.p;
-            if (!e.p) break;
-        }
-    }
+    // Never warm unrelated pipelines on a draw miss. The loader handles
+    // speculative warmup; the foreground builds only the pipeline requested.
     const uint64_t prev_pipes = st.pipelines;
     Pipeline* p = pipeline_resolve(dr, colors, depth);
     k = pipe_key(dr, colors, depth);  // recompute after shader_tex_mask64 is populated
@@ -3647,10 +3670,10 @@ Pipeline* Renderer::pipeline_resolve(const Draw& dr, Image* const* colors, Image
     }
     if (p->pipeline) {
         DiskPipeSpec sp{};
-        sp.vs_hash = shader_code_hash(dr.vs, true);
-        sp.ps_hash = dr.ps ? shader_code_hash(dr.ps, false) : 0;
-        sp.tex_sig[0] = dr.tex_sig[0] & shader_tex_mask64(dr.vs, true);
-        sp.tex_sig[1] = dr.ps ? (dr.tex_sig[1] & shader_tex_mask64(dr.ps, false)) : 0;
+        sp.vs_hash = shader_code_hash(dr.vs, true, dr.shader_res[0]);
+        sp.ps_hash = dr.ps ? shader_code_hash(dr.ps, false, dr.shader_res[1]) : 0;
+        sp.tex_sig[0] = dr.tex_sig[0] & shader_tex_mask64(dr.vs, true, dr.shader_res[0]);
+        sp.tex_sig[1] = dr.ps ? (dr.tex_sig[1] & shader_tex_mask64(dr.ps, false, dr.shader_res[1])) : 0;
         sp.vb_sig = dr.vb_sig;
         for (int i = 0; i < 16; ++i) {
             sp.vb1[i] = dr.vb[i][1];
@@ -3666,7 +3689,7 @@ Pipeline* Renderer::pipeline_resolve(const Draw& dr, Image* const* colors, Image
         sp.prim = dr.prim;
         sp.depth_stencil = uint8_t(depth && depth->stencil ? 1 : 0);
         for (int s = 0; s < 2; ++s) {
-            const uint64_t m64 = s ? (dr.ps ? shader_tex_mask64(dr.ps, false) : 0) : shader_tex_mask64(dr.vs, true);
+            const uint64_t m64 = s ? (dr.ps ? shader_tex_mask64(dr.ps, false, dr.shader_res[1]) : 0) : shader_tex_mask64(dr.vs, true, dr.shader_res[0]);
             for (int i = 0; i < 16; ++i)
                 sp.tex_dk[s][i] = ((m64 >> (i * 4)) & 0xF) ? dr.tex_dk[s][i] : 0;
         }
@@ -4218,6 +4241,8 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
     for (size_t di = 0; di < count; ++di) {
         Draw& dr = *draws[di];
         if (dr.kind != Draw::Indexed && dr.kind != Draw::Auto) continue;
+        dr.shader_res[0] = dr.vs && opt.res_current ? opt.res_current(uint64_t(dr.vs)) : 0;
+        dr.shader_res[1] = dr.ps && opt.res_current ? opt.res_current(uint64_t(dr.ps)) : 0;
         if (!dr.vb_sig) {
             uint64_t vsig = 0;
             for (uint32_t i = 0; i < 16; ++i)
@@ -4995,16 +5020,18 @@ void Renderer::load_shader(const LoadJob& j) {
     const bool vs = j.kind == 2;
     const uint8_t* obj = reinterpret_cast<const uint8_t*>(j.base);
     std::lock_guard lk(pipe_m);
+    if (!j.res || !opt.res_current || opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
     if (vs) {
         gcn::TexDim dims[16];
         uint8_t kinds[16] = {};
         for (int i = 0; i < 16; ++i) dims[i] = gcn::TexDim::Tex2D;
         Draw dummy{};
         dummy.vs = obj;
+        dummy.shader_res[0] = j.res;
         shader(dummy, true, dims, kinds);
     }
     // Pre-build any persisted pipeline specs that use this VS or PS so second runs have 0 misses
-    warm_shader_specs(obj, vs);
+    warm_shader_specs(obj, vs, j.res);
 }
 
 // ---------------------------------------------------------------------------- lists on engine threads
@@ -5707,7 +5734,7 @@ void Renderer::save_pipeline_cache() {
         if (std::rename(tmp.c_str(), opt.pipeline_cache) == 0) pcache_saved_pipelines = saving_pipelines;
     }
     if (!pipe_specs.empty()) {
-        const std::string sp_path = std::string(opt.pipeline_cache) + ".specs";
+        const std::string sp_path = std::string(opt.pipeline_cache) + ".specs.v2";
         const std::string sp_tmp = sp_path + ".tmp";
         if (FILE* sf = std::fopen(sp_tmp.c_str(), "wb")) {
             const bool sok = std::fwrite(pipe_specs.data(), sizeof(DiskPipeSpec), pipe_specs.size(), sf) == pipe_specs.size();
@@ -5968,12 +5995,12 @@ void notify_texture_mips(const uint32_t* tsharp, uint64_t res, uint64_t obj, uin
 void prefetch_shader_pair(const uint8_t* vs_obj, const uint8_t* ps_obj) {
     if (!g) return;
     if (vs_obj) {
-        Renderer::LoadJob j{2, {}, uint64_t(vs_obj), 0, 1, uint64_t(vs_obj)};
-        g->prefetch(j);
+        const uint64_t res = g->opt.res_current ? g->opt.res_current(uint64_t(vs_obj)) : 0;
+        if (res) g->prefetch({2, {}, uint64_t(vs_obj), 0, res, uint64_t(vs_obj)});
     }
     if (ps_obj) {
-        Renderer::LoadJob j{3, {}, uint64_t(ps_obj), 0, 1, uint64_t(ps_obj)};
-        g->prefetch(j);
+        const uint64_t res = g->opt.res_current ? g->opt.res_current(uint64_t(ps_obj)) : 0;
+        if (res) g->prefetch({3, {}, uint64_t(ps_obj), 0, res, uint64_t(ps_obj)});
     }
 }
 void prefetch_buffer(uint64_t base, uint64_t size, uint64_t res, uint64_t obj) {
