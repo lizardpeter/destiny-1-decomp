@@ -34,6 +34,7 @@
 #include "frame_telemetry.h"
 #include "host_memory.h"
 #include "native_record_registry.h"
+#include "../gfx/native_resource_identity.h"
 #include "runtime.h"
 #include "tiling.h"
 
@@ -192,62 +193,25 @@ uint32_t vertex_count(uint32_t prim, uint32_t n) {
 // the T#), vertex buffer (4), index buffer (6), pixel shader (8) or vertex shader (9) bumps
 // the object's epoch and triggers background GPU preparation.
 namespace resreg {
-constexpr uint32_t kBits = 18;
-constexpr size_t kSlots = size_t(1) << kBits, kProbe = 64;
-struct Slot { std::atomic<uint64_t> key{0}, val{0}; std::atomic<uint32_t> handle{0xFFFFFFFFu}; };
-Slot* g_slots = nullptr;
-std::mutex g_wm;
-uint32_t g_next_id = 0;
-size_t g_used = 0;
+ng::ResourceRegistry<>* g_registry = nullptr;
 std::atomic<uint64_t> g_events{0};
 bool g_on = false;
-inline size_t home(uint64_t k) { return size_t((k * 0x9E3779B97F4A7C15ull) >> (64 - kBits)); }
 inline uint64_t get(uint64_t key) {
-    if (!g_slots || key < 0x10000) return 0;
-    const size_t h = home(key);
-    for (size_t i = 0; i < kProbe; ++i) {
-        Slot& sl = g_slots[(h + i) & (kSlots - 1)];
-        const uint64_t k = sl.key.load(std::memory_order_acquire);
-        if (k == key) {
-            const uint64_t v = sl.val.load(std::memory_order_acquire);
-            const uint32_t hd = sl.handle.load(std::memory_order_relaxed);
-            if (hd != 0xFFFFFFFFu && resolve_handle_safe(hd) != key) {
-                static std::atomic<uint64_t> n{0};
-                const uint64_t c = ++n;
-                if ((c & (c - 1)) == 0 && c <= (1u << 20))
-                    log("nd: stale resource registry entries ignored: %llu (object %#llx, handle %#x now names %#llx)", (unsigned long long)c,
-                        (unsigned long long)key, hd, (unsigned long long)resolve_handle_safe(hd));
-                return 0;
-            }
-            return v;
-        }
-        if (!k) return 0;
+    if (!g_registry || key < 0x10000) return 0;
+    const auto snapshot = g_registry->get(key);
+    if (!snapshot.identity) return 0;
+    if (snapshot.handle != UINT32_MAX && resolve_handle_safe(snapshot.handle) != key) {
+        static std::atomic<uint64_t> n{0};
+        const uint64_t c = ++n;
+        if ((c & (c - 1)) == 0 && c <= (1u << 20))
+            log("nd: stale resource registry entries ignored: %llu (object %#llx, handle %#x)",
+                (unsigned long long)c, (unsigned long long)key, snapshot.handle);
+        return 0;
     }
-    return 0;
+    return snapshot.identity;
 }
-void touch(uint64_t key, bool insert, uint32_t handle = 0xFFFFFFFFu) {
-    if (!g_slots || key < 0x10000) return;
-    std::lock_guard lk(g_wm);
-    const size_t h = home(key);
-    for (size_t i = 0; i < kProbe; ++i) {
-        Slot& sl = g_slots[(h + i) & (kSlots - 1)];
-        const uint64_t k = sl.key.load(std::memory_order_relaxed);
-        if (k == key) {
-            const uint64_t v = sl.val.load(std::memory_order_relaxed);
-            if (handle != 0xFFFFFFFFu) sl.handle.store(handle, std::memory_order_relaxed);
-            sl.val.store((v & ~0xFFFFFFFFull) | ((v + 1) & 0xFFFFFFFFull), std::memory_order_release);
-            ++g_events;
-            return;
-        }
-        if (!k) {
-            if (!insert || g_used * 10 > kSlots * 7) return;
-            sl.handle.store(handle, std::memory_order_relaxed);
-            sl.val.store(uint64_t(++g_next_id) << 32 | 1, std::memory_order_relaxed);
-            sl.key.store(key, std::memory_order_release);
-            ++g_used, ++g_events;
-            return;
-        }
-    }
+void touch(uint64_t key, bool insert, uint32_t handle = UINT32_MAX) {
+    if (g_registry && key >= 0x10000 && g_registry->touch(key, insert, handle)) ++g_events;
 }
 // the resource object a (type, handle) names, 0 for the types the renderer does not track
 uint64_t object_of(uint32_t type, uint32_t handle) {
@@ -287,8 +251,8 @@ void event_any(uint32_t handle) {
     if (const uint64_t o = resolve_handle_safe(handle)) touch(o, false, handle);
 }
 void init() {
-    if (g_slots) return;
-    g_slots = new Slot[kSlots];
+    if (g_registry) return;
+    g_registry = new ng::ResourceRegistry<>;
     g_on = true;
 }
 }  // namespace resreg

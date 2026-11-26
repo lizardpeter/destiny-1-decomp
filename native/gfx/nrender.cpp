@@ -12,6 +12,7 @@
 // blocks. Flips blit the video-out target into the window's swapchain.
 #include "nrender.h"
 #include "native_memory_policy.h"
+#include "native_resource_identity.h"
 #include "../src/native_ranges.h"
 #include "../src/host_memory.h"
 
@@ -519,7 +520,7 @@ struct Renderer {
     // up every draw's buffers); blocks, their free lists and geo_bytes under geo_block_m
     struct GeoShard {
         std::mutex m;
-        std::unordered_map<uint64_t, GeoEntry> map;
+        std::unordered_map<GeometryKey, GeoEntry, GeometryKeyHash> map;
     };
     GeoShard geo_shards[64];
     std::mutex geo_block_m;
@@ -1681,8 +1682,7 @@ void Renderer::wait_serial(uint64_t serial) {
 
 VkDeviceMemory Renderer::alloc(VkMemoryRequirements req, VkMemoryPropertyFlags required,
                                VkMemoryPropertyFlags preferred, const void* next) {
-    VkPhysicalDeviceMemoryProperties props{};
-    vkGetPhysicalDeviceMemoryProperties(ctx.gpu, &props);
+    const auto& props = ctx.memory;
     uint32_t flags[32]{};
     for (uint32_t i=0;i<props.memoryTypeCount;++i) flags[i]=props.memoryTypes[i].propertyFlags;
     const auto order=memory_type_order(req.memoryTypeBits,flags,props.memoryTypeCount,required,preferred);
@@ -2805,8 +2805,8 @@ bool Renderer::geo_get(uint64_t addr, uint64_t size, int index_size, uint32_t in
 // event (a move keeps the contents), never write-tracked. Keyed by the resource and the offset
 // in it, so a move does not make a new entry.
 GeoEntry* Renderer::geo_lookup_res(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase) {
-    const uint64_t key = (mix(mix(res >> 32, addr - rbase), size) | 1ull << 63);
-    GeoShard& sh = geo_shards[(key * 0x9E3779B97F4A7C15ull) >> 58];
+    const GeometryKey key{res >> 32, addr-rbase, size, uint32_t(index_size), index_count};
+    GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
     std::unique_lock shard_lock(sh.m);
     GeoEntry& e = sh.map[key];
     e.last_used = submit_seq.load(std::memory_order_relaxed);
@@ -2840,6 +2840,7 @@ GeoEntry* Renderer::geo_lookup_res(uint64_t addr, uint64_t size, int index_size,
             return &e;
         }
         __atomic_fetch_add(&st.geo_res_changed, 1, __ATOMIC_RELAXED);
+        geo_evict_gen.fetch_add(1, std::memory_order_release); // invalidate thread-local native buffer bindings
         geo_free_later(e.block, e.off, e.size);
         e.valid = false;
     }
@@ -2870,12 +2871,13 @@ GeoEntry* Renderer::geo_lookup_res(uint64_t addr, uint64_t size, int index_size,
 
 GeoEntry* Renderer::geo_lookup(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase) {
     if (addr < 0x10000 || !size || size >= (64ull << 20) || (debug_toggles() & 8)) return nullptr;
+    if (index_size && ((index_size != 2 && index_size != 4) || index_count > size / uint64_t(index_size))) return nullptr;
     if (res && addr >= rbase) return geo_lookup_res(addr, size, index_size, index_count, res, rbase);
     if (!opt.watch || !opt.version || size >= (16ull << 20)) return nullptr;
     __atomic_fetch_add(&st.unreg_geo, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&st.unreg_geo_bytes, size, __ATOMIC_RELAXED);
-    const uint64_t key = addr | size << 40;  // exact: addr < 2^40, size <= 16 MiB
-    GeoShard& sh = geo_shards[(key * 0x9E3779B97F4A7C15ull) >> 58];
+    const GeometryKey key{0,addr,size,uint32_t(index_size),index_count};
+    GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
     std::unique_lock shard_lock(sh.m);
     GeoEntry& e = sh.map[key];
     e.last_used = rc().submit_no;
@@ -6342,8 +6344,8 @@ void describe_owner(uint64_t a, char* out, size_t n) {
     for (auto& sh : g->geo_shards) {
         std::lock_guard sl(sh.m);
         for (auto& [k, e] : sh.map)
-            if (!(k >> 63) && e.valid && a >= (k & 0xFFFFFFFFFFull) && a < (k & 0xFFFFFFFFFFull) + e.size) {
-                std::snprintf(out, n, "geometry %#llx +%llu (%s)", (unsigned long long)(k & 0xFFFFFFFFFFull), (unsigned long long)e.size,
+            if (!k.resource && e.valid && a >= k.offset && a-k.offset < e.size) {
+                std::snprintf(out, n, "geometry %#llx +%llu (%s)", (unsigned long long)k.offset, (unsigned long long)e.size,
                               e.misses ? "rewritten before" : "first write");
                 return;
             }
