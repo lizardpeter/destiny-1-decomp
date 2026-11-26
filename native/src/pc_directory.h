@@ -40,7 +40,7 @@ public:
         if (ec) return 0;
         auto dir = std::make_shared<Directory>(std::move(cursor));
         std::lock_guard lock(mutex_);
-        if (!next_) { ec = error(std::errc::too_many_files_open); return 0; }
+        if (next_ > 0x0fffffffu) { ec = error(std::errc::too_many_files_open); return 0; }
         const auto id = next_++;
         dirs_.emplace(id, std::move(dir));
         return id;
