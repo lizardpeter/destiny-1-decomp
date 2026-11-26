@@ -949,6 +949,8 @@ struct Renderer {
             if (overlaps(img->src_addr, img->src_size) ||
                 (img->low_loaded && overlaps(img->low_base, img->low_size)) ||
                 (img->hi_loaded && overlaps(img->hi_base, img->hi_size))) {
+                if(img->res_val&&img->res_obj&&opt.res_current&&opt.res_current(img->res_obj)!=img->res_val)
+                    continue; // old native GPU version is immutable
                 img->stale = true;
                 ++dma_stale;
                 changed = true;
@@ -974,6 +976,7 @@ struct Renderer {
     uint64_t texture_range_rejects=0, split_partial_kept=0, split_descriptor_rejects=0, texture_upload_failures=0;
     uint64_t resident_descriptor_hits=0,readback_unused_skipped=0,split_layout_guesses=0,expired_texture_epochs=0;
     uint64_t texture_cohort_splits=0,texture_draw_epoch_conflicts=0,unused_texture_slots=0;
+    uint64_t top_only_uploads=0,texture_view_mismatches=0;
     std::atomic<uint64_t> expired_gpu_results{0};
     // The GPU's results reached guest memory (a readback): copies made from that memory (a
     // texture over a render target's memory, e.g. glyphs drawn into a cache texture) are stale.
@@ -1007,6 +1010,8 @@ struct Renderer {
             if (!overlaps(img->src_addr, img->src_size) &&
                 !(img->low_loaded && overlaps(img->low_base, img->low_size)) &&
                 !(img->hi_loaded && overlaps(img->hi_base, img->hi_size))) continue;
+            if(img->res_val&&img->res_obj&&opt.res_current&&opt.res_current(img->res_obj)!=img->res_val)
+                continue;
             img->stale = true;
             ++cpu_stale;
             changed = true;
@@ -1275,7 +1280,7 @@ struct Renderer {
         bool quit = false;
     } wk;
     uint32_t rec_threads = 0;   // worker threads (0: everything on the submitting thread)
-    uint32_t rec_min_run = 64;  // fewest draws in a pass worth splitting
+    uint32_t rec_min_run = 256;  // fewest draws in a pass worth splitting
     uint64_t par_runs = 0, par_draws = 0;
     uint64_t native_stage_reuse=0,inline_run_draws=0,inline_runs=0;
     uint64_t native_view_cache_hits=0,native_view_cache_misses=0;
@@ -1567,7 +1572,7 @@ bool Renderer::init(const Options& o) {
         opt.frames_dir ? ", writing frames" : "");
     // D1_NG_RECORD_THREADS=<n>: worker threads recording runs of draws in parallel (default:
     // up to 6, leaving four hardware threads for the game; 0 = all on one thread)
-    // D1_NG_RECORD_RUN=<n>: fewest draws in one render pass that are split (default 64)
+    // D1_NG_RECORD_RUN=<n>: fewest draws in one render pass that are split (default 256)
     {
         const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
         rec_threads = hw >= 6 ? std::min(6u, hw - 4) : 0;
@@ -2598,8 +2603,11 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
 
     const StreamMipInfo smi = (!is3d && ts.type != 12 && ts.type != 13) ? get_stream_info(res, obj, ts, t) : StreamMipInfo{};
     if(!smi.valid){++expired_texture_epochs;return nullptr;}
-    const bool streamed = res != 0 && !is3d && ts.type != 12 && ts.type != 13 &&
-                          smi.has_hi != 0 && smi.full_mips > 1;
+    const bool split_resource=res!=0&&!is3d&&ts.type!=12&&ts.type!=13&&
+                              smi.has_hi!=0&&smi.full_mips>1;
+    const bool top_only=split_resource&&smi.from_callback&&!smi.low_base&&smi.hi_base==ts.base&&
+                        ts.width==smi.full_w&&ts.height==smi.full_h&&ts.last_level+1==smi.full_mips;
+    const bool streamed=split_resource&&!top_only;
     if(prepared&&(!res||streamed))return nullptr; // prepared jobs describe one contiguous registered surface
     if(split_prepared&&(!streamed||prepared))return nullptr;
     if (streamed) {
@@ -2632,7 +2640,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     const uint32_t full_w = streamed ? smi.full_w : ts.width;
     const uint32_t full_h = streamed ? smi.full_h : ts.height;
     const uint32_t full_d = streamed ? smi.full_d : (is3d ? ts.depth : 1);
-    const uint32_t full_levels = streamed ? smi.full_mips : std::min(ts.last_level + 1, tiling::kMaxMips);
+    const uint32_t full_levels = top_only?1u:streamed ? smi.full_mips : std::min(ts.last_level + 1, tiling::kMaxMips);
     const bool cur_is_low = streamed && ts.last_level + 1 < full_levels;
     const auto matches_shape=[&](const Image* img){
         return img->format==f&&img->w==full_w&&img->h==full_h&&img->d==full_d&&
@@ -2645,10 +2653,12 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     sf.depth = is3d ? ts.depth : 1;
     sf.layers = layers;
     sf.stored_layers=cube?ts.depth*6u:(ts.type==12||ts.type==13)?ts.depth:1u;
+    // Compute the authored full layout (its top level pitch can depend on
+    // the mip count), but only capture the allocation's first mip below.
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
     if(opt.compare_layout&&!rc().lr)opt.compare_layout(t,sf);
-    const uint64_t cur_bytes = cur_is_low ? sf.total_size : (streamed ? sf.mips[0].size : sf.total_size);
+    const uint64_t cur_bytes = cur_is_low ? sf.total_size : ((streamed||top_only) ? sf.mips[0].size : sf.total_size);
     if(prepared ? prepared_source_size!=cur_bytes : !guest_readable_range(ts.base,cur_bytes)){
         ++texture_range_rejects;
         return nullptr;
@@ -2708,7 +2718,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 st.t_tex_hit += now_ns() - t_in;
                 return img;
             }
-            if (!streamed && matches_shape(img)&&same_layout&&img->src_size == cur_bytes &&
+            if (!split_resource && matches_shape(img)&&same_layout&&img->src_size == cur_bytes &&
                 (prepared ? prepared_hash==img->content :
                  (primary()&&hash_bytes(primary_source.data(),cur_bytes)==img->content&&
                   guest_matches_current_spans(ts.base,cur_bytes,primary_spans,primary_source.data())&&current_epoch()))) {
@@ -3013,8 +3023,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         img->low_loaded = img->hi_loaded = ok;
         if (ok && res) {
             img->res_val = res, img->res_obj = smi.obj ? smi.obj : obj;
-            img->src_addr = ts.base, img->src_size = sf.total_size, img->version = ~0ull;
-            img->content=prepared?prepared_hash:hash_bytes(primary_source.data(),sf.total_size);
+            img->src_addr=ts.base;img->src_size=cur_bytes;img->version=~0ull;
+            img->content=prepared?prepared_hash:hash_bytes(primary_source.data(),cur_bytes);
+            if(top_only)++top_only_uploads;
         } else if (ok && (opt.watch || dynamic_copy)) {
             const uint64_t tw = now_ns();
             img->version = mem_watch(ts.base, sf.total_size);
@@ -3646,7 +3657,7 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
         img=it!=textures.end()?it->second.get():nullptr;
         if(res&&(!img||!img->matches_epoch(t,res))){
             auto* exact=historical_texture(tex_key(t,res),t,res);
-            if(img&&!exact)++expired_texture_epochs;
+            if(img&&!exact)++texture_view_mismatches;
             img=exact;
         }
     }
@@ -4389,7 +4400,9 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
         for (size_t i = 0; i < n; ++i) skip("no target");
         return;
     }
-    const uint32_t T = rec_threads + 1;
+    // Do not dispatch seven command buffers for a 64-draw run. Each
+    // worker has a fixed begin/end and synchronization cost.
+    const uint32_t T=std::min(rec_threads+1,std::max(2u,uint32_t(n/128)));
     Sub& sb = subs[rc().cur];
     if (sb.sec.size() < T) sb.sec.resize(T);
     // slices and their command buffers (allocated here: the pools belong to this thread's use)
@@ -7664,7 +7677,10 @@ void print_stats() {
             double(g->ring_worker_reserved)/1048576.0,double(g->ring_worker_payload)/1048576.0);
         g->resident_descriptor_hits=g->readback_unused_skipped=g->ring_worker_reserved=g->ring_worker_payload=0;
         log("native renderer: split low layouts reconstructed without a captured descriptor %llu",(unsigned long long)g->split_layout_guesses);
-        log("native renderer: expired captured texture epochs %llu",(unsigned long long)g->expired_texture_epochs);
+        log("native renderer: expired/invalid upload epochs %llu, missing exact resident views %llu, high-only texture uploads %llu",
+            (unsigned long long)g->expired_texture_epochs,(unsigned long long)g->texture_view_mismatches,
+            (unsigned long long)g->top_only_uploads);
+        g->texture_view_mismatches=g->top_only_uploads=0;
         g->split_layout_guesses=g->expired_texture_epochs=0;
         log("native renderer: texture epoch cohort splits %llu, conflicting versions in one draw %llu",
             (unsigned long long)g->texture_cohort_splits,(unsigned long long)g->texture_draw_epoch_conflicts);
