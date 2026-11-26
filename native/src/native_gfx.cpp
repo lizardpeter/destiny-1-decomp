@@ -34,6 +34,7 @@
 #include "frame_telemetry.h"
 #include "host_memory.h"
 #include "native_record_registry.h"
+#include "../gfx/native_record_fifo.h"
 #include "native_submission.h"
 #include "../gfx/native_close_contract.h"
 #include "../gfx/native_resource_identity.h"
@@ -802,12 +803,18 @@ using DrainFn = D1_SYSV bool (*)(uint64_t);
 DrainFn o_drain;
 using Dev3Fn = D1_SYSV void (*)(uint64_t, uint64_t, uint64_t);
 using Dev4Fn = D1_SYSV void (*)(uint64_t, uint64_t, uint64_t, uint64_t);
-Dev1Fn o_begin, o_end_submit;
+using BeginFn = D1_SYSV uint64_t (*)(uint64_t);
+BeginFn o_begin;
+Dev1Fn o_end_submit;
 Dev3Fn o_end;
 Dev4Fn o_begin_inherit;
-D1_SYSV void h_begin(uint64_t dev) {
-    o_begin(dev);
+bool native_ring_enabled();
+uint64_t native_begin(uint64_t dev);
+D1_SYSV uint64_t h_begin(uint64_t dev) {
+    if(native_ring_enabled())return native_begin(dev);
+    const uint64_t record=o_begin(dev);
     begin_list(dev);
+    return record;
 }
 D1_SYSV void h_begin_inherit(uint64_t dev, uint64_t rec, uint64_t a, uint64_t saved) {
     o_begin_inherit(dev, rec, a, saved);
@@ -830,7 +837,99 @@ bool native_drain_enabled() {
     }();
     return enabled;
 }
-// 01.33 0x7DD060: retain the original producer ring ABI for now, but consume
+bool native_ring_enabled() {
+    static const bool enabled=[] {
+        const char* v=std::getenv("D1_PC_NATIVE_RING");
+        return native_drain_enabled()&&v&&std::atoi(v)!=0;
+    }();
+    return enabled;
+}
+std::mutex g_fifo_m;
+std::unordered_map<uint64_t,std::unique_ptr<ng::NativeRecordFifo>> g_fifos;
+ng::NativeRecordFifo& native_fifo(uint64_t global) {
+    std::lock_guard lock(g_fifo_m);
+    auto& fifo=g_fifos[global];
+    if(!fifo) {
+        const uint32_t head=field<uint32_t>(global,0x2CC),tail=field<uint32_t>(global,0x2C8);
+        if(head!=tail){log("nd: cannot adopt nonempty original ring");std::abort();}
+        fifo=std::make_unique<ng::NativeRecordFifo>(head);
+    }
+    return *fifo;
+}
+void append_record(uint64_t global,uint64_t record,bool ready) {
+    auto mirror=[&](uint32_t sequence) {
+        const uint32_t slot=ng::record_ring_slot(sequence);
+        put_field(global,0x2D0,field<uint32_t>(global,0x2D0)+1);
+        put_field(global,0xC8+uint64_t(slot)*8,record);
+        put_field(global,0xC0,field<uint32_t>(global,0xC0)+1);
+        put_field(record,0x930,slot);
+        __atomic_store_n(reinterpret_cast<uint32_t*>(global+0x2C8),sequence+1,__ATOMIC_RELEASE);
+        put_field(global,0xB4,field<uint32_t>(global,0xB4)^1u);
+    };
+    if(native_ring_enabled()){
+        if(!native_fifo(global).reserve(record,ready,mirror)){
+            log("nd: native record FIFO full or duplicate reservation");std::abort();
+        }
+    } else mirror(field<uint32_t>(global,0x2C8));
+}
+void reset_record(uint64_t record) {
+    // 0x6AC60 initializes the common 24-byte record header.
+    put_field(record,0,uint64_t(0xffffffff80000000ull));
+    put_field(record,8,uint64_t(UINT64_MAX));
+    put_field(record,0x10,uint64_t(0));
+    __atomic_exchange_n(reinterpret_cast<uint32_t*>(record+0x18),0u,__ATOMIC_SEQ_CST);
+    put_field(record,0x1C,uint32_t(0));
+    put_field(record,0x24,uint32_t(0));
+    put_field(record,0x28,uint8_t(0));
+    put_field(record,0x730,uint32_t(0));
+    put_field(record,0x830,uint32_t(0));
+    put_field(record,0x930,uint32_t(0));
+    std::memset(reinterpret_cast<void*>(record+0x30),0,0x604);
+}
+void allocate_record_label(uint64_t record) {
+    using LabelFn=D1_SYSV void(*)(uint64_t,uint64_t);
+    reinterpret_cast<LabelFn>(nr::g_base+0x7EF890)(nr::g_base+0x26E4840,record+0x1C);
+}
+uint64_t native_begin(uint64_t dev) {
+    const uint64_t global=field<uint64_t>(dev,0);
+    const uint32_t index=field<uint32_t>(global,0x2DC);
+    // 32 full 0x938-byte records fit between +0x2E0 and +0x132E0.
+    if(index>=32){log("nd: main record array exhausted");std::abort();}
+    const uint64_t record=global+0x2E0+uint64_t(index)*0x938;
+    put_field(global,0x2DC,index+1);
+    reset_record(record);
+    allocate_record_label(record);
+    begin_list(dev);
+    put_field(dev,0x58,record);
+    using ResetFn=D1_SYSV void(*)(uint64_t,uint32_t);
+    reinterpret_cast<ResetFn>(nr::g_base+0x7DC270)(dev,0);
+    const uint32_t context=field<uint32_t>(global,0xB4);
+    if(context>1){log("nd: invalid native context index");std::abort();}
+    const uint64_t base=dev+uint64_t(context)*0xE60;
+    put_field(dev,0x50,base+0x60);
+    put_field(base,0x225,uint32_t(UINT32_MAX));
+    put_field(base,0x229,uint16_t(UINT16_MAX));
+    put_field(base,0x22B,uint8_t(UINT8_MAX));
+    put_field(base,0x152,uint8_t(UINT8_MAX));
+    put_field(base,0x150,uint16_t(UINT16_MAX));
+    for(uint64_t off=0x130;off<=0x148;off+=8)put_field(base,off,uint64_t(UINT64_MAX));
+    std::memset(reinterpret_cast<void*>(base+0x15A),0xFF,0xC4);
+    put_field(record,0x20,context);
+    using ContextFn=D1_SYSV void(*)(uint64_t,uint64_t);
+    reinterpret_cast<ContextFn>(nr::g_base+0x7EF9C0)(nr::g_base+0x26E4840,dev+0x50);
+    return record;
+}
+using ReserveRecordFn=D1_SYSV void(*)(uint64_t,uint64_t);
+ReserveRecordFn o_reserve_record;
+D1_SYSV void h_reserve_record(uint64_t dev,uint64_t record) {
+    if(!native_ring_enabled()){o_reserve_record(dev,record);return;}
+    const uint64_t global=field<uint64_t>(dev,0);
+    put_field(global,0x2D8,nr::eb<uint8_t>(0x18DCC30));
+    reset_record(record);
+    append_record(global,record,false);
+    allocate_record_label(record);
+}
+// 01.33 0x7DD060: retain original compatibility fields, but consume
 // native record identities rather than importing a Gnm submission. The
 // original scheduler lock and cooperative progress helper are still required.
 D1_SYSV bool h_drain(uint64_t dev) {
@@ -864,15 +963,23 @@ D1_SYSV bool h_drain(uint64_t dev) {
         }
     }
     for(;;){
-        const uint32_t head=field<uint32_t>(global,0x2CC);
-        const uint32_t tail=__atomic_load_n(reinterpret_cast<uint32_t*>(global+0x2C8),__ATOMIC_ACQUIRE);
-        if(!ng::ring_pending(head,tail))break;
-        const auto slot=global+0xC8+uint64_t(ng::record_ring_slot(head))*8;
-        const auto record=field<uint64_t>(slot,0);
-        if(!record) {log("nd: pending native ring slot is empty");std::abort();}
-        if(!__atomic_load_n(reinterpret_cast<uint32_t*>(record+0x18),__ATOMIC_ACQUIRE))break;
-        put_field(slot,0,uint64_t(0));
-        put_field(global,0x2CC,head+1);
+        uint64_t record=0;
+        auto mirror=[&](uint32_t head){
+            put_field(global,0xC8+uint64_t(ng::record_ring_slot(head))*8,uint64_t(0));
+            put_field(global,0x2CC,head+1);
+        };
+        if(native_ring_enabled()) {
+            record=native_fifo(global).take_ready(mirror);
+            if(!record)break;
+        } else {
+            const uint32_t head=field<uint32_t>(global,0x2CC);
+            const uint32_t tail=__atomic_load_n(reinterpret_cast<uint32_t*>(global+0x2C8),__ATOMIC_ACQUIRE);
+            if(!ng::ring_pending(head,tail))break;
+            record=field<uint64_t>(global,0xC8+uint64_t(ng::record_ring_slot(head))*8);
+            if(!record){log("nd: pending native ring slot is empty");std::abort();}
+            if(!__atomic_load_n(reinterpret_cast<uint32_t*>(record+0x18),__ATOMIC_ACQUIRE))break;
+            mirror(head);
+        }
         for(;;){
             const auto progress=field<uint64_t>(nr::g_base+0x26E4840,0x20);
             if(ng::progress_ready(__atomic_load_n(reinterpret_cast<uint32_t*>(progress),__ATOMIC_ACQUIRE),
@@ -952,17 +1059,13 @@ void native_close(uint64_t dev,uint32_t kind,bool worker) {
         std::abort();
     }
     clear_current(dev,list);
-    __atomic_exchange_n(reinterpret_cast<uint32_t*>(rec+0x18),1u,__ATOMIC_SEQ_CST);
-    if(plan.append_ring) {
-        put_field(global,0x2D0,field<uint32_t>(global,0x2D0)+1);
-        const uint32_t tail=field<uint32_t>(global,0x2C8),slot=ng::record_ring_slot(tail);
-        put_field(global,0xC8+uint64_t(slot)*8,rec);
-        put_field(global,0xC0,field<uint32_t>(global,0xC0)+1);
-        put_field(rec,0x930,slot);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        put_field(global,0x2C8,tail+1);
-        put_field(global,0xB4,field<uint32_t>(global,0xB4)^1u);
-    }
+    auto ready=[&]{__atomic_exchange_n(reinterpret_cast<uint32_t*>(rec+0x18),1u,__ATOMIC_SEQ_CST);};
+    if(plan.append_ring){ready();append_record(global,rec,true);}
+    else if(native_ring_enabled()){
+        if(!native_fifo(global).publish(rec,ready)){
+            log("nd: worker closed without a native FIFO reservation");std::abort();
+        }
+    } else ready();
     put_field(dev,0x50,uint64_t(0));
     put_field(dev,0x58,uint64_t(0));
     // Worker records were enqueued by 0x7DEA90 before recording started.
@@ -1184,6 +1287,7 @@ bool install() {
     ok &= hook(0x7DCEC0, &h_end, o_end, "cmdlist_end");
     ok &= hook(0x7DE950, &h_end_submit, o_end_submit, "cmdlist_end_and_submit");
     if (native_drain_enabled()) ok &= hook(0x7DD060, &h_drain, o_drain, "native_device_drain");
+    if (native_ring_enabled()) ok &= hook(0x7DEA90, &h_reserve_record, o_reserve_record, "native_worker_reserve");
     g_on = ok;
     log("nd: native device layer: %zu Gnm entry points replaced%s",
         sizeof kNoops / sizeof kNoops[0] + 8, ok ? "" : " - REQUIRED REPLACEMENTS FAILED");
