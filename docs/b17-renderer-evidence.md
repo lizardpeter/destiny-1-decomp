@@ -47,3 +47,24 @@ Build Linux and Windows; capture identical Earth Patrol, orbit, inventory and To
 The original 007d4480 body calls the descriptor initializer with half dimensions when high memory is absent, rounds dimensions to multiples of four when tag+35 is set, and selects the low or high address explicitly. The Vulkan upload now validates these descriptor states, treats mip callback addresses as authoritative, checks the two independent memory spans on DMA/CPU invalidation, allows failed uploads to retry, and crops padded block rows into the authored destination footprint. Split resources use demand upload until the background loader can prepare both allocation ranges safely; this is a correctness-first tradeoff, not a claim of higher streaming FPS.
 
 The full function index was checked before recording 17 additional evidence-backed names. Existing ledger entries and unconfirmed function starts were not overwritten. In particular, 007df200 writes a dummy T# pointer, rather than binding a PS texture. See records/names.tsv for individual evidence. The status table was regenerated programmatically using the existing status algorithm and full function index.
+
+
+## Test 33 follow-up (2026-11-26)
+
+The supplied client log identifies renderer build v12, Intel Arc, 1920x1080 internal rendering, 2880x1575 resized swapchain, immediate presentation, 120 FPS target. It does not identify an exact source commit; do not assume this executable includes the preceding B17 fixes.
+
+- Warm intro 120.1 FPS; orbit 98.7 FPS; in-world intervals 14.2, 16.6 and 14.5 FPS.
+- World: 6,983–9,338 recorded draws/frame, 96–97% parallel; 29.9–36.3 ms recording, 25.5–38.0 ms reported presentation/wait per frame. Worst recorded in-world hitch 502.0 ms (465.9 ms presentation, 34.7 ms record). Many hitches have zero newly compiled pipelines.
+- At the 4,455-frame checkpoint: 742 cumulative texture evictions, 52 cumulative null vertex-buffer skips, 2,911 cumulative target readbacks, 49.1 MiB reported ring peak, 1,230 MiB image memory after a previous 1,727 MiB peak. Feedback snapshots 431 copied, zero reused in the latest interval. These counters do not prove the cause of the visible flicker; cumulative byte averages are not steady-state GPU bandwidth.
+- Simulation: two 10 s world intervals advanced only 5.2 and 6.8 s of game time. The original timing routine returns a single capped primary tick in the trace even on long hitches. Do not patch the nominal rate or force a larger delta without recovering both tick consumers, the accumulator and scheduler dependencies.
+- Backend log has warnings and unhandled messages; no evidence that these account for the recorded renderer stalls.
+
+Source changes on main:
+- 05ea9a42: distinguish guest primitives that share Vulkan topology in the final pipeline key; depth and stencil copy regions separately; serialize loader and draw pipeline creation; throttle cache persistence by wall time; separate acquire, queue present, frame-end and cache-save timings.
+- 4a37e97f: synchronized texture-use masks with epoch-validated thread-local fast path; unknown masks remain conservative.
+- 7e349fb2: bind run targets before resolving texture views in submission-time recording (previously only the engine-list path did this); separate secondary-worker view lock from the parent renderer mutex; do not skip background uploads solely on identity if contents are stale.
+- 4d40e66d: bounded split-mip binding trace includes epoch, source spans and resident range, no frame-1200 cutoff.
+
+Validation status: source review and guarded edits only. No Windows build, Vulkan validation-layer run or real-GPU comparison was available in this session. Neither FPS uplift nor elimination of flickering is certified.
+
+Next test: same scene, camera path, GPU and settings; first compare current main on the normal submission-time path. Record the new presentation avg/max line, split-mip bind transitions, skipped draws, simulation/wall-time ratio and cold/warm pipeline creation. For an isolated presentation A/B keep the internal resolution constant while comparing window extent and present mode; do not ship a visual-quality reduction as an optimization. Next source investigations: exact target alias ownership rather than same-base fallback, sampled attachment content generation, pipeline cache identity/lifetime, per-pass GPU timestamps, GPU query/readback consumer contracts, and the original frame scheduler. Keep original shaders and game timing until those contracts are verified.
