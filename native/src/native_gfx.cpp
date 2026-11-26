@@ -1054,9 +1054,8 @@ void answer_zpass(uint64_t dest, bool end) {
     for (int db = 0; db < 8; ++db) q[db * 2 + (end ? 1 : 0)] = (end ? 1000ull : 0ull) | (1ull << 63);
 }
 
-void install() {
+bool install() {
     resev::install();
-    g_on = true;
     bool ok = true;
     auto rep = [&](uint64_t off, const void* fn) {
         if (!replace_eboot_function(off, fn)) ok = false, log("nd: replacing eboot+%#llx failed", (unsigned long long)off);
@@ -1082,8 +1081,10 @@ void install() {
     ok &= hook(0x7DD6A0, &h_begin_inherit, o_begin_inherit, "cmdlist_begin_inherit");
     ok &= hook(0x7DCEC0, &h_end, o_end, "cmdlist_end");
     ok &= hook(0x7DE950, &h_end_submit, o_end_submit, "cmdlist_end_and_submit");
-    log("nd: native device layer: no Gnm command buffers, no emulated GPU (%zu Gnm functions replaced)%s",
-        sizeof kNoops / sizeof kNoops[0] + 8, ok ? "" : " - SOME REPLACEMENTS FAILED");
+    g_on = ok;
+    log("nd: native device layer: %zu Gnm entry points replaced%s",
+        sizeof kNoops / sizeof kNoops[0] + 8, ok ? "" : " - REQUIRED REPLACEMENTS FAILED");
+    return ok;
 }
 }  // namespace nd
 
@@ -1371,10 +1372,12 @@ void native_gfx_on_unmap(uint64_t addr, uint64_t size) {
 }
 bool native_gfx_research_fault(void*, void*) { return false; }
 
-void native_gfx_install() {
+bool native_gfx_install() {
     const char* mode = getenv("D1_NATIVE_GFX");
-    if (!mode) mode = "render";
-    if (!mode || std::strcmp(mode, "render") != 0) return;
+    if (mode && std::strcmp(mode, "render") != 0) {
+        log("native gfx: compatibility GPU mode is no longer supported; native Vulkan is required");
+        return false;
+    }
     nr::g_base = rt().modules[0].base;
     nr::build_vsharp = reinterpret_cast<nr::BuildVsharpFn>(nr::g_base + 0xF7CF90);
     if (const char* v = getenv("D1_NG_EVERY")) nr::g_every = std::max(1, std::atoi(v));
@@ -1418,7 +1421,7 @@ void native_gfx_install() {
         if (opt.window_handles)
             os::error_box("The renderer could not start, so nothing can be drawn.\n\nIt needs a GPU driver with "
                           "Vulkan 1.4 (update the graphics driver). Details are in d1-native.log.");
-        return;
+        return false;
     }
     bool ok = true;
     ok &= hook(0x7E15D0, &r_draw_indexed, o_draw_indexed, "draw_indexed");
@@ -1431,9 +1434,10 @@ void native_gfx_install() {
     ok &= hook(0x7DF630, &r_alloc_constants, o_alloc_constants, "alloc_constants");
     ok &= hook(0x7DEC20, &r_set_vertex_buffer, o_set_vertex_buffer, "set_vertex_buffer");
     ok &= hook(0x7E0780, &r_dispatch, o_dispatch, "dispatch");
-    nd::install();
-    log("native gfx: rendering natively (every %d frame%s)%s", nr::g_every, nr::g_every == 1 ? "" : "s",
-        ok ? "" : " (some hooks failed)");
+    ok &= nd::install();
+    log("native gfx: %s (every %d frame%s)", ok ? "native device ready" : "required native device hooks failed",
+        nr::g_every, nr::g_every == 1 ? "" : "s");
+    return ok;
 }
 
 static void nr_every_world() {
