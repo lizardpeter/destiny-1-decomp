@@ -776,6 +776,7 @@ struct Renderer {
     // whose memory they write are marked stale.
     uint64_t dma_stale = 0;
     void run_copies(const std::vector<Draw*>& items) {
+        std::vector<std::pair<uint64_t, uint64_t>> ranges;
         for (Draw* d : items) {
             if (d->kind != Draw::Dma || d->caller < 0x10000 || guest_region_extent(d->caller) < d->count) continue;
             if (d->prim == 2) {
@@ -784,17 +785,43 @@ struct Renderer {
             } else if (d->index_addr >= 0x10000 && guest_region_extent(d->index_addr) >= d->count) {
                 std::memmove(reinterpret_cast<void*>(d->caller), reinterpret_cast<const void*>(d->index_addr), d->count);
             } else continue;
-            if (dynamic_copy) {
-                std::lock_guard dl(dyn_m);
-                dyn_q.push_back({d->caller, d->count});
-            }
-            const uint64_t a = d->caller, e = d->caller + d->count;
-            bool any_stale = false;
-            for (auto& [k, img] : textures)
-                if (img && !img->stale && img->overlaps_source(a, e)) img->stale = true, ++dma_stale, any_stale = true;
-            if (any_stale) ++views_gen;
+            if (!d->count) continue;
+            ranges.emplace_back(d->caller, d->caller + d->count);
             dma_texture_check(d->caller, d->count);
         }
+        if (ranges.empty()) return;
+        // Preserve actual copy order above. Only the subsequent notification
+        // ranges are merged; visit the native image table once per list.
+        std::sort(ranges.begin(), ranges.end());
+        size_t last = 0;
+        for (size_t i = 1; i < ranges.size(); ++i) {
+            if (ranges[i].first <= ranges[last].second)
+                ranges[last].second = std::max(ranges[last].second, ranges[i].second);
+            else ranges[++last] = ranges[i];
+        }
+        ranges.resize(last + 1);
+        if (dynamic_copy) {
+            std::lock_guard dl(dyn_m);
+            for (const auto& [a, e] : ranges) dyn_q.emplace_back(a, e - a);
+        }
+        auto overlaps = [&](uint64_t a, uint64_t n) {
+            if (!n) return false;
+            auto it = std::upper_bound(ranges.begin(), ranges.end(), std::make_pair(a, UINT64_MAX));
+            return (it != ranges.end() && it->first < a + n) ||
+                   (it != ranges.begin() && std::prev(it)->second > a);
+        };
+        bool changed = false;
+        for (auto& [key, img] : textures) {
+            if (!img || img->stale) continue;
+            if (overlaps(img->src_addr, img->src_size) ||
+                (img->low_loaded && overlaps(img->low_base, img->low_size)) ||
+                (img->hi_loaded && overlaps(img->hi_base, img->hi_size))) {
+                img->stale = true;
+                ++dma_stale;
+                changed = true;
+            }
+        }
+        if (changed) ++views_gen;
     }
     // D1_NG_LOG_DMA_TEX: (diagnostics) copy-queue writes into memory a texture copy was made from
     void dma_texture_check(uint64_t dst, uint64_t n) {
@@ -2016,6 +2043,7 @@ Image* Renderer::color_target(const uint32_t* c, bool bind) {
             retired.push_back(std::move(old->second));
         }
         images_by_base[base].push_back(n.get());
+        ++target_views_gen;
         (++targets_gen, ++gen_why[2]);
         targets[key] = std::move(n);
         ++st.targets;
@@ -2095,6 +2123,7 @@ Image* Renderer::depth_target(const uint32_t* d, bool bind) {
         n->base = base;
         img = n.get();
         images_by_base[base].push_back(img);
+        ++target_views_gen;
         (++targets_gen, ++gen_why[3]);
         targets[key] = std::move(n);
         ++st.targets;
@@ -4600,8 +4629,9 @@ void Renderer::pre_pass(const std::vector<Draw*>& draws) {
     static std::vector<Seen> seen(1u << 13);
     for (Draw* d : draws)
         for (int s = 0; s < 2; ++s)
-            for (int i = 0; i < 16; ++i)
-                if (const uint32_t* t = d->T(s, i)) {
+            for (uint32_t mask = d->tex_mask[s]; mask; mask &= mask - 1) {
+                    const uint32_t i = __builtin_ctz(mask);
+                    const uint32_t* t = d->tex[s][i];
                     const uint64_t k = hash_bytes(t, 32) ^ d->tex_res[s][i];
                     Seen& e = seen[k & (seen.size() - 1)];
                     if (e.key == k && e.sub == rc().submit_no) continue;
@@ -4764,15 +4794,24 @@ void Renderer::load_texture(const LoadJob& j) {
     tiling::layout(sf);
     if (guest_region_extent(ts.base) < sf.total_size) return;
     const uint64_t key = tex_key(t, j.res);
+    {
+        std::lock_guard lk(m);
+        auto it = textures.find(key);
+        if (it != textures.end() && it->second && !it->second->stale &&
+            it->second->res_val == j.res && it->second->src_addr == ts.base) { ++ld_skipped; return; }
+    }
+    // Hash only real loads or relocation candidates, never unchanged binds.
     const uint64_t content = hash_bytes(reinterpret_cast<const void*>(ts.base), sf.total_size);
     {
         std::lock_guard lk(m);
+        if (opt.res_current && opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
         auto it = textures.find(key);
         if (it != textures.end() && it->second && !it->second->stale) {
             Image* img = it->second.get();
             if (img->res_val == j.res && img->src_addr == ts.base) { ++ld_skipped; return; }
             if (img->content == content && img->src_size == sf.total_size) {
                 img->res_val = j.res, img->src_addr = ts.base;
+                ++views_gen; // invalidate cached misses and old descriptor epochs
                 ++ld_moves;
                 return;
             }
@@ -4834,8 +4873,8 @@ void Renderer::load_shader(const LoadJob& j) {
 // A command list recorded on the thread that ended it, into a submission slot of its own. The
 // renderer's lock (m) is held for everything that changes shared state - texture uploads and
 // target set-up (into the shared upload slot, submitted before any list that follows), pass
-// changes, clears, queries, readbacks - and released for runs of plain draws, which take it
-// only for cache misses. Recorded slots wait for submit_recorded, in the engine's order.
+// changes, clears, queries, readbacks, and resource-ID resolution - and released for
+// plain draw emission. Recorded slots wait for submit_recorded, in the engine's order.
 bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late) {
     static thread_local std::unique_ptr<Recorder> R_ptr;
     if (!R_ptr) R_ptr = std::make_unique<Recorder>();
