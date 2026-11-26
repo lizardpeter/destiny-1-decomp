@@ -110,7 +110,6 @@ struct DevState {
 
 std::mutex g_m;
 std::unordered_map<uint64_t, DevState*> g_devs;
-int g_every = 1;            // execute every Nth frame
 int g_dump_every = 0;       // write every Nth executed frame (0: none)
 uint64_t g_executed_frames = 0;
 bool g_frame_executed = false;
@@ -791,7 +790,6 @@ void write_token(uint64_t cb, uint64_t id) {
 }
 void record(List* l) {
     if (!ng::list_recording() || l->items.empty()) return;
-    if (gpu_flip_count() % uint64_t(nr::g_every) != 0) return;
     // A list containing CPU-visible resource writes must be executed in actual
     // submission order. Recording those writes at list close can reorder them
     // across other lists and duplicate them at submit.
@@ -1048,11 +1046,6 @@ void free_list(List* l) {
     delete l;
 }
 
-void answer_zpass(uint64_t dest, bool end) {
-    if (guest_region_extent(dest) < 0x80) return;
-    auto* q = reinterpret_cast<uint64_t*>(dest);
-    for (int db = 0; db < 8; ++db) q[db * 2 + (end ? 1 : 0)] = (end ? 1000ull : 0ull) | (1ull << 63);
-}
 
 bool install() {
     resev::install();
@@ -1380,7 +1373,8 @@ bool native_gfx_install() {
     }
     nr::g_base = rt().modules[0].base;
     nr::build_vsharp = reinterpret_cast<nr::BuildVsharpFn>(nr::g_base + 0xF7CF90);
-    if (const char* v = getenv("D1_NG_EVERY")) nr::g_every = std::max(1, std::atoi(v));
+    if (getenv("D1_NG_EVERY") || getenv("D1_NG_EVERY_WORLD"))
+        log("native gfx: legacy frame-skipping controls removed; all frames use the native device");
     if (const char* v = getenv("D1_NG_DUMP_EVERY")) nr::g_dump_every = std::max(0, std::atoi(v));
     ng::Options opt;
     opt.frames_dir = getenv("D1_NG_FRAMES");
@@ -1435,26 +1429,8 @@ bool native_gfx_install() {
     ok &= hook(0x7DEC20, &r_set_vertex_buffer, o_set_vertex_buffer, "set_vertex_buffer");
     ok &= hook(0x7E0780, &r_dispatch, o_dispatch, "dispatch");
     ok &= nd::install();
-    log("native gfx: %s (every %d frame%s)", ok ? "native device ready" : "required native device hooks failed",
-        nr::g_every, nr::g_every == 1 ? "" : "s");
+    log("native gfx: %s", ok ? "native device ready" : "required native device hooks failed");
     return ok;
-}
-
-static void nr_every_world() {
-    static const double every_world = getenv("D1_NG_EVERY_WORLD") ? std::atof(getenv("D1_NG_EVERY_WORLD")) : -1;
-    static const char* every_state = getenv("D1_NG_EVERY_STATE") ? getenv("D1_NG_EVERY_STATE") : "activity:in_world";
-    if (every_world >= 0 && nr::g_every > 1) {
-        static std::chrono::steady_clock::time_point t_world{};
-        const char* gs = game_state();
-        if (gs && std::strncmp(gs, every_state, std::strlen(every_state)) == 0) {
-            if (t_world == std::chrono::steady_clock::time_point{}) t_world = std::chrono::steady_clock::now();
-            else if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t_world).count() > every_world) {
-                nr::g_every = 1;
-                log("native gfx: now drawing every frame (D1_NG_EVERY_WORLD)");
-                if (getenv("D1_NG_PASSLOG_N")) ng::request_passlog(uint32_t(std::atoi(getenv("D1_NG_PASSLOG_N"))));
-            }
-        }
-    }
 }
 
 bool native_device_active() { return nd::g_on; }
@@ -1518,43 +1494,18 @@ void native_device_execute_submit(NativeSubmission* batch) {
     std::vector<uint32_t> recorded;
     struct PendingLabel { uint64_t addr, mapping; bool timestamp; std::vector<uint8_t> bytes; };
     std::vector<PendingLabel> labels;
-    nr_every_world();
-    const bool run = (gpu_flip_count() % uint64_t(nr::g_every)) == 0 && ng::active();
+    if (!ng::active()) {
+        log("native GPU: submission lost its native Vulkan device");
+        std::abort();
+    }
 
     auto flush_draws = [&] {
         if (draws.empty()) return;
-        if (run) {
-            const auto t0 = std::chrono::steady_clock::now();
-            ng::execute(draws);
-            nr::g_exec_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t0).count());
-            nr::g_frame_executed = true;
-        } else {
-            for (ng::Draw* d : draws) {
-                switch (d->kind) {
-                case ng::Draw::Dma:
-                    if (d->caller < 0x10000 || guest_region_extent(d->caller) < d->count) break;
-                    if (d->prim == 2) {
-                        auto* w = reinterpret_cast<uint32_t*>(d->caller);
-                        for (uint32_t k = 0; k < d->count / 4; ++k) w[k] = d->instances;
-                    } else if (d->index_addr >= 0x10000 && guest_region_extent(d->index_addr) >= d->count) {
-                        std::memmove(reinterpret_cast<void*>(d->caller), reinterpret_cast<const void*>(d->index_addr), d->count);
-                    } else break;
-                    ng::cpu_wrote(d->caller, d->count);
-                    break;
-                case ng::Draw::WriteData:
-                    if (d->caller >= 0x10000 && guest_region_extent(d->caller) >= d->inline_vertices.size()) {
-                        std::memcpy(reinterpret_cast<void*>(d->caller), d->inline_vertices.data(), d->inline_vertices.size());
-                        ng::cpu_wrote(d->caller, d->inline_vertices.size());
-                    }
-                    break;
-                case ng::Draw::ZPass:
-                    nd::answer_zpass(d->index_addr & ~0xFull, (d->index_addr & 0xF) != 0);
-                    break;
-                default: break;
-                }
-            }
-        }
+        const auto t0 = std::chrono::steady_clock::now();
+        ng::execute(draws);
+        nr::g_exec_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+        nr::g_frame_executed = true;
         draws.clear();
     };
     auto flush_recorded = [&] {
@@ -1596,7 +1547,7 @@ void native_device_execute_submit(NativeSubmission* batch) {
     };
 
     for (nd::List* l : lists) {
-        if (l->recorded && run) {
+        if (l->recorded) {
             flush_draws();
             for (const ng::LateCb& lc : l->late) {
                 const ng::Draw::Cb& c = nr::g_ce_known[lc.stage][lc.slot] ?
@@ -1611,7 +1562,6 @@ void native_device_execute_submit(NativeSubmission* batch) {
                 }
         } else {
             flush_recorded();
-            if (l->recorded) ng::discard_recorded(l->handle);
             for (nd::Item& it : l->items) {
                 if (!it.d) {
                     nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
@@ -1666,7 +1616,6 @@ void native_gfx_flip(void* addr, uint32_t width, uint32_t height) {
             } else if (gs && std::strncmp(gs, snap, n) == 0) {
                 if (t_in == std::chrono::steady_clock::time_point{}) t_in = std::chrono::steady_clock::now();
                 else if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t_in).count() > (colon ? std::atof(colon + 1) : 0)) {
-                    nr::g_every = 1;
                     ng::request_passlog(getenv("D1_NG_PASSLOG_N") ? uint32_t(std::max(1, std::atoi(getenv("D1_NG_PASSLOG_N")))) : 1u);
                     snap_phase = 1;
                 }
