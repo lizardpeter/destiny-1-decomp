@@ -25,6 +25,7 @@
 
 #include "formats.h"
 #include "nrender.h"
+#include "native_list_tokens.h"
 #include "settings.h"
 #ifdef D1_FRONTEND_SDL
 #include "frontend.h"
@@ -704,7 +705,7 @@ void install() {
 // ---------------------------------------------------------------------------- native device layer
 namespace nd {
 bool g_on = false;
-constexpr uint32_t kMagic = 0x4E44544Bu;  // token: NOP {magic, id lo, id hi}
+constexpr uint32_t kMagic = kNativeListMagic;  // token: NOP {magic, id lo, id hi}
 struct Item {
     ng::Draw* d = nullptr;  // null: a constant buffer binding
     nr::CbEvent cb{};
@@ -1470,18 +1471,15 @@ NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* 
     for (uint32_t k = 0; k < count; ++k) {
         const uint32_t* p = dcbs[k];
         const uint32_t n = p ? sizes[k] / 4 : 0;
-        for (uint32_t i = 0; i < n;) {
-            const uint32_t h = p[i], type = h >> 30;
-            const uint32_t words = type == 2 ? 1 : ((h >> 16) & 0x3FFF) + 2;
-            if (words > n - i) break;
-            if (type == 3 && words == 4 && ((h >> 8) & 0xFF) == 0x10 && p[i + 1] == nd::kMagic) {
-                const uint64_t id = p[i + 2] | uint64_t(p[i + 3]) << 32;
-                if (auto it = nd::g_lists.find(id); it != nd::g_lists.end()) {
-                    batch->lists.push_back(it->second);
-                    nd::g_lists.erase(it);
-                }
+        const bool complete = visit_native_list_tokens(p, n, [&](uint64_t id) {
+            if (auto it = nd::g_lists.find(id); it != nd::g_lists.end()) {
+                batch->lists.push_back(it->second);
+                nd::g_lists.erase(it);
             }
-            i += words;
+        });
+        if (!complete) {
+            static unsigned bad = 0;
+            if (bad++ < 16) log("nd: truncated retail list token stream at native submission boundary");
         }
     }
     return batch.release();
