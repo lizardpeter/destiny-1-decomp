@@ -233,3 +233,7 @@ set_tests_properties(native-resource-identity PROPERTIES TIMEOUT 60)
 add_executable(native-close-contract-test tests/native_close_contract_test.cpp)
 target_include_directories(native-close-contract-test PRIVATE gfx)
 add_test(NAME native-close-contract COMMAND native-close-contract-test)
+
+add_executable(native-staging-pages-test tests/native_staging_pages_test.cpp)
+target_include_directories(native-staging-pages-test PRIVATE gfx)
+add_test(NAME native-staging-pages COMMAND native-staging-pages-test)

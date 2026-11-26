@@ -12,6 +12,7 @@
 // blocks. Flips blit the video-out target into the window's swapchain.
 #include "nrender.h"
 #include "native_memory_policy.h"
+#include "native_staging_pages.h"
 #include "native_resource_identity.h"
 #include "../src/native_ranges.h"
 #include "../src/host_memory.h"
@@ -434,6 +435,8 @@ struct Sub {
     uint64_t submit_no = 0;   // the first recording that used it (what it may reference)
     uint64_t ring_begin = 0;  // ring position (absolute) when recording started
     std::vector<Buffer> staging;
+    std::vector<Buffer> geo_staging;
+    uint64_t geo_staging_used = 0, geo_staging_committed = 0;
     std::vector<VkDescriptorPool> pools;            // descriptor sets of this submission's draws
     size_t pool = 0;                                // the pool being allocated from
     // small render targets the CPU reads: copied to the ring, written to guest memory when done
@@ -533,6 +536,7 @@ struct Renderer {
     };
     bool geo_alloc(uint64_t size, int& block, uint64_t& off, bool device_local = false);
     bool prepare_local_geometry(const Draw::Res& res);
+    Buffer* geometry_staging(uint64_t bytes, StagingSpan& span);
     void geo_free_now(int block, uint64_t off, uint64_t size);
     void geo_free_later(int block, uint64_t off, uint64_t size);
     // res / rbase: an engine resource (id << 32 | epoch) and its memory's start: kept by
@@ -1630,6 +1634,9 @@ void Renderer::retire_one() {
     sb.rb_used = 0;
     for (auto& b : sb.staging) free_buffer(b);
     sb.staging.clear();
+    for (auto& b : sb.geo_staging) free_buffer(b);
+    sb.geo_staging.clear();
+    sb.geo_staging_used = sb.geo_staging_committed = 0;
     serial_done = std::max(serial_done, sb.serial);
     if (serial_done > serial_done_seen.load()) serial_done_seen.store(serial_done);
     sb.state = Sub::Idle;
@@ -2813,10 +2820,31 @@ void Renderer::geo_free_later(int block, uint64_t off, uint64_t size) {
 // Only the ordered primary pre-pass can publish device-local buffers. Recording workers
 // bind those buffers but never emit transfer commands, and the speculative loader cannot
 // publish a device-local buffer before its transfer is recorded.
+Buffer* Renderer::geometry_staging(uint64_t bytes, StagingSpan& span) {
+    auto& sb = subs[rc().cur];
+    if (!sb.geo_staging.empty()) {
+        span = staging_span(sb.geo_staging.back().size, sb.geo_staging_used, bytes);
+        if (span.valid) {
+            sb.geo_staging_used = span.offset + span.size;
+            return &sb.geo_staging.back();
+        }
+    }
+    const uint64_t capacity = staging_page_size(bytes, sb.geo_staging_committed);
+    if (!capacity) return nullptr;
+    Buffer page = make_native_buffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, true);
+    if (!page.map) return nullptr;
+    sb.geo_staging.push_back(page);
+    sb.geo_staging_committed += capacity;
+    span = staging_span(capacity, 0, bytes);
+    sb.geo_staging_used = span.offset + span.size;
+    return &sb.geo_staging.back();
+}
+
 bool Renderer::prepare_local_geometry(const Draw::Res& res) {
     if (!res.id || res.base < 0x10000 || !res.size || res.size >= (64ull << 20) ||
         guest_region_extent(res.base) < res.size || rc().cur == UINT32_MAX || rc().lr) return false;
-    const GeometryKey key{res.id >> 32, 0, res.size, 0, 0};
+    const GeometryKey key{res.id, 0, res.size, 0, 0};
     GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
     std::unique_lock lk(sh.m);
     GeoEntry& e = sh.map[key];
@@ -2824,34 +2852,28 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res) {
     if (e.valid && e.res == res.id) return false; // already resident (including mapped fallback)
     const auto* src = reinterpret_cast<const void*>(res.base);
     const uint64_t content = hash_bytes(src, res.size);
-    if (e.valid && e.hash == content) {
-        e.res = res.id; // a relocation without a data change
-        return false;
-    }
     int block = -1;
     uint64_t off = 0;
     if (!geo_alloc(res.size, block, off, true)) return false;
-    const uint64_t padded = (res.size + 3) & ~3ull;
-    // Use an independent staging allocation so static mesh uploads cannot exhaust
-    // the circular ring reserved for draw-time constants and dynamic geometry.
-    Buffer staging = make_native_buffer(padded, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, true);
-    if (!staging.map) {
+    StagingSpan span;
+    Buffer* staging = geometry_staging(res.size, span);
+    if (!staging) {
         geo_free_now(block, off, res.size);
         return false;
     }
-    std::memcpy(staging.map, src, res.size);
-    std::memset(staging.map + res.size, 0, padded - res.size);
-    if (hash_bytes(staging.map, res.size) != content ||
+    auto* dst = staging->map + span.offset;
+    std::memcpy(dst, src, res.size);
+    std::memset(dst + res.size, 0, span.size - res.size);
+    if (hash_bytes(dst, res.size) != content ||
         guest_region_extent(res.base) < res.size || hash_bytes(src, res.size) != content) {
-        free_buffer(staging);
+        // No GPU command references this span yet; return it to the page.
+        subs[rc().cur].geo_staging_used = span.offset;
         geo_free_now(block, off, res.size);
-        return false; // resource changed during snapshot; ordinary path will retry
+        return false;
     }
     end_pass();
-    VkBufferCopy copy{0, off, padded};
-    vkCmdCopyBuffer(rc().cmd, staging.buf, geo_blocks[size_t(block)].buf.buf, 1, &copy);
-    subs[rc().cur].staging.push_back(staging); // owned until completion fence
+    VkBufferCopy copy{span.offset, off, span.size};
+    vkCmdCopyBuffer(rc().cmd, staging->buf, geo_blocks[size_t(block)].buf.buf, 1, &copy);
     if (e.valid) {
         geo_evict_gen.fetch_add(1, std::memory_order_release);
         geo_free_later(e.block, e.off, e.size);
@@ -2875,7 +2897,7 @@ bool Renderer::geo_get(uint64_t addr, uint64_t size, int index_size, uint32_t in
 // event (a move keeps the contents), never write-tracked. Keyed by the resource and the offset
 // in it, so a move does not make a new entry.
 GeoEntry* Renderer::geo_lookup_res(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase) {
-    const GeometryKey key{res >> 32, addr-rbase, size, uint32_t(index_size), index_count};
+    const GeometryKey key{local_geometry_enabled() ? res : res >> 32, addr-rbase, size, uint32_t(index_size), index_count};
     GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
     std::unique_lock shard_lock(sh.m);
     GeoEntry& e = sh.map[key];
@@ -5365,6 +5387,9 @@ void Renderer::discard_recorded(uint32_t h) {
     sb.readbacks.clear(), sb.rb_used = 0, sb.zrecs.clear(), sb.q_used = 0;
     for (auto& b : sb.staging) free_buffer(b);
     sb.staging.clear();
+    for (auto& b : sb.geo_staging) free_buffer(b);
+    sb.geo_staging.clear();
+    sb.geo_staging_used = sb.geo_staging_committed = 0;
     sb.state = Sub::Idle;
     idle_subs.push_back(h);
     reap();
