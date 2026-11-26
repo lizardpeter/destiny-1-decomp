@@ -36,6 +36,7 @@
 #include "native_asset_region.h"
 #include "native_asset_suballocation.h"
 #include "../gfx/native_resource_move.h"
+#include "../gfx/native_buffer_binding.h"
 #include "../gfx/native_pool_contract.h"
 #include "../gfx/native_texture_constructor.h"
 #include "../gfx/native_small_surface_layout.h"
@@ -86,11 +87,10 @@ uint64_t mix(uint64_t h, uint64_t v) {
 }
 
 // ---- hooked device API (System V signatures as decompiled)
-using SetVertexBufferFn = D1_SYSV void (*)(uint64_t, uint32_t, uint32_t, uint32_t, int32_t);
-using AllocConstantsFn = D1_SYSV uint64_t (*)(uint64_t, uint32_t, uint32_t, uint32_t);
-
-SetVertexBufferFn o_set_vertex_buffer;
-AllocConstantsFn o_alloc_constants;
+namespace nd {
+D1_SYSV void* s_alloc(uint64_t cb,uint32_t bytes,uint32_t align_log2);
+D1_SYSV void s_set_cbs(uint64_t cue,uint32_t stage,uint32_t first,uint32_t count,const uint32_t* vs);
+}
 
 bool nd_push(uint64_t dev, ng::Draw* d);
 ng::TextureLeaseSet* nd_texture_leases(uint64_t dev);
@@ -105,8 +105,15 @@ T eb(uint64_t off) {
     return v;
 }
 
-using BuildVsharpFn = D1_SYSV void (*)(void*, uint64_t, uint32_t, uint32_t, uint32_t);
-BuildVsharpFn build_vsharp;
+D1_SYSV void build_vsharp(uint32_t* out,uint64_t address,uint32_t format,uint32_t stride,uint32_t count){
+    ng::vertex_words(out,address,format,stride,count);
+}
+D1_SYSV void build_csharp(uint32_t* out,uint64_t address,uint32_t bytes){
+    ng::constant_words(out,address,bytes);
+}
+D1_SYSV void set_buffer_memory_type(uint32_t* out,uint32_t type){
+    ng::buffer_memory_type(out,type);
+}
 
 struct DevState {
     ng::Draw::Cb cb[ng::kStages][16] = {};
@@ -306,7 +313,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
         for (uint32_t i = 0; i < n; ++i) {
             const uint32_t fmt = field<uint32_t>(decl, 0x14 + 8 * i);
             const uint32_t off = field<uint8_t>(decl, 0x18 + 8 * i), stream = field<uint8_t>(decl, 0x19 + 8 * i) & 31;
-            const uint32_t stride = field<uint32_t>(decl, 4 + 4 * (stream & 3));
+            const uint32_t stride = field<uint32_t>(decl, 4 + 4 * stream);
             if (!stride) continue;
             auto& binding=streams[stream];
             const uint32_t bit=1u<<stream;
@@ -325,8 +332,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
                     obj=resolve_handle_safe(h);
                     if(obj>=0x10000){
                         uint32_t tot=field<uint32_t>(obj,0x30);
-                        if(stream_off)tot=ds->vb_raw_count[stream]?uint32_t(ds->vb_raw_count[stream]):tot-stream_off/stride;
-                        vcnt=tot;
+                        vcnt=ng::vertex_records(tot,stream_off,stride,ds->vb_raw_count[stream]);
                     }
                 }else if(h!=0xFFFFFFFFu) obj=resolve_handle_safe(h);
                 if(obj>=0x10000){
@@ -512,7 +518,10 @@ D1_SYSV void r_draw_inline(uint64_t dev, uint32_t prim, int32_t prims, const voi
         d->count = nr::vertex_count(prim, uint32_t(prims));
         d->inline_vertices.assign(static_cast<const uint8_t*>(data),
                                   static_cast<const uint8_t*>(data) + size_t(d->count) * uint32_t(stride));
-        std::memset(d->vb, 0, sizeof d->vb);
+        std::memset(d->vb,0,sizeof d->vb);
+        // Inline offsets refer to the draw-owned vector, not the static
+        // resource captured from the previous declaration.
+        for(auto& resource:d->vres)resource={};
         const uint32_t n = std::min(field<uint32_t>(decl, 0), 16u);
         d->num_vb = n;
         uint64_t vbsig = 0;
@@ -540,27 +549,46 @@ D1_SYSV void r_clear(uint64_t dev, uint32_t flags) {
     o_clear(dev, flags);
 }
 D1_SYSV uint64_t r_alloc_constants(uint64_t dev, uint32_t stage, uint32_t slot, uint32_t bytes) {
-    const uint64_t p = o_alloc_constants(dev, stage, slot, bytes);
+    // The original body only allocates aligned storage, constructs a
+    // constant descriptor and calls the already-native binding entry.
+    const uint64_t ctx=field<uint64_t>(dev,0x50);
+    const uint64_t p=uint64_t(nd::s_alloc(ctx,bytes,4));
+    if(!p){log("nd: native constant allocation failed (%u bytes)",bytes);std::abort();}
+    uint32_t words[4];
+    ng::constant_words(words,p,bytes);
+    ng::buffer_memory_type(words,0x10);
+    nd::s_set_cbs(ctx+0xc0,stage,slot,1,words);
     const int s = nr::gnm_stage_index(stage);
     if (s >= 0 && slot < 16) nr::dev_state(dev)->cb[s][slot] = {p, bytes};
     return p;
 }
-D1_SYSV void r_set_vertex_buffer(uint64_t dev, uint32_t handle, uint32_t stream, uint32_t offset, int32_t count) {
-    const uint64_t decl = field<uint64_t>(dev, kVertexDecl);
-    const uint32_t s = stream & 0xFFFF;
-    if (handle != 0xFFFFFFFFu && s < 32) {
-        nr::DevState* ds = nr::dev_state(dev);
-        ds->vb_handle[s] = handle;
-        ds->vb_offset[s] = offset;
-        ds->vb_raw_count[s] = count;
-        const uint32_t stride = decl ? field<uint32_t>(decl, 4 + 4 * (s & 3)) : 0;
-        if (stride) {
-            uint32_t n = field<uint32_t>(nr::resolve_handle(handle), 0x30);
-            if (offset != 0) n = count ? uint32_t(count) : n - (stride ? offset / stride : 0);
-            ds->vb_count[s] = n;
-        }
-    }
-    o_set_vertex_buffer(dev, handle, stream, offset, count);
+// 0x7DEC20: Gnm V# writes were already no-ops. Publish the actual
+// native stream state and mirror only the engine's binding cache fields.
+D1_SYSV void r_set_vertex_buffer(uint64_t dev,uint32_t handle,uint32_t stream,uint32_t offset,int32_t count){
+    const uint32_t s=uint16_t(stream);
+    if(handle==UINT32_MAX||s>=32)return;
+    auto* ds=nr::dev_state(dev);
+    ds->vb_handle[s]=handle;
+    ds->vb_offset[s]=offset;
+    ds->vb_raw_count[s]=count;
+    const auto decl=field<uint64_t>(dev,kVertexDecl);
+    if(!decl)return;
+    const auto stride=field<uint32_t>(decl,4+4*s);
+    if(!stride)return;
+    const auto obj=nr::resolve_handle_safe(handle);
+    if(obj<0x10000)return;
+    ds->vb_count[s]=ng::vertex_records(field<uint32_t>(obj,0x30),offset,stride,count);
+    if(!ng::vertex_bind_changed(field<uint32_t>(dev,0x1d78+4*s),field<uint32_t>(dev,0x1df8+4*s),handle,offset))return;
+    std::memcpy(reinterpret_cast<void*>(dev+0x1d78+4*s),&handle,4);
+    std::memcpy(reinterpret_cast<void*>(dev+0x1df8+4*s),&offset,4);
+}
+// 0x7DEE30: the original packet setters are all replaced. Preserve
+// the handle and resolved index object used by direct native draws.
+D1_SYSV void r_set_index_buffer(uint64_t dev,uint32_t handle){
+    if(field<uint32_t>(dev,0x1d68)==handle)return;
+    const auto object=handle==UINT32_MAX?uint64_t(0):nr::resolve_handle_safe(handle);
+    std::memcpy(reinterpret_cast<void*>(dev+0x1d68),&handle,4);
+    std::memcpy(reinterpret_cast<void*>(dev+0x1d70),&object,8);
 }
 D1_SYSV void r_dispatch(uint64_t dev, uint64_t cs, uint32_t x, uint32_t y, uint32_t z, int32_t flag) {
     o_dispatch(dev, cs, x, y, z, flag);
@@ -2471,7 +2499,6 @@ bool native_gfx_install() {
         return false;
     }
     nr::g_base = rt().modules[0].base;
-    nr::build_vsharp = reinterpret_cast<nr::BuildVsharpFn>(nr::g_base + 0xF7CF90);
     if (getenv("D1_NG_EVERY") || getenv("D1_NG_EVERY_WORLD"))
         log("native gfx: legacy frame-skipping controls removed; all frames use the native device");
     if (const char* v = getenv("D1_NG_DUMP_EVERY")) nr::g_dump_every = std::max(0, std::atoi(v));
@@ -2490,12 +2517,10 @@ bool native_gfx_install() {
     }
     cache_file += "/native_pipelines.bin";
     opt.pipeline_cache = cache_file.c_str();
-    if (!getenv("D1_NG_NOCACHE")) {
-        opt.watch = [](uint64_t a, uint64_t n) { return wt::watch(a, n); };
-        opt.version = [](uint64_t a, uint64_t n) { return wt::version(a, n); };
-        opt.res_current = [](uint64_t obj) { return nr::resreg::get(obj); };
-        opt.describe = [](uint64_t a, char* out, size_t n) { wt::describe(a, out, n); };
-    }
+    opt.watch = [](uint64_t a, uint64_t n) { return wt::watch(a, n); };
+    opt.version = [](uint64_t a, uint64_t n) { return wt::version(a, n); };
+    opt.res_current = [](uint64_t obj) { return nr::resreg::get(obj); };
+    opt.describe = [](uint64_t a, char* out, size_t n) { wt::describe(a, out, n); };
     if (const char* v = getenv("D1_NG_FRAMES_IN_FLIGHT")) opt.frames_in_flight = uint32_t(std::max(1, std::atoi(v)));
 #ifdef D1_FRONTEND_SDL
     if (frontend::open(st.window_width, st.window_height, st.fullscreen)) {
@@ -2525,8 +2550,12 @@ bool native_gfx_install() {
     ok &= replace_eboot_function(0x7E1840,reinterpret_cast<const void*>(&r_draw_quads));
     ok &= replace_eboot_function(0x7E1960,reinterpret_cast<const void*>(&r_draw_inline));
     ok &= hook(0x7E2A00, &r_clear, o_clear, "clear");
-    ok &= hook(0x7DF630, &r_alloc_constants, o_alloc_constants, "alloc_constants");
-    ok &= hook(0x7DEC20, &r_set_vertex_buffer, o_set_vertex_buffer, "set_vertex_buffer");
+    ok &= replace_eboot_function(0xF7CF90,reinterpret_cast<const void*>(&nr::build_vsharp));
+    ok &= replace_eboot_function(0xF7D180,reinterpret_cast<const void*>(&nr::build_csharp));
+    ok &= replace_eboot_function(0xF7D010,reinterpret_cast<const void*>(&nr::set_buffer_memory_type));
+    ok &= replace_eboot_function(0x7DF630,reinterpret_cast<const void*>(&r_alloc_constants));
+    ok &= replace_eboot_function(0x7DEC20,reinterpret_cast<const void*>(&r_set_vertex_buffer));
+    ok &= replace_eboot_function(0x7DEE30,reinterpret_cast<const void*>(&r_set_index_buffer));
     ok &= hook(0x7E0780, &r_dispatch, o_dispatch, "dispatch");
     ok &= asset_backing::install();
     ok &= nd::install();
