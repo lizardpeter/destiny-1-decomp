@@ -37,6 +37,7 @@
 #include "native_asset_suballocation.h"
 #include "../gfx/native_resource_move.h"
 #include "../gfx/native_texture_constructor.h"
+#include "../gfx/native_surface_layout.h"
 #include "native_record_registry.h"
 #include "../gfx/native_record_fifo.h"
 #include "../gfx/native_cbm_contract.h"
@@ -1099,7 +1100,31 @@ using LayoutFn=D1_SYSV uint32_t(*)(LayoutOutput*,const LayoutInput*);
 using FootprintFn=D1_SYSV uint32_t(*)(uint64_t*,uint32_t*,void*);
 FootprintFn original_footprint;
 uint32_t calculate_layout(LayoutOutput& out,const LayoutInput& in){
-    return reinterpret_cast<LayoutFn>(nr::g_base+0xF85CB0)(&out,&in);
+    const uint32_t status=reinterpret_cast<LayoutFn>(nr::g_base+0xF85CB0)(&out,&in);
+    // Keep original output authoritative while the candidate is checked
+    // against actual original-machine-code results. No replacement yet.
+    static const bool compare=[]{
+        const char* v=std::getenv("D1_PC_COMPARE_SURFACE_LAYOUT");
+        return v&&std::atoi(v)!=0;
+    }();
+    if(compare&&in.tile<32&&uint8_t(in.format)<0x3b){
+        const uint32_t bits=nr::eb<uint32_t>(0x1609CE0+uint64_t(uint8_t(in.format))*4);
+        const uint32_t table=nr::eb<uint32_t>(0x16C7880+uint64_t(in.tile)*4);
+        LayoutOutput candidate{};
+        if(ng::surface_layout::linear(candidate,in,bits,array_mode(table))){
+            static std::atomic<uint64_t> compared{0},mismatches{0};
+            const auto n=++compared;
+            const bool match=!status&&ng::surface_layout::equivalent(candidate,out);
+            if(!match){
+                const auto m=++mismatches;
+                if(m<=16)log("nd: surface layout mismatch tile=%u format=%#x mip=%u %ux%u pitch=%u/%u status=%#x",
+                    in.tile,in.format,in.mip,in.width,in.height,candidate.words[0],out.words[0],status);
+            }
+            if((n&(n-1))==0)log("nd: surface layout comparisons=%llu mismatches=%llu",
+                (unsigned long long)n,(unsigned long long)mismatches.load());
+        }
+    }
+    return status;
 }
 D1_SYSV uint32_t calculate_footprint(uint64_t* bytes,uint32_t* alignment,void* descriptor){
     if(!bytes||!alignment||!descriptor)return invalid;
