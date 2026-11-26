@@ -33,7 +33,8 @@ class ResourceRegistry {
         return handle==UINT32_MAX?0:pools_[handle_pool(handle)].load();
     }
     bool stale(const Slot& s) const {
-        const auto h=s.handle.load(), e=epoch(h);
+        const auto h=s.handle.load();
+        const auto e=epoch(h);
         return (e&1)||s.pool_epoch.load()!=e;
     }
 public:
