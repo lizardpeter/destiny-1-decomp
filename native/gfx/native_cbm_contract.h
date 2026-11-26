@@ -5,8 +5,8 @@ constexpr uint64_t chunk_bytes=0x80000,slot_count=512,slot_bytes=8;
 constexpr uint32_t invalid_chain=0xcdcdcdcd,open_bias=0x80000;
 struct Layout {uint64_t data=0,label=0,bytes=0;};
 constexpr Layout layout(uint64_t data,uint64_t gran){
-    if(!data||data%chunk_bytes||!gran||(gran&(gran-1)))return {};
-    if(data>UINT64_MAX-gran||data+gran>UINT64_MAX-gran)return {};
+    if(!data||data%chunk_bytes||gran<sizeof(uint32_t)||(gran&(gran-1)))return {};
+    if(data>UINT64_MAX-(sizeof(uint32_t)+gran-1))return {};
     return {data,data,(data+sizeof(uint32_t)+gran-1)&~(gran-1)};
 }
 constexpr uint32_t next(uint32_t i){return (i+1)&(slot_count-1);}

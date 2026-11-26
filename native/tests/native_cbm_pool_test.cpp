@@ -26,9 +26,11 @@ int main(){
         for(unsigned i=1;i<rec.size();++i)check(pool.close(rec[i].slot,closed));
         check(!pool.retire(rec.back().seq,retired));
         check(pool.close(rec[0].slot,closed)&&!pool.close(rec[0].slot,closed));
+        check(pool.allocate(rec[0].slot,allocated)==Pool::invalid_slot);
         check(!pool.retire(rec[0].seq-1,retired));
         for(auto r:rec)check(pool.retire(r.seq,retired));
         check(pool.empty()&&pool.available()==198);
+        check(pool.allocate(rec[0].slot,allocated)==Pool::invalid_slot);
     }
     Pool labels(1);
     std::array<Pool::Reservation,511> slots;

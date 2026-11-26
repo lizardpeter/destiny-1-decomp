@@ -1257,8 +1257,9 @@ D1_SYSV uint64_t h_cbm_chunk(uint64_t cbm,uint32_t bytes,uint32_t alignment,uint
             if(count==1)put_field(rec,12,id);
             put_field(rec,16,uint32_t(count*ng::cbm::chunk_bytes));
         });
-        if(id!=UINT32_MAX)return g_cbm_base+uint64_t(id)*ng::cbm::chunk_bytes;
-        if(retry==1500000){log("nd: native CBM exhausted or invalid slot");std::abort();}
+        if(id==ng::cbm::Pool::invalid_slot){log("nd: native CBM allocation on a non-open slot");std::abort();}
+        if(id!=ng::cbm::Pool::exhausted)return g_cbm_base+uint64_t(id)*ng::cbm::chunk_bytes;
+        if(retry==1500000){log("nd: native CBM exhausted");std::abort();}
         if(!h_cbm_retire(cbm))os::sleep_us(10);
     }
 }
@@ -1268,7 +1269,7 @@ D1_SYSV void h_cbm_close(uint64_t cbm,uint32_t emit,uint32_t index,uint64_t rec,
     if(!g_cbm_pool->close(index,[&](uint32_t seq,uint32_t last){
         sequence=seq;g_cbm_table[index*2+1]=last;g_cbm_table[index*2]=seq;
     })){log("nd: native CBM close without reservation");std::abort();}
-    (void)rec;
+    if(!rec||field<uint32_t>(rec,0x1c)!=index){log("nd: native CBM record/slot mismatch");std::abort();}
     if(emit==1){
         using LabelFn=D1_SYSV void(*)(uint64_t,uint32_t,uint32_t,uint64_t,uint32_t,uint64_t,uint32_t,uint32_t);
         reinterpret_cast<LabelFn>(nr::g_base+0xF80C90)(gfx,4,0,field<uint64_t>(cbm,0x20),1,sequence,0,0);
