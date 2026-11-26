@@ -1000,6 +1000,7 @@ struct Renderer {
     std::unordered_map<uint64_t, uint64_t> obj_code_hash;      // (uint64_t(obj) << 1 | vs) -> bytecode hash
     std::unordered_map<uint64_t, const uint8_t*> hash_to_obj;  // (code_hash << 1 | vs) -> guest obj
     mutable std::shared_mutex shader_mask_m;
+    std::atomic<uint64_t> shader_mask_epoch{1};
     std::unordered_map<uint64_t, uint64_t> obj_tex_mask64;     // (uint64_t(obj) << 1 | vs) -> 4-bit-per-slot active mask
     uint64_t shader_code_hash(const uint8_t* obj, bool vs);
     uint64_t shader_tex_mask64(const uint8_t* obj, bool vs) const;
@@ -3017,9 +3018,18 @@ uint64_t Renderer::shader_code_hash(const uint8_t* obj, bool vs) {
 uint64_t Renderer::shader_tex_mask64(const uint8_t* obj, bool vs) const {
     if (!obj) return 0;
     const uint64_t ok = (uint64_t(obj) << 1) | (vs ? 1ull : 0ull);
+    // Avoid contending on a shared mutex twice per draw. Only cache published
+    // masks; a missing entry may become known during shader translation.
+    struct Entry { const Renderer* owner = nullptr; uint64_t key = 0, epoch = 0, mask = 0; };
+    static thread_local std::array<Entry, 256> local{};
+    Entry& e = local[(ok ^ (ok >> 8) ^ (ok >> 16)) & (local.size() - 1)];
+    const uint64_t epoch = shader_mask_epoch.load(std::memory_order_acquire);
+    if (e.owner == this && e.key == ok && e.epoch == epoch) return e.mask;
     std::shared_lock lk(shader_mask_m);
     auto it = obj_tex_mask64.find(ok);
-    return it != obj_tex_mask64.end() ? it->second : ~0ull;
+    if (it == obj_tex_mask64.end()) return ~0ull;
+    e = {this, ok, shader_mask_epoch.load(std::memory_order_relaxed), it->second};
+    return e.mask;
 }
 
 void Renderer::warm_shader_specs(const uint8_t* obj, bool vs) {
@@ -3202,7 +3212,12 @@ Shader* Renderer::shader(const Draw& dr, bool vs, const gcn::TexDim* dims, const
     }
     {
         std::unique_lock lk(shader_mask_m);
-        obj_tex_mask64[(uint64_t(obj) << 1) | (vs ? 1ull : 0ull)] = m4;
+        const uint64_t mask_key = (uint64_t(obj) << 1) | (vs ? 1ull : 0ull);
+        auto [it, inserted] = obj_tex_mask64.try_emplace(mask_key, m4);
+        if (inserted || it->second != m4) {
+            it->second = m4;
+            shader_mask_epoch.fetch_add(1, std::memory_order_release);
+        }
     }
     shader_code_hash(obj, vs);
     uint64_t canon_key = mix(mix(uint64_t(obj), vs), hash_bytes(masked_dims, 16 * sizeof(gcn::TexDim)));
