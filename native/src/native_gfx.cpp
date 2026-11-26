@@ -573,7 +573,7 @@ D1_SYSV uint64_t commit(uint64_t region,uint64_t bytes,uint8_t top){
 }
 bool install(){
     const char* v=std::getenv("D1_PC_NATIVE_ASSET_BACKING");
-    if(!v||std::atoi(v)==0)return true;
+    if(v&&std::atoi(v)==0)return true;
     bool ok=hook(0xB4780,&reserve,original_reserve,"asset_region_reserve");
     ok&=hook(0xB4630,&commit,original_commit,"asset_region_commit");
     return ok;
@@ -600,7 +600,7 @@ SetFn o_bind, o_rebind;
 bool native_bind_enabled() {
     static const bool enabled=[] {
         const char* v=std::getenv("D1_PC_NATIVE_BIND");
-        return v&&std::atoi(v)!=0;
+        return (!v||std::atoi(v)!=0);
     }();
     return enabled;
 }
@@ -983,14 +983,13 @@ D1_SYSV void h_register(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t
     patch_table();
     log("nd: engine resource callbacks registered: bind / re-point / release wrapped");
 }
-void install() {
+bool install() {
     bool ok = true;
     nr::resreg::init();
     // The prologue consists of relocatable register pushes; preserve the
     // original free body and its callbacks. Failure leaves the old registry
     // behavior rather than disabling otherwise valid resource notifications.
-    if(!hook(0x6FBC0,&h_pool_free,o_pool_free,"resource_pool_destroy"))
-        log("nd: pool destruction lifetime hook unavailable");
+    ok &= hook(0x6FBC0,&h_pool_free,o_pool_free,"resource_pool_destroy");
     ok &= hook(0xCFCC0, &h_register, o_register, "resource_callbacks_register");
     if (!replace_eboot_function(0x818FA0, reinterpret_cast<const void*>(&h_unlock))) ok = false, log("nd: replacing texture_unlock failed");
     patch_table();
@@ -1015,6 +1014,7 @@ void install() {
     ok &= hook(0xF8A330, &h_tile, o_tile, "tile_surface");
     log("nd: engine resource events %s", ok ? "hooked" : "NOT HOOKED");
     if (!ok) nr::resreg::g_on = false;
+    return ok;
 }
 }  // namespace resev
 
@@ -1156,7 +1156,7 @@ D1_SYSV void h_begin_inherit(uint64_t dev, uint64_t rec, uint64_t a, uint64_t sa
 bool native_close_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("D1_PC_NATIVE_CLOSE");
-        return v && std::atoi(v)!=0;
+        return (!v||std::atoi(v)!=0);
     }();
     return enabled;
 }
@@ -1166,28 +1166,28 @@ template<class T> void put_field(uint64_t base,uint64_t offset,T value) {
 bool native_drain_enabled() {
     static const bool enabled=[] {
         const char* v=std::getenv("D1_PC_NATIVE_DRAIN");
-        return native_close_enabled()&&v&&std::atoi(v)!=0;
+        return native_close_enabled()&&(!v||std::atoi(v)!=0);
     }();
     return enabled;
 }
 bool native_ring_enabled() {
     static const bool enabled=[] {
         const char* v=std::getenv("D1_PC_NATIVE_RING");
-        return native_drain_enabled()&&v&&std::atoi(v)!=0;
+        return native_drain_enabled()&&(!v||std::atoi(v)!=0);
     }();
     return enabled;
 }
 bool native_cbm_enabled(){
     static const bool enabled=[] {
         const char* v=std::getenv("D1_PC_NATIVE_CBM");
-        return v&&std::atoi(v)!=0;
+        return (!v||std::atoi(v)!=0);
     }();
     return enabled;
 }
 bool native_cbm_pool_enabled(){
     static const bool enabled=[] {
         const char* v=std::getenv("D1_PC_NATIVE_CBM_POOL");
-        return native_cbm_enabled()&&v&&std::atoi(v)!=0;
+        return native_cbm_enabled()&&(!v||std::atoi(v)!=0);
     }();
     return enabled;
 }
@@ -1751,8 +1751,7 @@ void free_list(List* l) {
 
 
 bool install() {
-    resev::install();
-    bool ok = true;
+    bool ok = resev::install();
     auto rep = [&](uint64_t off, const void* fn) {
         if (!replace_eboot_function(off, fn)) ok = false, log("nd: replacing eboot+%#llx failed", (unsigned long long)off);
     };

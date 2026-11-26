@@ -235,7 +235,7 @@ int main(int argc, char** argv) {
             if (native_fios && std::strcmp(n, "libSceFios2.prx") == 0) {
                 // Preserve the known 01.33 libc virtual base during the migration.
                 base += 0x10000000ull;
-                log("native FIOS: skipping libSceFios2.prx (experimental)");
+                log("native FIOS: skipping libSceFios2.prx (native default)");
                 continue;
             }
             rt().modules.push_back(load_module(sce_module + "/" + n, base));

@@ -2764,7 +2764,7 @@ void Renderer::fill_missing_mips(uint32_t first, uint8_t* staging, const std::ve
 
 // ---------------------------------------------------------------------------- geometry cache
 static bool local_geometry_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("D1_NG_LOCAL_GEOMETRY"); return v && std::atoi(v) != 0; }();
+    static const bool enabled = [] { const char* v = std::getenv("D1_NG_LOCAL_GEOMETRY"); return !v || std::atoi(v) != 0; }();
     return enabled;
 }
 

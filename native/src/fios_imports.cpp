@@ -227,7 +227,7 @@ uint32_t rename(const OperationAttributes* attr, const char* from, const char* t
 
 bool native_fios_enabled() {
     const char* mode = std::getenv("D1_NATIVE_FIOS");
-    return mode && std::atoi(mode) != 0;
+    return !mode || std::atoi(mode) != 0;
 }
 void native_fios_prepare() {
     if (!native_fios_enabled() || core) return;

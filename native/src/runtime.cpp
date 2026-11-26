@@ -435,7 +435,7 @@ void link_all() {
     const char* leaf_mode = getenv("D1_PC_LIBC_LEAVES");
     const bool native_leaves = !leaf_mode || std::atoi(leaf_mode) != 0;
     const char* math_mode = getenv("D1_PC_LIBC_MATH");
-    const bool native_math = math_mode && std::atoi(math_mode) != 0;
+    const bool native_math = !math_mode || std::atoi(math_mode) != 0;
     const bool trace_fios = getenv("D1_FIOS_TRACE") != nullptr;
     const bool native_fios = native_fios_enabled();
     std::set<std::string> fios_nids;
