@@ -1,7 +1,4 @@
-// Window, input and audio for builds with the native renderer (no shadPS4): an SDL2 window
-// owned by the main thread. The render_bridge.h window/input/audio entry points
-// (window_active, read_pad, take_mouse_motion, audio_*, run_window_loop) are implemented by
-// frontend_sdl.cpp in those builds.
+// Native SDL2 window and Vulkan surface handles.
 #pragma once
 #include <cstdint>
 
