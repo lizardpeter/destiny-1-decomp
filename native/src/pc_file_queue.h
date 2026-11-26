@@ -109,7 +109,7 @@ private:
         ec.clear();
         auto it = files_.find(file);
         if (!op->task && it == files_.end()) { ec = error(std::errc::bad_file_descriptor); return 0; }
-        if (stopping_ || !next_op_ || ops_.size() >= limit_) { ec = error(std::errc::resource_unavailable_try_again); return 0; }
+        if (stopping_ || next_op_ > 0x0fffffffu || ops_.size() >= limit_) { ec = error(std::errc::resource_unavailable_try_again); return 0; }
         if (!op->task) op->file = it->second;
         const Id id = next_op_++;
         ops_.emplace(id, op);
@@ -142,7 +142,7 @@ public:
         ec.clear();
         if (!file) { ec = error(std::errc::bad_file_descriptor); return 0; }
         std::lock_guard lock(m_);
-        if (stopping_ || !next_file_) { ec = error(std::errc::too_many_files_open); return 0; }
+        if (stopping_ || next_file_ > 0x0fffffffu) { ec = error(std::errc::too_many_files_open); return 0; }
         const Id id = next_file_++;
         files_.emplace(id, std::move(file));
         return id;
