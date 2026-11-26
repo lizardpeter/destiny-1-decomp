@@ -592,13 +592,12 @@ struct Renderer {
     Buffer* geometry_staging(uint64_t bytes, StagingSpan& span);
     void geo_free_now(int block, uint64_t off, uint64_t size);
     void geo_free_later(int block, uint64_t off, uint64_t size);
-    // res / rbase: an engine resource (id << 32 | epoch) and its memory's start: kept by
-    // identity and epoch instead of write tracking
-    bool geo_get(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, GeoHit& hit, uint64_t res = 0, uint64_t rbase = 0);
-    GeoEntry* geo_lookup(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase);
-    static thread_local GeoHit geo_hit_out;  // (geo_lookup's result, copied while its shard is locked)
-    GeoEntry* geo_lookup_res(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase,
-                             const uint8_t* snapshot=nullptr, uint64_t object=0, const MappingSpans* mapping=nullptr);
+    // Static geometry is resolved by the ordered native preparation pass.
+    // This cache is exclusively for unregistered dynamic native buffers.
+    bool geo_get(uint64_t addr,uint64_t size,int index_size,uint32_t index_count,GeoHit& hit);
+    GeoEntry* geo_lookup(uint64_t addr,uint64_t size,int index_size,uint32_t index_count);
+    static thread_local GeoHit geo_hit_out;
+    bool read_geometry_range(const Draw::Res& res,uint64_t address,uint64_t size,void* out);
     void evict_geo();
     uint64_t pcache_saved_pipelines = 0;
     uint64_t pcache_last_attempt_ns = 0;
@@ -626,7 +625,6 @@ struct Renderer {
     DescriptorSlots<gcn::kBindlessImageBindings,gcn::kMaxBindlessViews> view_slots;
     uint16_t next_sampler_id = 1;
     uint64_t view_exhausted=0,sampler_exhausted=0,view_create_failed=0,sampler_create_failed=0;
-    std::atomic<uint64_t> geo_evict_gen{1};
     uint16_t alloc_bindless_view(VkImageView v, uint8_t dim, uint8_t kind);
     void free_bindless_view(uint16_t id, uint8_t dim, uint8_t kind);
     Stats st;
@@ -1674,9 +1672,7 @@ bool Renderer::init(const Options& o) {
     // Capturing on the engine threads is cheap; recording Vulkan commands
     // there before the actual submit order is known is not yet safe for shared
     // mutable resources. Keep it as an explicitly requested research mode.
-    const char* early = std::getenv("D1_NG_EARLY_RECORD");
-    list_rec = early && std::atoi(early) != 0 && !debug && passlog_frame == UINT64_MAX &&
-               !std::getenv("D1_NG_TRACE") && !std::getenv("D1_NG_DRAWSTATS");
+    list_rec=false; // production records in actual submission order
     log("native renderer: command lists recorded %s", list_rec ? "on the engine's threads as they end" : "at submission");
     start_loader();
     {
@@ -3433,7 +3429,6 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
     VkBufferCopy copy{span.offset, off, span.size};
     vkCmdCopyBuffer(rc().cmd, staging->buf, geo_blocks[size_t(block)].buf.buf, 1, &copy);
     if (e.valid) {
-        geo_evict_gen.fetch_add(1, std::memory_order_release);
         geo_free_later(e.block, e.off, e.size);
     }
     e.block = block, e.off = off, e.size = res.size, e.hash = content;
@@ -3446,94 +3441,31 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
 
 // A GPU copy of guest memory [addr, addr+size), valid for this submission, or null (then the
 // caller copies into the ring). Buffers the game keeps rewriting are not cached for a while.
-bool Renderer::geo_get(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, GeoHit& hit, uint64_t res, uint64_t rbase) {
-    GeoEntry* ep = geo_lookup(addr, size, index_size, index_count, res, rbase);
-    return ep != nullptr && (hit = geo_hit_out, true);
+bool Renderer::read_geometry_range(const Draw::Res& res,uint64_t address,uint64_t size,void* out){
+    if(!size)return true;
+    if(address<0x10000||size>(64ull<<20))return false;
+    if(res.id){
+        if(address<res.base||address-res.base>res.size||size>res.size-(address-res.base))return false;
+        if(auto retained=geometry_sources.get({res.id,res.base,res.size,0,0})){
+            std::memcpy(out,retained->data()+(address-res.base),size);
+            return true;
+        }
+        // No immutable snapshot: the address may only be used while the
+        // same resource epoch still owns it. Never read a recycled pool.
+        if(!opt.res_current||!res.object||opt.res_current(res.object)!=res.id)return false;
+    }
+    MappingSpans spans;
+    if(!guest_capture_read_spans(address,size,spans)||
+       !guest_copy_current_spans(address,size,spans,out))return false;
+    return !res.id||opt.res_current(res.object)==res.id;
 }
-
-// An engine resource's bytes [addr, addr + size): kept while the resource's epoch is unchanged
-// (the engine only changes them with an event: bind, move, release), compared once after an
-// event (a move keeps the contents), never write-tracked. Keyed by the resource and the offset
-// in it, so a move does not make a new entry.
-GeoEntry* Renderer::geo_lookup_res(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase,
-                                       const uint8_t* snapshot, uint64_t object, const MappingSpans* mapping) {
-    const GeometryKey key{res, addr-rbase, size, uint32_t(index_size), index_count};
-    GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
-    std::unique_lock shard_lock(sh.m);
-    if(snapshot && (!opt.res_current || opt.res_current(object)!=res ||
-                   (!mapping||!guest_matches_current_spans(addr,size,*mapping,snapshot))))return nullptr;
-    const void* source=snapshot?static_cast<const void*>(snapshot):reinterpret_cast<const void*>(addr);
-    GeoEntry& e = sh.map[key];
-    e.last_used = submit_seq.load(std::memory_order_relaxed);
-    static const bool verify_res=std::getenv("D1_NG_GEO_VERIFY")!=nullptr;
-    if(e.valid&&e.res==res&&!verify_res){
-        __atomic_fetch_add(&st.geo_hits,1,__ATOMIC_RELAXED);
-        __atomic_fetch_add(&st.geo_res_hits,1,__ATOMIC_RELAXED);
-        geo_hit_out={geo_blocks[size_t(e.block)].buf.buf,e.off,e.size,e.vfirst,e.vlast};
-        return &e;
-    }
-    if(!guest_readable_range(addr,size))return nullptr;
-    if (e.valid) {
-        if (e.res == res) {
-            // D1_NG_GEO_VERIFY: (diagnostics) unchanged really? (a write the engine did not announce)
-            static const bool verify = std::getenv("D1_NG_GEO_VERIFY") != nullptr;
-            if (verify && hash_bytes(source, size) != e.hash) {
-                __atomic_fetch_add(&st.geo_stale, 1, __ATOMIC_RELAXED);
-                static std::atomic<int> told{0};
-                if (told++ < 60) {
-                    char ds[256] = "";
-                    if (opt.describe) opt.describe(addr, ds, sizeof ds);
-                    log("ng geo: engine %s buffer changed without an event: %#llx +%llu (resource %#llx, base %#llx) | %s",
-                        index_size ? "index" : "vertex", (unsigned long long)addr, (unsigned long long)size, (unsigned long long)res,
-                        (unsigned long long)rbase, ds);
-                }
-                e.hash = hash_bytes(source, size);
-            }
-            __atomic_fetch_add(&st.geo_hits, 1, __ATOMIC_RELAXED);
-            __atomic_fetch_add(&st.geo_res_hits, 1, __ATOMIC_RELAXED);
-            geo_hit_out = {geo_blocks[size_t(e.block)].buf.buf, e.off, e.size, e.vfirst, e.vlast};
-            return &e;
-        }
-        if (e.size == size && hash_bytes(source, size) == e.hash) {  // moved
-            e.res = res;
-            __atomic_fetch_add(&st.geo_res_moves, 1, __ATOMIC_RELAXED);
-            geo_hit_out = {geo_blocks[size_t(e.block)].buf.buf, e.off, e.size, e.vfirst, e.vlast};
-            return &e;
-        }
-        __atomic_fetch_add(&st.geo_res_changed, 1, __ATOMIC_RELAXED);
-        geo_evict_gen.fetch_add(1, std::memory_order_release); // invalidate thread-local native buffer bindings
-        geo_free_later(e.block, e.off, e.size);
-        e.valid = false;
-    }
-    if (!geo_alloc(size, e.block, e.off)) return nullptr;
-    e.size = size;
-    uint8_t* dst = geo_blocks[size_t(e.block)].buf.map + e.off;
-    std::memcpy(dst, source, size);
-    __atomic_fetch_add(&st.bytes_geo, size, __ATOMIC_RELAXED);
-    e.hash = hash_bytes(source, size);  // (of guest memory: compared after a move)
-    if (index_size) {  // the vertex range the indices reference
-        uint32_t lo = UINT32_MAX, hi = 0;
-        if (index_size == 4) {
-            const uint32_t* ix = reinterpret_cast<const uint32_t*>(dst);
-            for (uint32_t i = 0; i < index_count; ++i)
-                if (ix[i] != 0xFFFFFFFFu) lo = std::min(lo, ix[i]), hi = std::max(hi, ix[i]);
-        } else {
-            const uint16_t* ix = reinterpret_cast<const uint16_t*>(dst);
-            for (uint32_t i = 0; i < index_count; ++i)
-                if (ix[i] != 0xFFFF) lo = std::min<uint32_t>(lo, ix[i]), hi = std::max<uint32_t>(hi, ix[i]);
-        }
-        if (lo > hi) lo = hi = 0;
-        e.vfirst = lo, e.vlast = hi;
-    }
-    e.res = res, e.uploaded = e.last_used, e.valid = true;
-    geo_hit_out = {geo_blocks[size_t(e.block)].buf.buf, e.off, e.size, e.vfirst, e.vlast};
-    return &e;
+bool Renderer::geo_get(uint64_t addr,uint64_t size,int index_size,uint32_t index_count,GeoHit& hit){
+    auto* entry=geo_lookup(addr,size,index_size,index_count);
+    return entry!=nullptr&&(hit=geo_hit_out,true);
 }
-
-GeoEntry* Renderer::geo_lookup(uint64_t addr, uint64_t size, int index_size, uint32_t index_count, uint64_t res, uint64_t rbase) {
-    if (addr < 0x10000 || !size || size >= (64ull << 20) || (debug_toggles() & 8)) return nullptr;
-    if (index_size && ((index_size != 2 && index_size != 4) || index_count > size / uint64_t(index_size))) return nullptr;
-    if (res && addr >= rbase) return geo_lookup_res(addr, size, index_size, index_count, res, rbase);
+GeoEntry* Renderer::geo_lookup(uint64_t addr,uint64_t size,int index_size,uint32_t index_count){
+    if(addr<0x10000||!size||size>=(64ull<<20)||(debug_toggles()&8))return nullptr;
+    if(index_size&&((index_size!=2&&index_size!=4)||index_count>size/uint64_t(index_size)))return nullptr;
     if (!opt.watch || !opt.version || size >= (16ull << 20)) return nullptr;
     __atomic_fetch_add(&st.unreg_geo, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&st.unreg_geo_bytes, size, __ATOMIC_RELAXED);
@@ -3641,20 +3573,17 @@ void Renderer::evict_geo() {
     geometry_sources.prune([](uint64_t id){return texture_leases().pinned(id);});
     const uint64_t horizon = 3000, now = submit_seq.load();
     if (now < horizon) return;
-    bool any = false;
     for (GeoShard& sh : geo_shards) {
         std::lock_guard lk(sh.m);
         for (auto it = sh.map.begin(); it != sh.map.end();) {
             if (it->second.last_used + horizon < now && (!it->second.res||!texture_leases().pinned(it->second.res))) {
                 if (it->second.valid) geo_free_later(it->second.block, it->second.off, it->second.size);
                 it = sh.map.erase(it);
-                any = true;
             } else {
                 ++it;
             }
         }
     }
-    if (any) geo_evict_gen.fetch_add(1, std::memory_order_release);
 }
 
 // Textures unused for a while are dropped (re-uploaded if the game uses them again): the
@@ -5227,14 +5156,9 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     r.last_pipeline_mask_epoch=mask_epoch;
     lap(r.t_pipe);
 
-    // 2. Geometry resolution: thread-local fast cache for engine resource buffers (whole buffer
-    // bound once, sub-meshes indexed via firstIndex with vertexOffset = 0)
-    struct TlGeo { uint64_t res = 0, rbase = 0, rsize = 0, gen = 0; VkBuffer buf = VK_NULL_HANDLE; uint64_t off = 0; };
-    static thread_local std::unique_ptr<TlGeo[]> tlg_ptr;
-    if (!tlg_ptr) tlg_ptr = std::make_unique<TlGeo[]>(2048);
-    TlGeo* const tlg = tlg_ptr.get();
-    const uint64_t ggen = geo_evict_gen.load(std::memory_order_acquire);
-    const bool no_geo_cache = (debug_toggles() & 8) != 0;
+    // 2. Geometry: native allocations were selected in the ordered
+    // preparation pass. Only genuinely dynamic data needs upload here.
+    const bool no_geo_cache=(debug_toggles()&8)!=0;
 
     VkBuffer vbufs[16];
     VkDeviceSize voffs[16], vsizes[16];
@@ -5246,6 +5170,18 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     VkBuffer ige_buf = VK_NULL_HANDLE;
     uint64_t ige_off = 0;
     const uint32_t istride = dr.index32 ? 4u : 2u;
+    // CPU index inspection (quad expansion or mixed dynamic vertices)
+    // requires an owned exact-version slice, never an unchecked pointer.
+    static thread_local std::vector<uint8_t> index_scratch;
+    const uint8_t* index_data=nullptr;
+    auto indices=[&]()->const uint8_t*{
+        if(index_data)return index_data;
+        const uint64_t bytes=uint64_t(dr.count)*istride;
+        if(!bytes||bytes>(64ull<<20))return nullptr;
+        index_scratch.resize(size_t(bytes));
+        if(!read_geometry_range(dr.ires,dr.index_addr,bytes,index_scratch.data()))return nullptr;
+        return index_data=index_scratch.data();
+    };
 
     if (dr.kind == Draw::Indexed && dr.index_addr >= 0x10000 && dr.count && dr.prim != 0x13) {
         const uint64_t ibytes = uint64_t(dr.count) * istride;
@@ -5254,30 +5190,16 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
                           ((dr.index_addr - dr.ires.base) % istride == 0);
         if (!dr.ires.id) __atomic_fetch_add(&st.why_ib_noid, 1, __ATOMIC_RELAXED);
         else if (!ires) __atomic_fetch_add(&st.why_ib_range, 1, __ATOMIC_RELAXED);
-        if(ires&&!no_geo_cache&&(dr.native_geo_mask&(1u<<16))){
+        if(ires&&(dr.native_geo_mask&(1u<<16))){
             ige=ige_whole=true;
             ige_buf=(VkBuffer)dr.native_geo[16].buffer;
             ige_off=dr.native_geo[16].offset;
             first_index=uint32_t((dr.index_addr-dr.ires.base)/istride);
             ++r.native_geometry_bindings;
-        }else if (ires && !no_geo_cache) {
-            const uint64_t tk = mix(dr.ires.id, dr.ires.size);
-            TlGeo& te = tlg[tk & 2047];
-            if (te.res == dr.ires.id && te.rbase == dr.ires.base && te.rsize == dr.ires.size && te.gen == ggen && te.buf) {
-                ige = true, ige_whole = true, ige_buf = te.buf, ige_off = te.off;
-                first_index = uint32_t((dr.index_addr - dr.ires.base) / istride);
-            } else {
-                GeoHit h;
-                if (geo_get(dr.ires.base, dr.ires.size, 0, 0, h, dr.ires.id, dr.ires.base)) {
-                    te = {dr.ires.id, dr.ires.base, dr.ires.size, ggen, h.buf, h.off};
-                    ige = true, ige_whole = true, ige_buf = h.buf, ige_off = h.off;
-                    first_index = uint32_t((dr.index_addr - dr.ires.base) / istride);
-                }
-            }
-        } else if (!dyn_copy) {
+        }else if(!dr.ires.id&&!dyn_copy&&!no_geo_cache){
             GeoHit h;
-            if (geo_get(dr.index_addr, ibytes, int(istride), dr.count, h, 0, 0))
-                ige = true, ige_buf = h.buf, ige_off = h.off, vfirst = h.vfirst, vlast = h.vlast;
+            if(geo_get(dr.index_addr,ibytes,int(istride),dr.count,h))
+                ige=true,ige_buf=h.buf,ige_off=h.off,vfirst=h.vfirst,vlast=h.vlast;
         }
     }
 
@@ -5291,20 +5213,22 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
             const uint32_t stride = v[1] >> 16 & 0x3FFF;
             const Draw::Res& R = dr.vres[slot];
             if (!stride) continue;
-            if (!(R.id && dr.inline_vertices.empty() && base >= R.base && base < R.base + R.size && !no_geo_cache)) {
+            if (!(R.id && dr.inline_vertices.empty() && base >= R.base && base < R.base + R.size)) {
                 need_vrange = true;
                 break;
             }
         }
     }
     if (need_vrange && dr.kind == Draw::Indexed && dr.index_addr >= 0x10000 && dr.count) {
-        vfirst = UINT32_MAX, vlast = 0;
-        if (dr.index32) {
-            const uint32_t* ix = reinterpret_cast<const uint32_t*>(dr.index_addr);
+        const auto* data=indices();
+        if(!data)return skip("unavailable index source epoch");
+        vfirst=UINT32_MAX,vlast=0;
+        if(dr.index32){
+            const uint32_t* ix=reinterpret_cast<const uint32_t*>(data);
             for (uint32_t i = 0; i < dr.count; ++i)
                 if (ix[i] != 0xFFFFFFFFu) vfirst = std::min(vfirst, ix[i]), vlast = std::max(vlast, ix[i]);
         } else {
-            const uint16_t* ix = reinterpret_cast<const uint16_t*>(dr.index_addr);
+            const uint16_t* ix=reinterpret_cast<const uint16_t*>(data);
             for (uint32_t i = 0; i < dr.count; ++i)
                 if (ix[i] != 0xFFFF) vfirst = std::min<uint32_t>(vfirst, ix[i]), vlast = std::max<uint32_t>(vlast, ix[i]);
         }
@@ -5321,7 +5245,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         const Draw::Res& R = dr.vres[slot];
 
         // Fast path: engine vertex buffer resource bound from base (vfirst = 0 when ige_whole or auto draw)
-        if (R.id && dr.inline_vertices.empty() && stride && base >= R.base && base < R.base + R.size && !no_geo_cache) {
+        if (R.id && dr.inline_vertices.empty() && stride && base >= R.base && base < R.base + R.size) {
             const uint32_t voff_idx = (!per_instance && !ige_whole) ? vfirst : 0;
             const uint64_t src = base + uint64_t(voff_idx) * stride;
             if (src < R.base + R.size) {
@@ -5331,18 +5255,6 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
                     gbuf=(VkBuffer)dr.native_geo[slot].buffer;
                     goff=dr.native_geo[slot].offset;
                     ++r.native_geometry_bindings;
-                }else{
-                    const uint64_t tk=mix(R.id,R.size);
-                    TlGeo& te=tlg[tk&2047];
-                    if(te.res==R.id&&te.rbase==R.base&&te.rsize==R.size&&te.gen==ggen&&te.buf){
-                        gbuf=te.buf;goff=te.off;
-                    }else{
-                        GeoHit h;
-                        if(geo_get(R.base,R.size,0,0,h,R.id,R.base)){
-                            te={R.id,R.base,R.size,ggen,h.buf,h.off};
-                            gbuf=h.buf;goff=h.off;
-                        }
-                    }
                 }
                 if (gbuf) {
                     const uint64_t rel = src - R.base;
@@ -5370,7 +5282,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         }
         uint64_t size = stride ? uint64_t(last - first + 1) * stride : 16;
         uint64_t src = base + uint64_t(first) * stride;
-        if (dr.inline_vertices.empty() && stride && base >= 0x10000 && !dyn_copy && !no_geo_cache) {
+        if (!R.id && dr.inline_vertices.empty() && stride && base >= 0x10000 && !dyn_copy && !no_geo_cache) {
             GeoHit h;
             if (geo_get(base, uint64_t(records) * stride, 0, 0, h)) {
                 vbufs[slot] = h.buf, voffs[slot] = h.off + uint64_t(first) * stride;
@@ -5383,7 +5295,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
             if (src >= dr.inline_vertices.size()) return skip("inline vertex offset");
             size = std::min<uint64_t>(size, dr.inline_vertices.size() - src);
             src += uint64_t(dr.inline_vertices.data());
-        } else if (base < 0x10000 || !guest_readable_range(src,size)) {
+        } else if (!R.id&&(base < 0x10000 || !guest_readable_range(src,size))) {
             const uint64_t zsz = std::max<uint64_t>(stride ? stride : 16, 16);
             const uint64_t off = rec_ring(r, zsz, 16);
             if (off == UINT64_MAX) return skip("ring full");
@@ -5395,7 +5307,12 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         size = std::min<uint64_t>(size, 64ull << 20);
         const uint64_t off = rec_ring(r, std::max<uint64_t>(size, 16), 256);
         if (off == UINT64_MAX) return skip("ring full");
-        std::memcpy(ring.map + off, reinterpret_cast<const void*>(src), size);
+        if(dr.inline_vertices.empty()&&R.id){
+            // Capacity pressure may require a native upload-ring copy. It
+            // must still consume exactly the captured resource version.
+            if(!read_geometry_range(R,src,size,ring.map+off))
+                return skip("unavailable vertex source epoch");
+        }else std::memcpy(ring.map+off,reinterpret_cast<const void*>(src),size);
         if (dr.inline_vertices.empty()&&rc().lr) note_copy(1, src, size), r.recopy.push_back({src, off, size, 1});
         r.bytes_vtx += size;
         if (size < 16) std::memset(ring.map + off + size, 0, 16 - size);
@@ -5521,13 +5438,15 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         const uint64_t o = rec_ring(r, uint64_t(quads) * 6 * 4, 4);
         if (o == UINT64_MAX) return skip("ring full");
         uint32_t* out = reinterpret_cast<uint32_t*>(ring.map + o);
+        const uint8_t* source=indexed?indices():nullptr;
+        if(indexed&&!source)return skip("unavailable quad index source epoch");
         for (uint32_t q = 0; q < quads; ++q) {
             uint32_t v[4];
             for (int k = 0; k < 4; ++k) {
                 const uint32_t i = q * 4 + k;
                 v[k] = !indexed ? i
-                     : dr.index32 ? reinterpret_cast<const uint32_t*>(dr.index_addr)[i]
-                                  : reinterpret_cast<const uint16_t*>(dr.index_addr)[i];
+                     : dr.index32 ? reinterpret_cast<const uint32_t*>(source)[i]
+                                  : reinterpret_cast<const uint16_t*>(source)[i];
             }
             const uint32_t t[6] = {v[0], v[1], v[2], v[0], v[2], v[3]};
             std::memcpy(out + q * 6, t, sizeof t);
@@ -5541,7 +5460,9 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     } else if (indexed) {
         if (dr.index_addr < 0x10000) return skip("null index buffer");
         const uint64_t ibytes = uint64_t(count) * istride;
-        ioff = rec_copy(r, reinterpret_cast<const void*>(dr.index_addr), ibytes);
+        const auto* source=indices();
+        if(!source)return skip("unavailable index source epoch");
+        ioff=rec_copy(r,source,ibytes);
         note_copy(2, dr.index_addr, ibytes);
         r.bytes_idx += ibytes;
         if (ioff == UINT64_MAX) return skip("ring full");
@@ -5842,12 +5763,11 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     flush_uploads();
     const uint64_t t_geometry=now_ns();
     t_pre_views+=t_geometry-t_views;
-    if (!rc().lr && !(debug_toggles() & 8)) {
+    if (!rc().lr) {
         // Prepare each exact resource epoch/range once per ordered segment, before
         // any graphics secondary begins. Different versions remain distinct.
         static thread_local SegmentTable<GeometryKey,Draw::NativeGeometry,GeometryKeyHash> seen_geometry;
         seen_geometry.clear();
-        static const bool verify=std::getenv("D1_NG_GEO_VERIFY")!=nullptr;
         bool copied=false;
         auto prepare=[&](Draw& d,unsigned slot,const Draw::Res& r){
             if(!r.id||!r.size)return;
@@ -5857,7 +5777,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                 copied|=prepare_local_geometry(r,nullptr,0,nullptr,&hit);
                 return Draw::NativeGeometry{uint64_t(hit.buf),hit.off};
             });
-            if(native.buffer&&!verify){
+            if(native.buffer){
                 d.native_geo[slot]=native;d.native_geo_mask|=1u<<slot;
             }
         };
@@ -6079,8 +5999,7 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
 // (another epoch) before it was done is dropped. Draws that need a resource first still
 // upload it themselves; the loader then finds it done.
 void Renderer::start_loader() {
-    const char* v = std::getenv("D1_NG_PREFETCH");
-    load_on = (!v || std::atoi(v) != 0) && opt.res_current != nullptr;
+    load_on=opt.res_current!=nullptr;
     if (!load_on) return;
     loader = std::thread([this] {
         unsigned consecutive_textures=0;
@@ -6110,7 +6029,7 @@ void Renderer::start_loader() {
         }
     });
     loader.detach();
-    log("native renderer: engine resources are uploaded when the engine loads or moves them (D1_NG_PREFETCH=0: at first use)");
+    log("native renderer: engine resources are prepared on the native asset loader when the engine loads or moves them");
 }
 
 void Renderer::load_buffer(const LoadJob& j) {
