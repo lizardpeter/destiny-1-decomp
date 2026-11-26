@@ -41,7 +41,9 @@ public:
         if (!within(base, full) || (write && (full == base || within(assets_, full)))) {
             ec = error(std::errc::permission_denied); return {};
         }
-        return full;
+        // Preserve the leaf's identity for unlink/rename; canonicalization is
+        // solely the containment check, not a request to operate on its target.
+        return base / name;
     }
     std::shared_ptr<File> open(Root root, const std::filesystem::path& name, OpenOptions options, std::error_code& ec) const {
         const bool write = options.access != Access::read || options.create || options.truncate || options.exclusive;
