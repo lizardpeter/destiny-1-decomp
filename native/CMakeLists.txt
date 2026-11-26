@@ -289,3 +289,7 @@ add_test(NAME native-descriptor-slots COMMAND native-descriptor-slots-test)
 add_executable(native-texture-identity-test tests/native_texture_identity_test.cpp)
 target_include_directories(native-texture-identity-test PRIVATE gfx)
 add_test(NAME native-texture-identity COMMAND native-texture-identity-test)
+
+add_executable(native-epoch-cohort-test tests/native_epoch_cohort_test.cpp)
+target_include_directories(native-epoch-cohort-test PRIVATE gfx)
+add_test(NAME native-epoch-cohort COMMAND native-epoch-cohort-test)

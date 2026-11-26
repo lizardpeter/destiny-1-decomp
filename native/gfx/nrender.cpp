@@ -16,6 +16,7 @@
 #include "native_resource_identity.h"
 #include "native_descriptor_slots.h"
 #include "native_texture_identity.h"
+#include "native_epoch_cohort.h"
 #include "../src/native_ranges.h"
 #include "../src/host_memory.h"
 
@@ -782,7 +783,8 @@ struct Renderer {
     std::deque<LoadJob> load_q;
     std::unordered_set<uint64_t> load_pending; // speculative work only; first use remains authoritative
     static uint64_t load_key(const LoadJob& j) {
-        uint64_t h = mix(mix(mix(j.kind, j.res), j.obj), mix(mix(j.base, j.size),j.mapping));
+        uint64_t h=mix(mix(mix(j.kind,j.res),j.obj),mix(j.base,j.size));
+        for(const auto& span:j.mapping)h=mix(mix(mix(h,span.base),span.size),span.identity);
         if (j.kind == 1) h = mix(h, hash_bytes(j.t, sizeof j.t));
         return h;
     }
@@ -904,6 +906,7 @@ struct Renderer {
     uint64_t dma_tex_hits = 0, feedback_draws = 0, readback_stale = 0, cpu_stale = 0;
     uint64_t texture_range_rejects=0, split_partial_kept=0, split_descriptor_rejects=0, texture_upload_failures=0;
     uint64_t resident_descriptor_hits=0,readback_unused_skipped=0,split_layout_guesses=0,expired_texture_epochs=0;
+    uint64_t texture_cohort_splits=0,texture_draw_epoch_conflicts=0;
     std::atomic<uint64_t> expired_gpu_results{0};
     // The GPU's results reached guest memory (a readback): copies made from that memory (a
     // texture over a render target's memory, e.g. glyphs drawn into a cache texture) are stale.
@@ -2981,18 +2984,26 @@ bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snaps
         return false;
     }
     auto* dst = staging->map + span.offset;
-    const bool copied = snapshot ? (std::memcpy(dst,snapshot,res.size),true) :
-        guest_copy_current_spans(res.base,res.size,*mapping,dst);
-    std::memset(dst + res.size, 0, span.size - res.size);
-    if(!copied||!guest_matches_current_spans(res.base,res.size,*mapping,dst)||
+    // Hash and validate in host-cached memory, not by reading the
+    // potentially write-combined mapped Vulkan staging page.
+    static thread_local std::vector<uint8_t> owned;
+    const uint8_t* source=snapshot;
+    bool copied=true;
+    if(!source){
+        owned.resize(res.size);
+        copied=guest_copy_current_spans(res.base,res.size,*mapping,owned.data());
+        source=owned.data();
+    }
+    if(!copied||!guest_matches_current_spans(res.base,res.size,*mapping,source)||
        (snapshot&&opt.res_current(object)!=res.id)){
         // No GPU command references this span yet; return it to the page.
         subs[rc().cur].geo_staging_used = span.offset;
         geo_free_now(block, off, res.size);
         return false;
     }
-    // Hash the uploaded snapshot, never reread a potentially recycled source.
-    const uint64_t content=hash_bytes(snapshot?snapshot:dst,res.size);
+    const uint64_t content=hash_bytes(source,res.size);
+    std::memcpy(dst,source,res.size);
+    std::memset(dst+res.size,0,span.size-res.size);
     end_pass();
     VkBufferCopy copy{span.offset, off, span.size};
     vkCmdCopyBuffer(rc().cmd, staging->buf, geo_blocks[size_t(block)].buf.buf, 1, &copy);
@@ -5150,9 +5161,30 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
             i = end;
             continue;
         }
-        size_t end = i + 1;
-        while (end < draws.size() && !memory_write(draws[end])) ++end;
-        pre_pass(draws.data() + i, end - i);
+        // Stop preparation before a second epoch of any persistent
+        // texture. Otherwise the later upload overwrites the image before
+        // the earlier draw has even recorded its sampling commands.
+        static thread_local EpochCohort cohort;
+        cohort.clear();
+        size_t end=i;
+        for(;end<draws.size()&&!memory_write(draws[end]);++end){
+            const Draw& dr=*draws[end];
+            if(dr.kind!=Draw::Indexed&&dr.kind!=Draw::Auto)continue;
+            bool conflict=false;
+            for(unsigned stage=0;stage<2&&!conflict;++stage)
+                for(uint32_t mask=dr.tex_mask[stage];mask;mask&=mask-1){
+                    const unsigned slot=__builtin_ctz(mask);
+                    if(!cohort.observe(dr.tex_res[stage][slot])){conflict=true;break;}
+                }
+            if(conflict){
+                if(end==i){++texture_draw_epoch_conflicts;continue;}
+                ++texture_cohort_splits;break;
+            }
+        }
+        // Any preceding inline rendering must finish before preparation
+        // records texture or geometry transfer commands.
+        end_pass();
+        pre_pass(draws.data()+i,end-i);
         for (; i < end; ++i) {
         Draw* d = draws[i];
         switch (d->kind) {
@@ -5309,7 +5341,8 @@ void Renderer::load_texture(const LoadJob& j) {
         std::lock_guard lk(m);
         auto it = textures.find(key);
         if (it != textures.end() && it->second && !it->second->stale &&
-            it->second->res_val == j.res && it->second->src_addr == ts.base) { ++ld_skipped; return; }
+            it->second->res_val==j.res&&it->second->src_addr==ts.base&&
+            it->second->descriptor_epoch[0]&&texture_source_layout_equal(it->second->resident_descriptor[0],t)) {++ld_skipped;return;}
     }
     // Own a complete tiled snapshot before detiling; the loader may be
     // delayed past the original package's mapping lifetime.
@@ -5324,9 +5357,14 @@ void Renderer::load_texture(const LoadJob& j) {
         auto it = textures.find(key);
         if (it != textures.end() && it->second && !it->second->stale) {
             Image* img = it->second.get();
-            if (img->res_val == j.res && img->src_addr == ts.base) { ++ld_skipped; return; }
-            if (img->content == content && img->src_size == sf.total_size) {
-                img->res_val = j.res, img->src_addr = ts.base;
+            const bool same_layout=img->descriptor_epoch[0]&&
+                texture_source_layout_equal(img->resident_descriptor[0],t)&&
+                !img->low_size&&!img->hi_size;
+            if(img->res_val==j.res&&img->src_addr==ts.base&&same_layout){++ld_skipped;return;}
+            if(same_layout&&img->content==content&&img->src_size==sf.total_size){
+                img->res_val=j.res;img->res_obj=j.obj;img->src_addr=ts.base;
+                std::memcpy(img->resident_descriptor[0],t,32);
+                img->descriptor_epoch[0]=j.res;img->descriptor_epoch[1]=0;
                 ++views_gen; // invalidate cached misses and old descriptor epochs
                 ++ld_moves;
                 return;
@@ -6827,6 +6865,9 @@ void print_stats() {
         log("native renderer: split low layouts reconstructed without a captured descriptor %llu",(unsigned long long)g->split_layout_guesses);
         log("native renderer: expired captured texture epochs %llu",(unsigned long long)g->expired_texture_epochs);
         g->split_layout_guesses=g->expired_texture_epochs=0;
+        log("native renderer: texture epoch cohort splits %llu, conflicting versions in one draw %llu",
+            (unsigned long long)g->texture_cohort_splits,(unsigned long long)g->texture_draw_epoch_conflicts);
+        g->texture_cohort_splits=g->texture_draw_epoch_conflicts=0;
         {
             std::lock_guard dl(g->bindless_m);
             uint32_t live=0,peak=0,binding=0;
