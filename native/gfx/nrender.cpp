@@ -579,7 +579,7 @@ struct Renderer {
     GeoShard geo_shards[64];
     GeometrySources geometry_sources;
     std::atomic<bool> geometry_source_pressure{false};
-    void capture_geometry(const Draw::Res& res);
+    void capture_geometry(const Draw::Res& res,bool cpu_required);
     std::mutex geo_block_m;
     uint64_t geo_bytes = 0;
     struct GeoHit {
@@ -3346,11 +3346,11 @@ Buffer* Renderer::geometry_staging(uint64_t bytes, StagingSpan& span) {
     return &sb.geo_staging.back();
 }
 
-void Renderer::capture_geometry(const Draw::Res& res){
+void Renderer::capture_geometry(const Draw::Res& res,bool cpu_required){
     if(!res.id||!res.object||res.base<0x10000||!res.size||res.size>=(64ull<<20))return;
     const GeometryKey resident_key{res.id,0,res.size,0,0};
     auto& sh=geo_shards[(uint64_t(GeometryKeyHash{}(resident_key))*0x9E3779B97F4A7C15ull)>>58];
-    {
+    if(!cpu_required){
         std::lock_guard lk(sh.m);
         const auto i=sh.map.find(resident_key);
         if(i!=sh.map.end()&&i->second.valid&&i->second.res==res.id)return;
@@ -6042,30 +6042,29 @@ void Renderer::load_buffer(const LoadJob& j) {
         const auto it=sh.map.find(key);
         if(it!=sh.map.end()&&it->second.valid&&it->second.res==j.res){++ld_skipped;return;}
     }
-    // Copy outside Renderer::m. The mapping identity was captured at bind,
-    // not at dequeue, so a reused virtual address cannot feed an old job.
-    static thread_local std::vector<uint8_t> snapshot;
-    snapshot.resize(j.size);
-    if(!guest_copy_current_spans(j.base,j.size,j.mapping,snapshot.data()) ||
-       opt.res_current(j.obj)!=j.res){++ld_stale;return;}
-    {
-        // Early speculative recording is not part of the ordered upload cohort.
-        if(list_rec)return;
-        std::lock_guard lk(m);
-        if(opt.res_current(j.obj)!=j.res || !guest_matches_current_spans(j.base,j.size,j.mapping,snapshot.data())){++ld_stale;return;}
-        Recorder* const previous=tr;
-        struct Restore {Recorder* p;~Restore(){tr=p;}} restore{previous};
-        tr=&up_rec;
-        up_rec.lr=true;
-        if(up_rec.cur==UINT32_MAX)up_rec.submit_no=submit_seq.load(),begin_record();
-        if(up_rec.cur==UINT32_MAX)return;
-        if(prepare_local_geometry({j.res,j.base,j.size,j.obj},snapshot.data(),j.obj,&j.mapping)){
-            // Same graphics queue; execute() submits the shared upload slot
-            // before recording the next ordered draw submission.
-            barrier();
-            ++ld_buf;
-        }
-        return;
+    // The loader and first draw share the same immutable source claim.
+    // Only the first claimant copies from the original allocation; the
+    // copy and mapping validation are outside the renderer mutex.
+    const GeometryKey key{j.res,j.base,j.size,0,0};
+    const auto source=geometry_sources.capture(key,[&](uint8_t* dst,uint64_t bytes){
+        return opt.res_current(j.obj)==j.res&&
+               guest_copy_current_spans(j.base,bytes,j.mapping,dst)&&
+               opt.res_current(j.obj)==j.res&&
+               guest_matches_current_spans(j.base,bytes,j.mapping,dst);
+    });
+    if(!source){geometry_source_pressure.store(true,std::memory_order_relaxed);++ld_stale;return;}
+    if(list_rec)return;
+    std::lock_guard lk(m);
+    if(opt.res_current(j.obj)!=j.res&&!texture_leases().pinned(j.res)){++ld_stale;return;}
+    Recorder* const previous=tr;
+    struct Restore {Recorder* p;~Restore(){tr=p;}} restore{previous};
+    tr=&up_rec;
+    up_rec.lr=true;
+    if(up_rec.cur==UINT32_MAX)up_rec.submit_no=submit_seq.load(),begin_record();
+    if(up_rec.cur==UINT32_MAX)return;
+    if(prepare_local_geometry({j.res,j.base,j.size,j.obj},source->data(),j.obj,&j.mapping)){
+        barrier();
+        ++ld_buf;
     }
 }
 
@@ -7619,8 +7618,8 @@ void prefetch_shader_pair(const uint8_t* vs_obj, const uint8_t* ps_obj) {
         if (res) g->prefetch({3, {}, uint64_t(ps_obj), 0, res, uint64_t(ps_obj)});
     }
 }
-void capture_geometry_source(const Draw::Res& resource){
-    if(g)g->capture_geometry(resource);
+void capture_geometry_source(const Draw::Res& resource,bool cpu_required){
+    if(g)g->capture_geometry(resource,cpu_required);
 }
 void prefetch_buffer(uint64_t base, uint64_t size, uint64_t res, uint64_t obj) {
     if (!g || !res || !g->load_on || !size || size >= (64ull<<20)) return;
