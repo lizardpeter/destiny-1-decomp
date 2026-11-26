@@ -382,7 +382,7 @@ static size_t patch_fs_tcb(Module& m) {
 }
 
 // ------------------------------------------------------------------ linker
-void* native_libc_leaf(const std::string& nid); // pc_libc_imports.cpp
+void* native_libc_leaf(const std::string& nid, bool include_math); // pc_libc_imports.cpp
 
 void link_all() {
     auto& mods = rt().modules;
@@ -413,6 +413,8 @@ void link_all() {
     size_t n_game = 0, n_hle = 0, n_unimpl = 0, n_obj = 0, n_native_libc = 0;
     const char* leaf_mode = getenv("D1_PC_LIBC_LEAVES");
     const bool native_leaves = !leaf_mode || std::atoi(leaf_mode) != 0;
+    const char* math_mode = getenv("D1_PC_LIBC_MATH");
+    const bool native_math = math_mode && std::atoi(math_mode) != 0;
     for (auto& m : mods) {
         for (auto& r : m.relas) {
             auto* where = reinterpret_cast<uint64_t*>(m.base + r.offset);
@@ -445,7 +447,7 @@ void link_all() {
                 }
                 const bool is_object = (s.info & 0xF) == 1;
                 std::string key = m.name + "|" + nid + "|" + lib;
-                void* leaf = native_leaves && lib == "libc" && !is_object ? native_libc_leaf(nid) : nullptr;
+                void* leaf = native_leaves && lib == "libc" && !is_object ? native_libc_leaf(nid, native_math) : nullptr;
                 if (leaf) {
                     auto& t = thunk_cache[key];
                     if (!t) {
