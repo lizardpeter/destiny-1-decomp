@@ -121,6 +121,7 @@ struct CbEvent {
     ng::Draw::Cb cb;
 };
 ng::Draw::Cb g_ce[ng::kStages][16] = {};  // bindings as of the end of the last submission
+bool g_ce_known[ng::kStages][16] = {}; // distinguish explicit unbind from no inherited state
 struct CueState {
     ng::Draw::Cb cb[ng::kStages][16] = {};
 };
@@ -808,7 +809,7 @@ void record(List* l) {
                 for (int sl = 0; sl < 16; ++sl) {
                     ng::Draw::Cb& c = d->cb[st][sl];
                     if (bound[st][sl]) {
-                        if (local[st][sl].addr) c = local[st][sl];
+                        c = local[st][sl];
                     } else {
                         if (!l->dflt[st][sl].addr && c.addr) l->dflt[st][sl] = c;
                         c = {ng::kLateCb | uint64_t(st) << 4 | uint64_t(sl), c.size};
@@ -1538,19 +1539,23 @@ void native_device_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t*
         if (l->recorded && run) {
             flush_draws();
             for (const ng::LateCb& lc : l->late) {
-                const ng::Draw::Cb& c = nr::g_ce[lc.stage][lc.slot].addr ?
+                const ng::Draw::Cb& c = nr::g_ce_known[lc.stage][lc.slot] ?
                     nr::g_ce[lc.stage][lc.slot] : l->dflt[lc.stage][lc.slot];
                 ng::fill_late(lc, c.addr, c.size);
             }
             recorded.push_back(l->handle);
             for (nd::Item& it : l->items)
-                if (!it.d) nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
+                if (!it.d) {
+                    nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
+                    nr::g_ce_known[it.cb.stage][it.cb.slot] = true;
+                }
         } else {
             flush_recorded();
             if (l->recorded) ng::discard_recorded(l->handle);
             for (nd::Item& it : l->items) {
                 if (!it.d) {
                     nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
+                    nr::g_ce_known[it.cb.stage][it.cb.slot] = true;
                     continue;
                 }
                 ng::Draw* d = it.d;
@@ -1562,7 +1567,7 @@ void native_device_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t*
                 if (d->kind <= ng::Draw::Clear)
                     for (int st = 0; st < 2; ++st)
                         for (int sl = 0; sl < 16; ++sl)
-                            if (nr::g_ce[st][sl].addr) d->cb[st][sl] = nr::g_ce[st][sl];
+                            if (nr::g_ce_known[st][sl]) d->cb[st][sl] = nr::g_ce[st][sl];
                 draws.push_back(d);
             }
         }
