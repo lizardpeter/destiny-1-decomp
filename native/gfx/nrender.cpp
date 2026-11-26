@@ -2325,6 +2325,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             if (!streamed && img->src_size == cur_bytes && guest_region_extent(ts.base) >= cur_bytes &&
                 hash_bytes(reinterpret_cast<const void*>(ts.base), cur_bytes) == img->content) {
                 img->res_val = res, img->src_addr = ts.base;
+                ++views_gen;
                 ++st.res_moves;
                 st.t_tex_hit += now_ns() - t_in;
                 return img;
@@ -2538,6 +2539,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         img->src_addr = ts.base, img->src_size = cur_bytes, img->version = ~0ull;
     } else {
         ok = upload_range(sf, ts.base, 0, full_levels, 0);
+        // A reused image may previously have been streamed. Do not carry a
+        // split allocation's address/size metadata into a contiguous upload.
+        img->low_base = img->hi_base = img->low_size = img->hi_size = 0;
         img->low_loaded = img->hi_loaded = ok;
         if (ok && res) {
             img->res_val = res, img->res_obj = smi.obj ? smi.obj : obj;
