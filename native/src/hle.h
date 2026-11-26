@@ -93,7 +93,7 @@ int net_close_socket(int fd);
 // Current world-controller state name (e.g. "bootflow:start"), or null (hooks.cpp).
 const char* game_state();
 
-// Guest paths (/app0/..., /temp0/...) -> host paths.
-std::string host_path(const char* guest);
+// Initialize the native filesystem roots before starting game threads.
+bool init_pc_filesystem();
 
 }  // namespace d1
