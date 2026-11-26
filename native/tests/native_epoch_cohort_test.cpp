@@ -1,5 +1,6 @@
 #include "native_epoch_cohort.h"
 #include "native_draw_batch.h"
+#include "native_image_lifetime.h"
 #include <cstdlib>
 #include <cstdio>
 using d1::ng::EpochCohort;
@@ -20,6 +21,14 @@ int main(){
     check(cohort.observe(res(257,8)));
     check(cohort.observe(res(1,2)));
     using namespace d1::ng;
+    int image=1;
+    ImageLifetime<int> lifetime;
+    auto old=lifetime.token(&image);
+    check(ImageLifetime<int>::resolve(old)==&image);
+    lifetime.retire();
+    check(ImageLifetime<int>::resolve(old)==nullptr);
+    auto next=lifetime.token(&image);
+    check(ImageLifetime<int>::resolve(next)==&image&&ImageLifetime<int>::resolve(old)==nullptr);
     SegmentTable<uint32_t,uint32_t> lazy;
     unsigned constructed=0;
     for(unsigned i=0;i<1000;++i){const auto [value,added]=lazy.get_or_insert(17,[&]{++constructed;return 123u;});check(value==123&&added==(i==0));}

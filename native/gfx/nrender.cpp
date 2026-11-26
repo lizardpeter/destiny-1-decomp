@@ -17,6 +17,7 @@
 #include "native_descriptor_slots.h"
 #include "native_texture_identity.h"
 #include "native_mip_source.h"
+#include "native_image_lifetime.h"
 #include "native_texture_leases.h"
 #include "native_epoch_cohort.h"
 #include "native_draw_batch.h"
@@ -325,6 +326,7 @@ struct ViewHandle {
 };
 
 struct Image {
+    ImageLifetime<Image> lifetime;
     VkImage image = VK_NULL_HANDLE;
     Alloc mem;
     VkFormat format = VK_FORMAT_UNDEFINED;
@@ -1287,6 +1289,8 @@ struct Renderer {
     uint64_t par_runs = 0, par_draws = 0;
     uint64_t native_stage_reuse=0,inline_run_draws=0,inline_runs=0;
     uint64_t native_view_cache_hits=0,native_view_cache_misses=0;
+    uint64_t t_pre_writes=0,t_pre_views=0,t_pre_geometry=0,t_run_resolve=0,t_run_feedback=0,
+             t_run_worker_wall=0,t_run_worker_wait=0;
     uint64_t native_geometry_bindings=0;
     uint64_t batched_draws=0,indirect_batches=0;
     void start_workers();
@@ -1865,6 +1869,7 @@ uint64_t Renderer::oldest_ring() const {
 
 void Renderer::bury(std::unique_ptr<Image> img) {
     if (!img) return;
+    img->lifetime.retire();
     std::lock_guard lk(grave_m);
     grave.push_back({submit_seq.load(), std::move(img), {}});
 }
@@ -2084,6 +2089,7 @@ void Renderer::free_bindless_view(uint16_t id, uint8_t dim, uint8_t kind) {
 
 void Renderer::destroy_image(Image* img) {
     if (!img) return;
+    img->lifetime.retire();
     for (auto& [k, v] : img->views) {
         if (v.id) free_bindless_view(v.id, v.dim, v.kind);
         if (v.view) vkDestroyImageView(ctx.device, v.view, nullptr);
@@ -4407,9 +4413,14 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
             for (size_t i = 0; i < n; ++i) draw(*run[i]);
             return;
         }
-    feedback_snapshots(run, n, colors, depth, true);
-    resolve_draw_resources(run, n);
-    begin_pass(colors, depth, true);
+    const uint64_t t_feedback=now_ns();
+    feedback_snapshots(run,n,colors,depth,true);
+    const uint64_t t_resolve=now_ns();
+    resolve_draw_resources(run,n);
+    const uint64_t t_workers=now_ns();
+    t_run_feedback+=t_resolve-t_feedback;
+    t_run_resolve+=t_workers-t_resolve;
+    begin_pass(colors,depth,true);
     rc().pass_secondary = true;
     VkFormat cfmt[8]{};
     uint32_t ncolor = 0;
@@ -4450,11 +4461,14 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
     }
     wk.cv.notify_all();
     slice(0);
+    const uint64_t t_wait=now_ns();
     {
         std::unique_lock lk(wk.m);
-        wk.done_cv.wait(lk, [&] { return wk.pending == 0; });
+        wk.done_cv.wait(lk,[&]{return wk.pending==0;});
     }
-    vkCmdExecuteCommands(rc().cmd, T, cbs.data());
+    t_run_worker_wait+=now_ns()-t_wait;
+    vkCmdExecuteCommands(rc().cmd,T,cbs.data());
+    t_run_worker_wall+=now_ns()-t_workers;
     for (const Rec& r : recs) merge(r);
     rc().dstate.valid = false;  // (the primary's bindings and dynamic state are undefined after secondaries)
     rc().dstate.stage_valid[0] = rc().dstate.stage_valid[1] = false;
@@ -5532,6 +5546,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     // resources first (copies cannot run inside a render pass): targets, then textures
     // (each distinct target set and T# once per submission: thousands of draws share a few)
     const uint64_t t_tgt0 = now_ns();
+    t_pre_writes+=t_tgt0-tp;
     const Draw* prev_d = nullptr;
     for (size_t i = 0; i < count; ++i) {
         Draw* d = draws[i];
@@ -5543,20 +5558,22 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         for (int i = 0; i < 5; ++i) color_target(d->color[i], false);
         depth_target(d->depth, false);
     }
-    st.t_tgt += now_ns() - t_tgt0;
-    struct Seen { uint64_t key, sub, res; const uint32_t* words; ViewHandle native; };
+    const uint64_t t_views=now_ns();
+    st.t_tgt+=t_views-t_tgt0;
+    struct Seen { uint64_t key, sub, res; const uint32_t* words; ViewHandle native; bool resolved=false; };
     static thread_local std::vector<Seen> seen(1u << 13);
     // Persistent material-view cache across ordered segments. Registered
-    // assets have no target dependencies. Generation invalidation precedes
-    // image retirement; source epoch and every view word must still match.
+    // assets have no target dependencies. Each image owns a lifetime token
+    // invalidated before retirement; unrelated uploads do not flush the cache.
+    // Source epoch and every view word must still match.
     struct NativeView {
         const Renderer* owner=nullptr;
-        uint64_t key=0,res=0,gen=0;
+        uint64_t key=0,res=0;
         uint32_t words[8]{};
-        Image* image=nullptr;
+        ImageLifetime<Image>::Token lifetime;
         ViewHandle view{};
     };
-    static thread_local std::vector<NativeView> native_views(1u<<14);
+    static thread_local std::vector<NativeView> native_views(1u<<16);
     // A submission can contain several resource-write boundaries. A descriptor
     // seen before one of them must be checked again in the next segment.
     static thread_local uint64_t preparation_epoch = 0;
@@ -5572,8 +5589,10 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         d->native_tex_ready[0]=d->native_tex_ready[1]=0;
         d->native_geo_mask=0;
         d->tex_filter_mask[0]=d->tex_filter_mask[1]=0;
+        // A registered descriptor has one authoritative resolution per
+        // ordered segment, including a failed resolution. The recording path
+        // must not repeat thousands of lookups for the same missing image.
         auto use_native=[&](int stage,uint32_t slot,const ViewHandle& vh){
-            if(!vh.id)return;
             const uint16_t bit=uint16_t(1u<<slot);
             d->native_tex_ready[stage]|=bit;
             d->tex_view[stage][slot]=vh.id;
@@ -5611,23 +5630,26 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                         if(e.sub!=epoch){if(!vacant)vacant=&e;continue;}
                         if(e.key==k&&e.res==res&&std::memcmp(e.words,t,32)==0){already=&e;break;}
                     }
-                    if(already){use_native(s,i,already->native);continue;}
+                    if(already){if(already->resolved)use_native(s,i,already->native);continue;}
                     if(!vacant)vacant=&seen[home];
-                    *vacant={k,epoch,res,t,{}};
+                    *vacant={k,epoch,res,t,{},false};
                     NativeView* cache=nullptr;
                     if(res&&!rc().lr){
-                        cache=&native_views[k&(native_views.size()-1)];
-                        const uint64_t gen=views_gen.load(std::memory_order_relaxed);
-                        if(cache->owner==this&&cache->key==k&&cache->res==res&&cache->gen==gen&&
-                           cache->image&&cache->view.id&&std::memcmp(cache->words,t,32)==0&&
-                           cache->image->matches_epoch(t,res)){
-                            cache->image->last_used=rc().submit_no;
-                            cache->image->last_frame=st.frames;
-                            vacant->native=cache->view;
-                            use_native(s,i,cache->view);
-                            ++native_view_cache_hits;
-                            continue;
+                        const size_t home=k&(native_views.size()-4);
+                        cache=&native_views[home+((k>>16)&3)];
+                        for(size_t probe=0;probe<4;++probe){
+                            auto& entry=native_views[home+probe];
+                            auto* img=ImageLifetime<Image>::resolve(entry.lifetime);
+                            if(!img)cache=&entry;
+                            if(entry.owner==this&&entry.key==k&&entry.res==res&&
+                               img&&entry.view.id&&std::memcmp(entry.words,t,32)==0&&img->matches_epoch(t,res)){
+                                img->last_used=rc().submit_no;img->last_frame=st.frames;
+                                vacant->native=entry.view;vacant->resolved=true;
+                                use_native(s,i,entry.view);++native_view_cache_hits;
+                                break;
+                            }
                         }
+                        if(vacant->resolved)continue;
                         ++native_view_cache_misses;
                     }
                     const uint64_t b = fmt::decode_tsharp(t).base;
@@ -5641,14 +5663,16 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                         // Registered assets do not alias transient attachments.
                         // Resolve their native sampled handle once in this
                         // ordered preparation segment; recording uses it directly.
-                        if(res&&image&&!rc().lr){
+                        if(res&&!rc().lr){
                             vacant->native=texture_view(t,slot_dim(t),res,image);
+                            vacant->resolved=true;
                             use_native(s,i,vacant->native);
-                            if(cache&&vacant->native.id&&image->matches_epoch(t,res)){
+                            auto* resident=tv_texture;
+                            if(cache&&resident&&vacant->native.id&&resident->matches_epoch(t,res)){
                                 cache->owner=this;cache->key=k;cache->res=res;
-                                cache->gen=views_gen.load(std::memory_order_relaxed);
                                 std::memcpy(cache->words,t,32);
-                                cache->image=image;cache->view=vacant->native;
+                                cache->lifetime=resident->lifetime.token(resident);
+                                cache->view=vacant->native;
                             }
                         }
                     }
@@ -5657,6 +5681,8 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         prior=d;
     }
     flush_uploads();
+    const uint64_t t_geometry=now_ns();
+    t_pre_views+=t_geometry-t_views;
     if (local_geometry_enabled() && !rc().lr && !(debug_toggles() & 8)) {
         // Prepare each exact resource epoch/range once per ordered segment, before
         // any graphics secondary begins. Different versions remain distinct.
@@ -5711,7 +5737,8 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
             vkCmdPipelineBarrier2(rc().cmd, &di);
         }
     }
-    st.t_pre += now_ns() - tp;
+    const uint64_t end=now_ns();
+    t_pre_geometry+=end-t_geometry;st.t_pre+=end-tp;
 }
 
 void Renderer::run_inline(Draw* const* run,size_t n){
@@ -7631,6 +7658,10 @@ void print_stats() {
     log("native renderer: persistent native material views: %llu hits, %llu misses",
         (unsigned long long)g->native_view_cache_hits,(unsigned long long)g->native_view_cache_misses);
     g->native_view_cache_hits=g->native_view_cache_misses=0;
+    log("native renderer: CPU detail ms/frame: writes %.2f, material preparation %.2f, geometry preparation %.2f, feedback %.2f, run binding resolution %.2f, worker wall %.2f (wait %.2f)",
+        g->t_pre_writes/f/1e6,g->t_pre_views/f/1e6,g->t_pre_geometry/f/1e6,
+        g->t_run_feedback/f/1e6,g->t_run_resolve/f/1e6,g->t_run_worker_wall/f/1e6,g->t_run_worker_wait/f/1e6);
+    g->t_pre_writes=g->t_pre_views=g->t_pre_geometry=g->t_run_feedback=g->t_run_resolve=g->t_run_worker_wall=g->t_run_worker_wait=0;
     log("native renderer: %llu prepared native geometry bindings consumed without recording-thread resource lookup",(unsigned long long)g->native_geometry_bindings);
     g->native_geometry_bindings=0;
     log("native renderer: grouped queue submissions %llu, driver calls avoided %llu",(unsigned long long)g->grouped_submissions,(unsigned long long)g->queue_calls_saved);
