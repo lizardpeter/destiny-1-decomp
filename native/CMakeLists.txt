@@ -120,3 +120,7 @@ add_test(NAME native-list-tokens COMMAND native-list-tokens-test)
 add_executable(frame-time-contract-test tests/frame_time_contract_test.cpp)
 target_include_directories(frame-time-contract-test PRIVATE src)
 add_test(NAME frame-time-contract COMMAND frame-time-contract-test)
+
+add_executable(native-ranges-test tests/native_ranges_test.cpp)
+target_include_directories(native-ranges-test PRIVATE src)
+add_test(NAME native-ranges COMMAND native-ranges-test)
