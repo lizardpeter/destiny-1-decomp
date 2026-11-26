@@ -7659,8 +7659,8 @@ void print_stats() {
         (unsigned long long)g->native_view_cache_hits,(unsigned long long)g->native_view_cache_misses);
     g->native_view_cache_hits=g->native_view_cache_misses=0;
     log("native renderer: CPU detail ms/frame: writes %.2f, material preparation %.2f, geometry preparation %.2f, feedback %.2f, run binding resolution %.2f, worker wall %.2f (wait %.2f)",
-        g->t_pre_writes/f/1e6,g->t_pre_views/f/1e6,g->t_pre_geometry/f/1e6,
-        g->t_run_feedback/f/1e6,g->t_run_resolve/f/1e6,g->t_run_worker_wall/f/1e6,g->t_run_worker_wait/f/1e6);
+        g->t_pre_writes/fr/1e6,g->t_pre_views/fr/1e6,g->t_pre_geometry/fr/1e6,
+        g->t_run_feedback/fr/1e6,g->t_run_resolve/fr/1e6,g->t_run_worker_wall/fr/1e6,g->t_run_worker_wait/fr/1e6);
     g->t_pre_writes=g->t_pre_views=g->t_pre_geometry=g->t_run_feedback=g->t_run_resolve=g->t_run_worker_wall=g->t_run_worker_wait=0;
     log("native renderer: %llu prepared native geometry bindings consumed without recording-thread resource lookup",(unsigned long long)g->native_geometry_bindings);
     g->native_geometry_bindings=0;
