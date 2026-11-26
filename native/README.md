@@ -116,16 +116,14 @@ engine-side patch (not done yet).
 | `D1_NET_ID=<n>` | run as console 10.0.2.`<n>` (4..254): sockets bind to 127.0.0.`<n>`, so several instances on one PC reach each other (co-op testing) |
 | `D1_PEEK=off,*off` / `D1_POKE=secs:off+delta=value;…` | research aids: dump / write eboot-relative memory (`*` dereferences a pointer) |
 
-Native renderer (`native/gfx`):
+Native renderer (`native/gfx`): the native asset loader and resource registry are mandatory. Static geometry uses exact-epoch ownership and ordered device-local preparation; diagnostics cannot disable that lifetime contract.
 
 | env | effect |
 |---|---|
 | `D1_GPU=<n>` | use the n-th Vulkan device |
 | Legacy frame skipping | Removed: all submitted frames execute on the native renderer; no fabricated occlusion results |
-| `D1_NG_NOCACHE=1` | no geometry cache and no texture change tracking |
 | Native device | Required; startup fails if the native renderer or required device hooks cannot be installed. The retail submit boundary associates engine record addresses with native lists, not packet tokens |
 | Early recording | Retail device adapter now records only in actual submit order, including the original close-time completion labels. Parallel native secondary command recording remains enabled |
-| `D1_NG_PREFETCH=0` | engine resources are uploaded at their first draw instead of on the renderer's loader thread when the engine binds or moves them (default). The log's "loader" line counts uploads ahead of use, moves kept and work dropped because the resource changed again |
 | `D1_NG_DYNAMIC_COPY=0` | memory that is no engine resource (dynamic vertex / index buffers, dynamic textures, small render targets the CPU rewrites) is write-tracked again instead of following the engine's own write announcements (texture unlocks, copy-queue writes); default: nothing is write-protected, 0 write faults |
 | `D1_NG_VERIFY_DYN=1` / `D1_NG_LOG_FAULTS=1` / `D1_ND_LOG_UNLOCK=1` / `D1_ND_LOG_UNREG=1` | (testing) hash dynamic textures at every use and report changes without an event / write faults by writing code address / dynamic texture unlocks / vertex buffers that are no engine resource |
 | `D1_NG_RECOPY=0` | (testing) dynamic vertices, indices and constants a recorded list copied are not copied again when the list is submitted |
