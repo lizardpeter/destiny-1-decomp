@@ -1662,10 +1662,6 @@ void native_device_execute_submit(NativeSubmission* batch) {
     for (nd::List* l : lists) nd::free_list(l);
 }
 
-void native_device_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
-    native_device_execute_submit(native_device_capture_submit(count, dcbs, sizes));
-}
-
 void native_gfx_flip(void* addr, uint32_t width, uint32_t height) {
     if (!nr::g_base || !ng::active()) return;
     if (nr::g_frame_executed) {

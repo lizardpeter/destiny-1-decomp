@@ -365,15 +365,7 @@ bool native_device_active();
 struct NativeSubmission;
 NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes);
 void native_device_execute_submit(NativeSubmission* batch);
-void native_device_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes);
 void gnm_signal_eop() { signal_eop(); }
-static void submit_now(uint32_t count, uint32_t* const* dcbs, const uint32_t* dcb_sizes) {
-    if (!native_device_active()) {
-        log("native GPU: submit attempted without an installed native device");
-        std::abort();
-    }
-    native_device_submit(count, dcbs, dcb_sizes);
-}
 
 namespace gpuq {
 struct Job {
@@ -449,24 +441,6 @@ void push(Job&& j) {
     lk.unlock();
     cv.notify_one();
 }
-void capture_submit(Job& j, uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
-    if (!native_device_active()) {
-        log("native GPU: queued submit attempted without an installed native device");
-        std::abort();
-    }
-    j.native = native_device_capture_submit(count, dcbs, sizes);
-}
-void push_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
-    Job j;
-    capture_submit(j, count, dcbs, sizes);
-    push(std::move(j));
-}
-void push_submit_and_flip(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes, int32_t buf, int64_t arg) {
-    Job j;
-    capture_submit(j, count, dcbs, sizes);
-    j.flip = true, j.buf = buf, j.arg = arg;
-    push(std::move(j));
-}
 void push_flip(int32_t buf, int64_t arg) {
     Job j;
     j.flip = true, j.buf = buf, j.arg = arg;
@@ -498,8 +472,11 @@ void native_queue_submit(NativeSubmission* batch,bool flip,int32_t buffer,int64_
 }
 
 static int32_t submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* dcb_sizes) {
-    if (gpuq::enabled()) gpuq::push_submit(count, dcbs, dcb_sizes);
-    else submit_now(count, dcbs, dcb_sizes);
+    if(!native_device_active()) {
+        log("native GPU: submit attempted without an installed native device");
+        std::abort();
+    }
+    native_queue_submit(native_device_capture_submit(count,dcbs,dcb_sizes),false,-1,0);
     return SCE_OK;
 }
 
@@ -511,6 +488,10 @@ HLE("sceGnmSubmitCommandBuffers", sceGnmSubmitCommandBuffers)
 static int32_t sceGnmSubmitAndFlipCommandBuffers(uint32_t count, uint32_t* const* dcbs, const uint32_t* dcb_sizes,
                                                  uint32_t* const* ccbs, const uint32_t* ccb_sizes, uint32_t,
                                                  uint32_t buf, uint32_t, int64_t arg) {
+    if(!native_device_active()) {
+        log("native GPU: flip attempted without an installed native device");
+        std::abort();
+    }
     native_queue_submit(native_device_capture_submit(count, dcbs, dcb_sizes),true,int32_t(buf),arg);
     return SCE_OK;
 }
