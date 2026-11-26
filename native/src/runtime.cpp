@@ -382,6 +382,8 @@ static size_t patch_fs_tcb(Module& m) {
 }
 
 // ------------------------------------------------------------------ linker
+void* native_libc_leaf(const std::string& nid); // pc_libc_imports.cpp
+
 void link_all() {
     auto& mods = rt().modules;
     int next_modid = 1;
@@ -408,7 +410,9 @@ void link_all() {
     for (auto& [nid, name] : kImportNames) names[nid] = name;
 
     std::map<std::string, void*> thunk_cache;  // key importer|nid|lib
-    size_t n_game = 0, n_hle = 0, n_unimpl = 0, n_obj = 0;
+    size_t n_game = 0, n_hle = 0, n_unimpl = 0, n_obj = 0, n_native_libc = 0;
+    const char* leaf_mode = getenv("D1_PC_LIBC_LEAVES");
+    const bool native_leaves = !leaf_mode || std::atoi(leaf_mode) != 0;
     for (auto& m : mods) {
         for (auto& r : m.relas) {
             auto* where = reinterpret_cast<uint64_t*>(m.base + r.offset);
@@ -441,7 +445,18 @@ void link_all() {
                 }
                 const bool is_object = (s.info & 0xF) == 1;
                 std::string key = m.name + "|" + nid + "|" + lib;
-                if (auto ex = exports.find({nid, lib}); ex != exports.end()) {
+                void* leaf = native_leaves && lib == "libc" && !is_object ? native_libc_leaf(nid) : nullptr;
+                if (leaf) {
+                    auto& t = thunk_cache[key];
+                    if (!t) {
+                        auto nm = names.find(nid);
+                        auto* ii = new ImportInfo{nm != names.end() ? nm->second : nid, lib, m.name, leaf};
+                        g_imports.push_back(ii);
+                        t = make_thunk(g_imports.size() - 1, leaf);
+                    }
+                    value = reinterpret_cast<uint64_t>(t);
+                    ++n_native_libc;
+                } else if (auto ex = exports.find({nid, lib}); ex != exports.end()) {
                     value = ex->second;
                     ++n_game;
                 } else if (auto h = hle.find(nid); h != hle.end()) {
@@ -488,8 +503,8 @@ void link_all() {
             m.name.c_str(), m.base, m.size, m.entry ? describe_addr(m.entry).c_str() : "-",
             m.init ? describe_addr(m.init).c_str() : "-", m.tls_modid, m.tls_memsz, p);
     }
-    log("imports: %zu game-module, %zu HLE, %zu unimplemented (logging stubs), %zu data placeholders", n_game,
-        n_hle, n_unimpl, n_obj);
+    log("imports: %zu game-module, %zu native libc leaf relocations, %zu HLE, %zu unimplemented (logging stubs), %zu data placeholders",
+        n_game, n_native_libc, n_hle, n_unimpl, n_obj);
 }
 
 // ------------------------------------------------------------------ crash reporting
