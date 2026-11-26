@@ -98,6 +98,7 @@ struct ImportInfo {
     std::string importer; // module that imports it
     void* target;         // HLE function (traced) or nullptr (unimplemented)
     std::atomic<uint64_t> calls{0};
+    bool fios_trace = false;
 };
 static std::vector<ImportInfo*> g_imports;
 
@@ -117,6 +118,11 @@ extern "C" D1_SYSV void d1_log_call(uint64_t idx, uint64_t* regs) {
     uint64_t n = ii->calls.fetch_add(1);
     uint64_t s = g_seq.fetch_add(1);
     g_ring[s % kRing] = {s, uint32_t(idx), gettid32(), regs[0], regs[1], regs[2]};
+    if (ii->fios_trace && n < 32)
+        log("fios trace: [%u] %s:%s #%llu args=%#llx,%#llx,%#llx,%#llx,%#llx,%#llx",
+            gettid32(), ii->importer.c_str(), ii->name.c_str(), (unsigned long long)n,
+            (unsigned long long)regs[0], (unsigned long long)regs[1], (unsigned long long)regs[2],
+            (unsigned long long)regs[3], (unsigned long long)regs[4], (unsigned long long)regs[5]);
     if (g_trace_all || (!ii->target && n < 3))
         log("[%u] %s %s(%#llx, %#llx, %#llx)%s", gettid32(), ii->target ? "call" : "UNIMPL",
             ii->name.c_str(), regs[0], regs[1], regs[2], ii->target ? "" : " -> 0");
@@ -186,11 +192,12 @@ static uint8_t* g_thunk_mem = nullptr;
 static size_t g_thunk_used = 0;
 static constexpr size_t kThunkArea = 4 << 20;
 
-static void* make_thunk(uint64_t idx, void* target) {
+static void* make_thunk(uint64_t idx, void* target, bool force_trace = false) {
     if (!g_thunk_mem) {
         g_thunk_mem = static_cast<uint8_t*>(os::alloc(0, kThunkArea, os::kRead | os::kWrite | os::kExec, false));
         if (!g_thunk_mem) throw std::runtime_error("cannot allocate import thunks");
     }
+    if (g_thunk_used > kThunkArea - 48) throw std::runtime_error("import thunk area exhausted");
     uint8_t* p = g_thunk_mem + g_thunk_used;
     // Implemented imports jump straight to their implementation: the logging entry (register
     // save, two shared atomic counters, the crash-report ring) costs on every one of the
@@ -198,7 +205,7 @@ static void* make_thunk(uint64_t idx, void* target) {
     // a cache line between all game threads. D1_TRACE / D1_CALL_STATS=1 keep the logging
     // entry (call ring in crash reports, import call counts).
     static const bool slow = getenv("D1_TRACE") || getenv("D1_CALL_STATS") || getenv("D1_ABORT_ON_UNIMPL");
-    if (target && !slow) {
+    if (target && !slow && !force_trace) {
         uint8_t code[] = {0xFF, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};  // jmp [rip+0] ; dq target
         uint64_t t = reinterpret_cast<uint64_t>(target);
         std::memcpy(code + 6, &t, 8);
@@ -415,6 +422,7 @@ void link_all() {
     const bool native_leaves = !leaf_mode || std::atoi(leaf_mode) != 0;
     const char* math_mode = getenv("D1_PC_LIBC_MATH");
     const bool native_math = math_mode && std::atoi(math_mode) != 0;
+    const bool trace_fios = getenv("D1_FIOS_TRACE") != nullptr;
     for (auto& m : mods) {
         for (auto& r : m.relas) {
             auto* where = reinterpret_cast<uint64_t*>(m.base + r.offset);
@@ -460,6 +468,20 @@ void link_all() {
                     ++n_native_libc;
                 } else if (auto ex = exports.find({nid, lib}); ex != exports.end()) {
                     value = ex->second;
+                    // Only instrument original FIOS function imports. Keep data
+                    // relocations and all other original exports untouched.
+                    if (trace_fios && lib == "libSceFios2" && !is_object && r.type == 7) {
+                        auto& t = thunk_cache[key];
+                        if (!t) {
+                            auto nm = names.find(nid);
+                            auto* ii = new ImportInfo{nm != names.end() ? nm->second : nid, lib, m.name,
+                                                      reinterpret_cast<void*>(value)};
+                            ii->fios_trace = true;
+                            g_imports.push_back(ii);
+                            t = make_thunk(g_imports.size() - 1, ii->target, true);
+                        }
+                        value = reinterpret_cast<uint64_t>(t);
+                    }
                     ++n_game;
                 } else if (auto h = hle.find(nid); h != hle.end()) {
                     if (h->second->object) {
