@@ -278,6 +278,16 @@ bool guest_matches_current_mapping(uint64_t addr,uint64_t size,uint64_t identity
                             host_prot(r->second.prot),os::kRead)&&
            std::memcmp(reinterpret_cast<const void*>(addr),snapshot,size)==0;
 }
+bool guest_move_current_mapping(uint64_t dst,uint64_t src,uint64_t size,uint64_t dst_id,uint64_t src_id) {
+    std::lock_guard lk(g_mem_mutex);
+    const auto* d=region_of(dst);
+    const auto* s=region_of(src);
+    if(!d||!s||
+       !mapping_allows(d->first,d->second.size,d->second.identity,dst,size,dst_id,host_prot(d->second.prot),os::kWrite)||
+       !mapping_allows(s->first,s->second.size,s->second.identity,src,size,src_id,host_prot(s->second.prot),os::kRead))return false;
+    std::memmove(reinterpret_cast<void*>(dst),reinterpret_cast<const void*>(src),size);
+    return true;
+}
 bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
                                  void (*write)(void*, void*), void* context) {
     if (!identity || !size || !write) return false;

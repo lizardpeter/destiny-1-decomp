@@ -365,6 +365,7 @@ ng::Draw* alloc_draw() {
     d->kind = ng::Draw::Auto, d->prim = 4, d->index32 = 0, d->clear_flags = 0;
     d->count = 0, d->instances = 1, d->index_addr = 0, d->order = 0, d->seq = 0, d->frame = 0, d->caller = 0;
     d->vs = d->ps = nullptr, d->num_vb = 0;
+    d->dma_src_mapping=d->dma_dst_mapping=0;d->dma_checked=false;
     d->shader_res[0] = d->shader_res[1] = 0;
     std::memset(d->vb, 0, sizeof d->vb);
     for (auto& r : d->vres) r = {};
@@ -638,6 +639,79 @@ D1_SYSV bool h_blit_enqueue(uint64_t dst,uint64_t src,uint32_t size,uint64_t cal
     __atomic_exchange_n(reinterpret_cast<uint32_t*>(record),1u,__ATOMIC_SEQ_CST);
     return true;
 }
+// Batch operations retain the engine's device selection, reset and label
+// ABI, but issue one ordered native copy instead of console DMA fragments.
+uint64_t blit_device(){
+    using DeviceFn=D1_SYSV uint64_t(*)(uint64_t);
+    return reinterpret_cast<DeviceFn>(nr::g_base+0x7E3A00)(nr::eb<uint64_t>(0x26E2BE8));
+}
+void blit_begin_device(uint64_t dev) {
+    using VoidFn=D1_SYSV void(*)(uint64_t);
+    using BeginFn=D1_SYSV uint64_t(*)(uint64_t);
+    reinterpret_cast<VoidFn>(nr::g_base+0x7DCAA0)(dev);
+    reinterpret_cast<BeginFn>(nr::g_base+0x7DCCE0)(dev);
+    reinterpret_cast<VoidFn>(nr::g_base+0x7DCAF0)(dev);
+}
+void blit_close_device(uint64_t dev) {
+    using CloseFn=D1_SYSV void(*)(uint64_t,uint64_t,uint64_t);
+    using DrainFn=D1_SYSV bool(*)(uint64_t);
+    reinterpret_cast<CloseFn>(nr::g_base+0x7DCEC0)(dev,0,0);
+    reinterpret_cast<DrainFn>(nr::g_base+0x7DD060)(dev);
+}
+D1_SYSV void h_blit_batch_begin(void* batch) {
+    using namespace ng::binding;
+    store(batch,0,__atomic_fetch_add(reinterpret_cast<uint32_t*>(nr::g_base+0x26DF280),1u,__ATOMIC_SEQ_CST));
+    store(batch,4,uint32_t(0));
+    if(!load<uint32_t>(batch,8)){
+        blit_begin_device(blit_device());
+        store(batch,12,uint16_t(0));store(batch,14,uint8_t(1));
+    }
+}
+D1_SYSV void h_blit_issue(void* batch,void* record) {
+    using namespace ng::binding;
+    const int32_t size=load<int32_t>(record,0x18);
+    if(size>0){
+        const auto dev=blit_device();
+        const bool owns_list=load<uint32_t>(batch,8)==0;
+        if(owns_list&&load<uint8_t>(batch,12)){
+            blit_begin_device(dev);
+            store(batch,12,uint16_t(0));store(batch,14,uint8_t(1));
+        }
+        const uint64_t cb=field<uint64_t>(dev,0x50);
+        if(!cb){log("nd: blitter has no active native list");std::abort();}
+        // 0xF8F3A0 is already replaced by the native device's ordered DMA
+        // capture. A host memmove handles both overlap directions correctly.
+        using CopyFn=D1_SYSV void(*)(uint64_t,uint64_t,uint64_t,uint32_t,uint32_t);
+        reinterpret_cast<CopyFn>(nr::g_base+0xF8F3A0)(cb,load<uint64_t>(record,8),load<uint64_t>(record,0x10),uint32_t(size),1);
+        const uint32_t count=load<uint32_t>(batch,4);
+        store(batch,4,count+1);
+        if(count>=4000)store(batch,13,uint8_t(1));
+        if(owns_list&&load<uint8_t>(batch,13)){
+            blit_close_device(dev);
+            store(batch,13,uint8_t(0));store(batch,4,uint32_t(0));
+            blit_begin_device(dev);
+            store(batch,12,uint8_t(0));store(batch,14,uint8_t(1));
+        }
+    }
+    store(record,0x3c,uint8_t(1));
+    store(record,0x38,load<uint32_t>(batch,0));
+}
+D1_SYSV void h_blit_batch_end(void* batch) {
+    using namespace ng::binding;
+    const auto dev=blit_device();
+    const uint64_t cb=field<uint64_t>(dev,0x50);
+    if(!cb){log("nd: blitter completion has no active list");std::abort();}
+    using LabelFn=D1_SYSV void(*)(uint64_t,uint32_t,uint32_t,uint64_t,uint32_t,uint64_t,uint32_t,uint32_t);
+    const uint64_t label=nr::eb<uint64_t>(0x26DF288);
+    const uint64_t sequence=uint64_t(int64_t(load<int32_t>(batch,0)));
+    reinterpret_cast<LabelFn>(nr::g_base+0xF80C90)(cb,4,0,label,1,sequence,0,0);
+    if(!load<uint32_t>(batch,8)){
+        blit_close_device(dev);
+        using ResetFn=D1_SYSV void(*)(uint64_t);
+        reinterpret_cast<ResetFn>(nr::g_base+0x7DCAA0)(dev);
+        store(batch,12,uint8_t(1));store(batch,14,uint8_t(0));store(batch,13,uint8_t(0));store(batch,4,uint32_t(0));
+    }
+}
 // The original blitter has a single consumer, which first issues a
 // ready prefix and later retires the completed prefix. Keep that contract
 // and the original batch device/label operations until they are migrated.
@@ -848,6 +922,9 @@ void install() {
         ok &= replace_eboot_function(0x7DA960,reinterpret_cast<const void*>(&h_blit_enqueue));
         ok &= replace_eboot_function(0x7DACF0,reinterpret_cast<const void*>(&h_blit_submit));
         ok &= replace_eboot_function(0x7DAB10,reinterpret_cast<const void*>(&h_blit_complete));
+        ok &= replace_eboot_function(0x7DB2D0,reinterpret_cast<const void*>(&h_blit_batch_begin));
+        ok &= replace_eboot_function(0x7DB340,reinterpret_cast<const void*>(&h_blit_issue));
+        ok &= replace_eboot_function(0x7DB4B0,reinterpret_cast<const void*>(&h_blit_batch_end));
     }
     ok &= hook(0x82B490, &h_tech_a, o_tech_a, "tfx_technique_apply_a");
     ok &= hook(0x82B5C0, &h_tech_b, o_tech_b, "tfx_technique_apply_b");
@@ -1368,6 +1445,11 @@ D1_SYSV void s_dma(uint64_t cb, uint64_t dst, uint64_t src, uint32_t bytes) {
     ng::Draw* d = nr::alloc_draw();
     d->kind = ng::Draw::Dma;
     d->index_addr = src, d->caller = dst, d->count = bytes, d->prim = 0, d->index32 = 0;
+    if(resev::native_bind_enabled()){
+        d->dma_checked=true;
+        d->dma_src_mapping=guest_mapping_identity(src,bytes);
+        d->dma_dst_mapping=guest_mapping_identity(dst,bytes);
+    }
     add(c, d);
 }
 D1_SYSV void s_set_cbs(uint64_t cue, uint32_t stage, uint32_t first, uint32_t count, const uint32_t* vs) {

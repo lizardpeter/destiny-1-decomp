@@ -29,6 +29,9 @@ struct Draw {
     uint32_t seq = 0;
     uint32_t frame = 0;         // video-out flip count when recorded
     uint64_t caller = 0;        // engine call site (diagnostics)
+    // Ordered native copies optionally capture the actual host mapping lifetimes.
+    uint64_t dma_src_mapping = 0, dma_dst_mapping = 0;
+    bool dma_checked = false;
     const uint8_t* vs = nullptr;  // engine vertex shader object (fetch shader size/address, Gnm VsShader at +0x14)
     const uint8_t* ps = nullptr;  // Gnm PsShader
     uint64_t shader_res[kStages] = {}; // resource epoch at native preparation (0: unregistered)

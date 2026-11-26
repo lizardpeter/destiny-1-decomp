@@ -820,8 +820,16 @@ struct Renderer {
                 }
                 continue;
             }
-            if (d->kind != Draw::Dma || d->caller < 0x10000 || guest_region_extent(d->caller) < d->count) continue;
-            if (d->prim == 2) {
+            if (d->kind != Draw::Dma)continue;
+            if(d->dma_checked){
+                if(!guest_move_current_mapping(d->caller,d->index_addr,d->count,d->dma_dst_mapping,d->dma_src_mapping)){
+                    log("native renderer: rejected expired or invalid ordered copy %#llx -> %#llx (%u bytes)",
+                        (unsigned long long)d->index_addr,(unsigned long long)d->caller,d->count);
+                    // Completion callbacks must not claim a copy succeeded.
+                    std::abort();
+                }
+            } else if (d->caller < 0x10000 || guest_region_extent(d->caller) < d->count) continue;
+            else if (d->prim == 2) {
                 auto* w = reinterpret_cast<uint32_t*>(d->caller);
                 for (uint32_t k = 0; k < d->count / 4; ++k) w[k] = d->instances;
             } else if (d->index_addr >= 0x10000 && guest_region_extent(d->index_addr) >= d->count) {
