@@ -351,6 +351,7 @@ struct Image {
     bool hi_loaded = false;
     bool stale = false;
     uint64_t bound_serial = 0, last_write_submit = 0;
+    uint64_t target_revision=1, snapshot_revision=0;
     uint64_t descriptor_epoch[2] = {};
     uint32_t resident_descriptor[2][8] = {};
 };
@@ -699,6 +700,7 @@ struct Renderer {
         std::vector<std::pair<Image*, Image*>> snaps;  // (attachment, snapshot)
         // Transfer writes not yet made available to sampling/attachments.
         std::vector<Image*> pending_uploads;
+        std::vector<Image*> written_targets;
         // snapshots that still equal their attachment at this point of this command buffer (no
         // command recorded here since the copy writes it): a later pass samples them uncopied.
         // Per command buffer: lists are recorded in any order but run in submission order.
@@ -754,7 +756,16 @@ struct Renderer {
             if (f[i].img == img && !(f[i].valid &= uint8_t(~aspects))) f[i] = f.back(), f.pop_back();
             else ++i;
     }
-    uint64_t snap_reused = 0;
+    void mark_target_write(Image* img,uint8_t aspects){
+        if(!img||!aspects)return;
+        wrote_target(img,aspects);
+        ++img->target_revision;
+        if(img->last_write_submit!=rc().submit_no){
+            img->last_write_submit=rc().submit_no;
+            rc().written_targets.push_back(img);
+        }
+    }
+    uint64_t snap_reused = 0, snap_cross_submit=0, snap_failed=0;
     ViewHandle target_view(Image* img, const Image* like, const uint32_t* t);
     static bool verify_late() { static const bool v = std::getenv("D1_NG_VERIFY_LATE") != nullptr; return v; }
     void note_copy(uint8_t kind, uint64_t addr, uint64_t size) {
@@ -1514,6 +1525,7 @@ void Renderer::begin_record() {
         vkCmdBindDescriptorSets(sb.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_layout, 0, 1, &bindless_set, 0, nullptr);
     rc().snaps.clear(), rc().snap_key = 0, rc().fresh.clear(), rc().pass_live.clear(), rc().pass_written.clear();
     rc().pending_uploads.clear();
+    rc().written_targets.clear();
     barrier();  // earlier submissions' writes before anything here
 }
 
@@ -2205,8 +2217,12 @@ Image* Renderer::color_target(const uint32_t* c, bool bind) {
         ++st.targets;
     }
     target_bases.insert(base);
-    if (bind || !target_by_base.count(base)) set_base(target_by_base, base, img), img->bound_serial = ++bind_serial;
-    img->last_used = rc().submit_no;
+    if(bind){
+        if(img->swap!=swap){img->swap=swap;++target_views_gen;}
+        set_base(target_by_base,base,img);
+        img->bound_serial=++bind_serial;
+        img->last_used=rc().submit_no;
+    }
     img->bind_slice = std::min(slice, img->d - 1);
     img->tile_mode = c[5] & 0x1F, img->pitch = ((c[1] & 0x7FF) + 1) * 8;
     img->bpp = fmt::data_format(fmt::color_to_data_format(format)).bpp;
@@ -2288,19 +2304,19 @@ Image* Renderer::depth_target(const uint32_t* d, bool bind) {
     const uint64_t read_base = uint64_t(d[2]) << 8;  // Z_READ_BASE
     if (bind) img->bound_serial = ++bind_serial;
     target_bases.insert(base), target_bases.insert(read_base);
-    if (bind || !target_by_base.count(base)) set_base(target_by_base, base, img);
-    if (bind || !target_by_base.count(read_base)) set_base(target_by_base, read_base, img);
+    if(bind)set_base(target_by_base,base,img);
+    if(bind&&read_base)set_base(target_by_base,read_base,img);
     if (sfmt)  // the stencil plane lives at its own address; shaders read it as an 8-bit texture
         for (const uint64_t sb : {uint64_t(d[3]) << 8, uint64_t(d[5]) << 8})
             if (sb && sb != base) {
                 target_bases.insert(sb);
-                if (bind || !stencil_by_base.count(sb)) set_base(stencil_by_base, sb, img);
+                if(bind)set_base(stencil_by_base,sb,img);
                 static std::unordered_set<uint64_t> told;
                 if (told.size() < 32 && told.insert(sb).second)
                     log("native renderer: depth target %llx %ux%u has its stencil at %llx", (unsigned long long)base, w, h,
                         (unsigned long long)sb);
             }
-    img->last_used = rc().submit_no;
+    if(bind)img->last_used=rc().submit_no;
     return img;
 }
 
@@ -3237,7 +3253,8 @@ Image* Renderer::target_for(const fmt::TSharp& ts) {
     Image* best = nullptr;
     if (auto it = images_by_base.find(ts.base); it != images_by_base.end())
         for (Image* c : it->second)
-            if (c->w == ts.width && c->h == ts.height && (!best || c->bound_serial > best->bound_serial)) best = c;
+            if(c->bound_serial&&c->w==ts.width&&c->h==ts.height&&
+               (!best||c->bound_serial>best->bound_serial))best=c;
     return best ? best : img;
 }
 
@@ -4062,9 +4079,11 @@ void Renderer::run_parallel(Draw* const* run, size_t n) {
     for (const Rec& r : recs) merge(r);
     rc().dstate.valid = false;  // (the primary's bindings and dynamic state are undefined after secondaries)
     rc().dstate.stage_valid[0] = rc().dstate.stage_valid[1] = false;
+    // Primary inline graphics state is not legal inside a rendering
+    // instance declared SECONDARY_COMMAND_BUFFERS_BIT.
+    end_pass();
     if (bindless_set && pipe_layout)
         vkCmdBindDescriptorSets(rc().cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_layout, 0, 1, &bindless_set, 0, nullptr);
-    end_pass();
     ++par_runs, par_draws += n;
 }
 
@@ -4158,15 +4177,17 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
     const bool keep = rc().in_pass && rc().snap_key == key;
     for (const Need& x : need) {
         const bool copied = keep && std::any_of(rc().snaps.begin(), rc().snaps.end(), [&](auto& p) { return p.first == x.img; });
-        if (copied || (writes(x.img) & x.asp)) snap_need.push_back(x);
-        else put(rc().pass_live, x.img, x.asp);
+        // Even a nominally read-only attachment has LOAD/STORE operations
+        // in this renderer. Do not sample it in GENERAL while attached.
+        (void)copied;
+        snap_need.push_back(x);
     }
     auto done = [&] {
         for (Image* img : {colors[0], colors[1], colors[2], colors[3], colors[4], colors[5], colors[6], colors[7], depth})
             if (img) {
                 const uint8_t a = writes(img);
                 put(rc().pass_written, img, a);
-                if (a) {wrote_target(img, a);img->last_write_submit=rc().submit_no;}
+                if(a)mark_target_write(img,a);
             }
     };
     if (snap_need.empty()) {
@@ -4190,7 +4211,11 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
         const uint8_t want = x.asp ? x.asp : 3;
         if (f != rc().fresh.end() && si != snap_img.end() && si->second.get() == f->sn && (f->valid & want) == want)
             snaps.push_back({x.img, f->sn}), ++snap_reused;
-        else copy.push_back(x.img);
+        else if(!rc().lr&&si!=snap_img.end()&&si->second&&
+                si->second->snapshot_revision==x.img->target_revision){
+            snaps.push_back({x.img,si->second.get()});
+            ++snap_reused;++snap_cross_submit;
+        }else copy.push_back(x.img);
     }
     if (!copy.empty()) {
         end_pass();  // (copies run outside render passes; the next draw begins the pass again)
@@ -4203,7 +4228,7 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
                     const UpSlot up = to_upload_slot();  // (shared by every list's snapshots of this target)
                     sn = make_image(img->format, img->w, img->h, 1, 1, 1, false, false, img->depth, img->stencil);
                 }
-                if (!sn) continue;
+                if(!sn){++snap_failed;continue;}
                 sn->base = img->base, sn->swap = img->swap;
             }
             VkImageCopy c{};
@@ -4222,6 +4247,7 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
             snaps.push_back({img, sn.get()});
             wrote_target(img);
             rc().fresh.push_back({img, sn.get(), 3});
+            sn->snapshot_revision=rc().lr?0:img->target_revision;
             ++snap_copies;
             if (static const bool lg = std::getenv("D1_NG_LOG_SNAPS"); lg)
                 if (static uint64_t tot = 0; ++tot >= 1000 && tot < 1080)
@@ -4348,17 +4374,6 @@ void Renderer::clear(const Draw& dr) {
     Image* depth = depth_target(dr.depth);
     if (rc().in_pass && rc().pass_key == pass_key_of(colors, depth) && !rc().pass_live.empty()) end_pass();  // (it writes what the pass reads in place)
     begin_pass(colors, depth);
-    // A bind is not a write. Clear only the aspects actually requested.
-    for(unsigned i=0;i<4;++i)
-        if(colors[i]&&(dr.clear_flags>>(2+i)&1)){
-            wrote_target(colors[i]);rc().pass_written.push_back({colors[i],3});
-            colors[i]->last_write_submit=rc().submit_no;
-        }
-    if(depth&&(dr.clear_flags&0xc0)){
-        const uint8_t aspects=uint8_t((dr.clear_flags&0x40?1:0)|(dr.clear_flags&0x80?2:0));
-        wrote_target(depth,aspects);rc().pass_written.push_back({depth,aspects});
-        depth->last_write_submit=rc().submit_no;
-    }
     VkClearAttachment att[6];
     uint32_t n = 0;
     for (uint32_t i = 0; i < 4; ++i)
@@ -4383,6 +4398,19 @@ void Renderer::clear(const Draw& dr) {
     w = std::min(w, rc().pass_w - std::min<uint32_t>(rc().pass_w, uint32_t(x)));
     h = std::min(h, rc().pass_h - std::min<uint32_t>(rc().pass_h, uint32_t(y)));
     if (!w || !h) return;
+    for(unsigned i=0;i<4;++i)
+        if(colors[i]&&(dr.clear_flags>>(2+i)&1)){
+            mark_target_write(colors[i],3);
+            rc().pass_written.push_back({colors[i],3});
+        }
+    const uint8_t aspects=uint8_t((da&VK_IMAGE_ASPECT_DEPTH_BIT?1:0)|
+        ((da&VK_IMAGE_ASPECT_STENCIL_BIT)||(masked_stencil&&stencil_wm)?2:0));
+    if(depth&&aspects){
+        mark_target_write(depth,aspects);
+        rc().pass_written.push_back({depth,aspects});
+    }
+    // An explicit clear changes the starting contents for following draws.
+    rc().snaps.clear();rc().snap_key=0;
     if (st.frames == passlog_frame && !passlog.empty()) ++passlog.back().clears;
     VkClearRect r{{{x, y}, {w, h}}, 0, 1};
     if (n) vkCmdClearAttachments(rc().cmd, n, att, 1, &r);
@@ -5031,9 +5059,12 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                     if (e.key == k && e.sub == epoch) continue;
                     e = {k, epoch};
                     const uint64_t b = fmt::decode_tsharp(t).base;
-                    const bool is_target = !d->tex_res[s][i] && target_bases.count(b) != 0;
-                    if (is_target) tsharp_bases.insert(b);  // (only render target addresses matter there)
-                    if (!is_target || !target_current(b)) {
+                    const bool possible_target=!d->tex_res[s][i]&&target_bases.count(b)!=0;
+                    if(possible_target)tsharp_bases.insert(b);
+                    // Preparing a later attachment must not publish it as
+                    // the owner of memory sampled by an earlier draw.
+                    const bool is_target=possible_target&&(target_by_base.count(b)||stencil_by_base.count(b));
+                    if(!is_target||!target_current(b)){
                         upload_texture(t, d->tex_res[s][i], d->tex_obj[s][i]);
                     }
                 }
@@ -5873,8 +5904,7 @@ void Renderer::queue_readbacks() {
     }();
     if (!max_pix || (debug_toggles() & 4)) return;
     bool any = false;
-    for (auto& [k, up] : targets) {
-        Image* img = up.get();
+    for(Image* img:rc().written_targets){
         // only memory used for nothing else: one target there, never sampled or read as a texture
         if (!img || img->last_used != rc().submit_no || img->depth || img->is3d || img->swap || !img->bpp || img->bpp % 8 ||
             uint64_t(img->w) * img->h > max_pix || !img->base)
@@ -6753,6 +6783,9 @@ void print_stats() {
         log("native renderer: feedback loops: %llu target snapshots copied, %llu reused | texture copies made stale by copy commands %llu, by readbacks %llu, by CPU writes %llu",
             (unsigned long long)g->snap_copies, (unsigned long long)g->snap_reused, (unsigned long long)g->dma_stale,
             (unsigned long long)g->readback_stale, (unsigned long long)g->cpu_stale);
+        log("native renderer: feedback snapshots reused across ordered submissions %llu, allocation failures %llu",
+            (unsigned long long)g->snap_cross_submit,(unsigned long long)g->snap_failed);
+        g->snap_cross_submit=g->snap_failed=0;
         if (const uint64_t expired = g->expired_gpu_results.exchange(0))
             log("native renderer: %llu delayed results rejected (mapping expired or unwritable)", (unsigned long long)expired);
         log("native renderer: texture failures since last report: %llu mapped range, %llu split descriptor, %llu upload, %llu valid low chains retained",
