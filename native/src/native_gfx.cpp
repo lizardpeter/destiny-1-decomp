@@ -1471,7 +1471,7 @@ struct NativeSubmission {
 };
 NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
     auto batch = std::make_unique<NativeSubmission>();
-    std::lock_guard lk(nd::g_lists_m);
+    std::unique_lock lk(nd::g_lists_m);
     for (uint32_t k = 0; k < count; ++k) {
         const uint32_t* p = dcbs[k];
         const uint32_t n = p ? sizes[k] / 4 : 0;
@@ -1486,6 +1486,7 @@ NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* 
             if (bad++ < 16) log("nd: truncated retail list token stream at native submission boundary");
         }
     }
+    lk.unlock();
     // These labels outlive the submission API. Capture the destination's
     // identity here, before the GPU queue is allowed to delay the operation.
     for (const nd::List* list : batch->lists)
@@ -1574,7 +1575,7 @@ void native_device_execute_submit(NativeSubmission* batch) {
         // for unrelated later lists, nor become visible before prior GPU work.
         flush_recorded();
         flush_draws();
-        ng::after_gpu([pending = std::move(labels), eop] {
+        ng::after_gpu([pending = std::move(labels), eop]() mutable {
             for (auto& label : pending) {
                 auto& bytes = label.bytes;
                 if (label.timestamp && bytes.size() >= 8) {
