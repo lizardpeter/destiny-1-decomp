@@ -46,7 +46,7 @@ public:
         return base / name;
     }
     std::shared_ptr<File> open(Root root, const std::filesystem::path& name, OpenOptions options, std::error_code& ec) const {
-        const bool write = options.access != Access::read || options.create || options.truncate || options.exclusive;
+        const bool write = options.access != Access::read || options.create || options.truncate || options.exclusive || options.append;
         auto path = resolve(root, name, write, ec);
         if (ec) return {};
         if (std::filesystem::is_directory(path, ec)) { ec = error(std::errc::is_a_directory); return {}; }
