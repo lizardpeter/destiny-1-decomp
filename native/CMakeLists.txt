@@ -277,3 +277,7 @@ add_test(NAME native-asset-suballocation COMMAND native-asset-suballocation-test
 add_executable(native-resource-move-test tests/native_resource_move_test.cpp)
 target_include_directories(native-resource-move-test PRIVATE gfx)
 add_test(NAME native-resource-move COMMAND native-resource-move-test)
+
+add_executable(native-texture-constructor-test tests/native_texture_constructor_test.cpp)
+target_include_directories(native-texture-constructor-test PRIVATE gfx)
+add_test(NAME native-texture-constructor COMMAND native-texture-constructor-test)

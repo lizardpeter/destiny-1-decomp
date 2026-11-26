@@ -36,6 +36,7 @@
 #include "native_asset_region.h"
 #include "native_asset_suballocation.h"
 #include "../gfx/native_resource_move.h"
+#include "../gfx/native_texture_constructor.h"
 #include "native_record_registry.h"
 #include "../gfx/native_record_fifo.h"
 #include "../gfx/native_cbm_contract.h"
@@ -1092,6 +1093,28 @@ D1_SYSV void h_swap(uint64_t a, uint64_t b) {
     else o_swap(a,b);
     nr::resreg::event_any(uint32_t(a)), nr::resreg::event_any(uint32_t(b));
 }
+namespace texture_constructor {
+using namespace ng::texture_ctor;
+uint64_t build(void* p,const Request& q){
+    using LayoutFn=D1_SYSV uint32_t(*)(LayoutOutput*,const LayoutInput*);
+    using FootprintFn=D1_SYSV uint32_t(*)(uint64_t*,uint32_t*,void*);
+    return construct(p,q,
+        [](LayoutOutput& out,const LayoutInput& in){
+            return reinterpret_cast<LayoutFn>(nr::g_base+0xF85CB0)(&out,&in);
+        },
+        [](uint64_t& bytes,uint32_t& alignment,void* descriptor){
+            return reinterpret_cast<FootprintFn>(nr::g_base+0xF89BD0)(&bytes,&alignment,descriptor);
+        });
+}
+D1_SYSV uint64_t build_2d(void* p,uint32_t w,uint32_t h,uint32_t slices,uint32_t mips,
+                          uint32_t format,uint32_t tile,uint32_t fragments,uint8_t cube){
+    return build(p,{w,h,slices,mips,format,tile,fragments,cube,false});
+}
+D1_SYSV uint64_t build_3d(void* p,uint32_t w,uint32_t h,uint32_t depth,uint32_t mips,
+                          uint32_t format,uint32_t tile){
+    return build(p,{w,h,depth,mips,format,tile,0,0,true});
+}
+} // namespace texture_constructor
 using MipFn = D1_SYSV void (*)(uint32_t, uint64_t, uint64_t);
 MipFn o_mips;
 D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
@@ -1101,8 +1124,8 @@ D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
         using namespace ng::binding;
         auto* p=reinterpret_cast<void*>(obj);
         const auto plan=mip_plan(p,low_base,hi_base);
-        // The 2D/cube and volume descriptor constructors still own the
-        // original tile-layout calculation. Do not guess a different pitch.
+        // Native constructor bodies retain the original layout/footprint
+        // leaves until the full tile-layout contract is reconstructed.
         using Construct2D=D1_SYSV uint64_t(*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
         using Construct3D=D1_SYSV uint64_t(*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
         if(plan.volume)
@@ -1219,6 +1242,8 @@ bool install() {
     ok &= hook(0x7D37B0, &h_swap, o_swap, "resource_move_commit");
     ok &= hook(0x7D4480, &h_mips, o_mips, "texture_mips");
     if(native_bind_enabled()){
+        ok &= replace_eboot_function(0xF83530,reinterpret_cast<const void*>(&texture_constructor::build_2d));
+        ok &= replace_eboot_function(0xF83AB0,reinterpret_cast<const void*>(&texture_constructor::build_3d));
         ok &= replace_eboot_function(0x7DAA60,reinterpret_cast<const void*>(&h_blit_init));
         ok &= replace_eboot_function(0x7DA8B0,reinterpret_cast<const void*>(&h_blit_reserve));
         ok &= replace_eboot_function(0x7DA910,reinterpret_cast<const void*>(&h_blit_can_request));
