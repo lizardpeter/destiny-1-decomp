@@ -21,6 +21,7 @@
 #include "hle.h"
 #include "os.h"
 #include "pc_frontend.h"
+#include "host_memory.h"
 #include "runtime.h"
 #include "settings.h"
 #include "frame_time_contract.h"
