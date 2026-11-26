@@ -55,13 +55,20 @@ void* tls_create_thread_block() { ++tls_count; return nullptr; }
 void tls_set_current(void*) {}
 void log(const char*, ...) {}
 namespace os { void set_thread_name(const char*) {} }
-uint64_t guest_mapping_identity(uint64_t addr, uint64_t n) {
-    const auto base = reinterpret_cast<uint64_t>(target.data());
-    return addr >= base && addr - base <= target.size() && n <= target.size() - (addr - base) ? 7 : 0;
+static bool lookup_target(uint64_t addr,MappingSpan& r){
+    const auto base=reinterpret_cast<uint64_t>(target.data());
+    if(addr<base||addr-base>=target.size())return false;
+    // Deliberately split the read buffer into adjacent independent mappings.
+    const bool second=addr-base>=4;
+    r=second?MappingSpan{base+4,target.size()-4,8}:MappingSpan{base,4,7};
+    return true;
 }
-bool guest_write_current_mapping(uint64_t addr, uint64_t n, uint64_t id, void(*fn)(void*, void*), void* context) {
-    if (reject_delivery || id != 7 || guest_mapping_identity(addr, n) != id) return false;
-    fn(reinterpret_cast<void*>(addr), context);
+bool guest_capture_write_spans(uint64_t addr,uint64_t size,MappingSpans& spans){
+    return capture_mapping_spans(addr,size,spans,lookup_target);
+}
+bool guest_write_current_spans(uint64_t addr,uint64_t size,const MappingSpans& spans,const void* source){
+    if(reject_delivery||!validate_mapping_spans(addr,size,spans,lookup_target))return false;
+    std::memcpy(reinterpret_cast<void*>(addr),source,size);
     return true;
 }
 }
