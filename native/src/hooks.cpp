@@ -1724,11 +1724,19 @@ using TimeInitFn = D1_SYSV void (*)(void*);
 using GameTimeFn = D1_SYSV void (*)(float, float*, int32_t*, float*, int32_t*);
 static TimeInitFn g_time_init_orig = nullptr;
 static GameTimeFn g_game_time_orig = nullptr;
+static int64_t g_original_frame_period_us = 0;
+static bool fixed_tick_research() {
+    static const bool enabled = [] { const char* v = getenv("D1_NATIVE_FIXED_TICK"); return v && std::atoi(v) != 0; }();
+    return enabled;
+}
 static D1_SYSV void time_init_hook(void* cfg) {
     g_time_init_orig(cfg);
     static const int fps = settings().fps;
     auto* tc = *reinterpret_cast<uint8_t**>(rt().modules[0].base + 0x26BCD08);
-    if (!tc || fps <= 0) return;
+    if (!tc) return;
+    g_original_frame_period_us = *reinterpret_cast<int64_t*>(tc + 0x08);
+    if (fixed_tick_research()) log("hooks: fixed-tick research: original accumulator period %lld us", (long long)g_original_frame_period_us);
+    if (fps <= 0) return;
     *reinterpret_cast<int64_t*>(tc + 0x08) = 1000000 / fps;
     log("hooks: frame rate target %d fps (period %d us)", fps, 1000000 / fps);
 }
@@ -1736,7 +1744,18 @@ static D1_SYSV void game_time_hook(float elapsed, float* dt, int32_t* ticks, flo
     auto* tc = *reinterpret_cast<uint8_t**>(rt().modules[0].base + 0x26BCD08);
     auto* gt = *reinterpret_cast<uint8_t**>(rt().modules[0].base + 0x26BC880);
     static const bool nominal30 = getenv("D1_TICK_NOMINAL30") != nullptr;  // research: old behaviour
-    if (tc && elapsed > 0.0f) {
+    const bool fixed = fixed_tick_research() && tc && g_original_frame_period_us > 0;
+    const int64_t pacing_period = tc ? *reinterpret_cast<int64_t*>(tc + 8) : 0;
+    auto* force_primary = reinterpret_cast<uint8_t*>(rt().modules[0].base + 0x18DCAA4);
+    const uint8_t saved_force = fixed ? *force_primary : 0;
+    if (fixed) {
+        // 0x591710's normal accumulator uses +8, whereas the main scheduler
+        // uses the same field for pacing. Keep the original accumulator
+        // period and let the original zero/multi-step path run in this mode.
+        // Do not modify the nominal game rate, pause, timescale or cap logic.
+        *reinterpret_cast<int64_t*>(tc + 8) = g_original_frame_period_us;
+        *force_primary = 0;
+    } else if (tc && std::isfinite(elapsed) && elapsed > 0.0f) {
         // One tick of the frame's real duration. The game runs at most about two ticks per
         // frame (0x591710 caps the count), so fixed short ticks lose time whenever a frame
         // takes longer than two periods (fps = 120 rendering at 50: slow motion).
@@ -1746,7 +1765,8 @@ static D1_SYSV void game_time_hook(float elapsed, float* dt, int32_t* ticks, flo
         // consistent pair, 1 / an integer rate (30..1000): a nominal off the console's exact
         // 1/30 (29 ticks a second at 33.366 ms) hid the orbit character screen's character.
         static const int32_t forced = [] { const char* e = getenv("D1_TICK_RATE_FORCE"); return e ? std::atoi(e) : 0; }();  // research
-        const int32_t rate = forced > 0 ? forced : std::clamp<int32_t>(int32_t(1.0 / double(elapsed) + 0.5), 30, 1000);
+        const int32_t rate = forced > 0 ? std::clamp(forced, 30, 1000) :
+            int32_t(std::clamp(1.0 / double(elapsed) + 0.5, 30.0, 1000.0));
         *reinterpret_cast<int64_t*>(tc + 0x08) = (1000000 + rate / 2) / rate;
         if (gt && !nominal30) {
             *reinterpret_cast<int32_t*>(gt + 4) = rate;
@@ -1755,17 +1775,30 @@ static D1_SYSV void game_time_hook(float elapsed, float* dt, int32_t* ticks, flo
         g_real_tick = 1.0f / float(rate);
     }
     g_game_time_orig(elapsed, dt, ticks, dt2, ticks2);
-    {  // every 10 s: game time against real time (should match)
+    if (fixed) {
+        *force_primary = saved_force;
+        *reinterpret_cast<int64_t*>(tc + 8) = pacing_period;
+        g_real_tick = gt ? *reinterpret_cast<float*>(gt + 8) : 0.0f;
+    }
+    {  // 0x591d40 consumes aggregate time, then splits additional steps
         static auto since = std::chrono::steady_clock::now();
-        static double sum_elapsed = 0, sum_game = 0;
-        static int frames = 0, ticks_total = 0;
-        sum_elapsed += elapsed, sum_game += double(*dt) * *ticks, ticks_total += *ticks, ++frames;
+        static double sum_elapsed = 0, sum_primary = 0, sum_secondary = 0;
+        static int frames = 0, ticks_total = 0, ticks2_total = 0, zero = 0, multi = 0;
+        sum_elapsed += elapsed;
+        sum_primary += *dt; // aggregate seconds, NOT dt * count
+        sum_secondary += *dt2;
+        ticks_total += *ticks;
+        ticks2_total += *ticks2;
+        zero += *ticks == 0;
+        multi += *ticks > 1;
+        ++frames;
         const auto now = std::chrono::steady_clock::now();
         if (const double wall = std::chrono::duration<double>(now - since).count(); wall >= 10.0) {
             const char* gs = game_state();
-            log("timing: %.1f s real, %.1f s measured by the game, %.1f s of game time | %d frames, %d ticks (%s)", wall,
-                sum_elapsed, sum_game, frames, ticks_total, gs ? gs : "?");
-            since = now, sum_elapsed = sum_game = 0, frames = ticks_total = 0;
+            log("timing: %.1f s real, %.1f s measured by the game, %.3f s primary aggregate, %.3f s secondary aggregate | %d batches, %d/%d scheduled steps, %d zero / %d multi (%s)", wall,
+                sum_elapsed, sum_primary, sum_secondary, frames, ticks_total, ticks2_total, zero, multi, gs ? gs : "?");
+            since = now, sum_elapsed = sum_primary = sum_secondary = 0;
+            frames = ticks_total = ticks2_total = zero = multi = 0;
         }
     }
     static const bool trace = getenv("D1_TIMING_TRACE") != nullptr;
@@ -2715,13 +2748,15 @@ void install_game_hooks() {
         g_time_init_orig = reinterpret_cast<TimeInitFn>(hook_function(exe.base + 0x593F00, reinterpret_cast<const void*>(&time_init_hook)));
         g_game_time_orig = reinterpret_cast<GameTimeFn>(hook_function(exe.base + 0x591710, reinterpret_cast<const void*>(&game_time_hook)));
         if (!g_time_init_orig || !g_game_time_orig) log("hooks: frame-rate hook FAILED");
-    } else {  // unlimited: no limiter wait, one simulation tick per rendered frame
+    } else {  // unlimited: remove the limiter, retain scheduler contracts
+        if (fixed_tick_research())
+            g_time_init_orig = reinterpret_cast<TimeInitFn>(hook_function(exe.base + 0x593F00, reinterpret_cast<const void*>(&time_init_hook)));
         auto* wait = reinterpret_cast<uint8_t*>(exe.base + 0x594A3B);
         const uint8_t expect[4] = {0x48, 0x03, 0x4E, 0x08}, nop4[4] = {0x0F, 0x1F, 0x40, 0x00};
         g_game_time_orig = reinterpret_cast<GameTimeFn>(hook_function(exe.base + 0x591710, reinterpret_cast<const void*>(&game_time_hook)));
         if (g_game_time_orig && std::memcmp(wait, expect, 4) == 0) {
             std::memcpy(wait, nop4, 4);
-            log("hooks: frame rate unlimited (one game tick per frame)");
+            log("hooks: frame rate unlimited (%s)", fixed_tick_research() ? "fixed-tick research" : "variable tick");
         } else {
             log("hooks: unlimited frame rate hook FAILED");
         }
