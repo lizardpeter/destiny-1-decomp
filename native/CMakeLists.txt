@@ -112,3 +112,7 @@ target_include_directories(region-extent-cache-test PRIVATE src)
 target_link_libraries(region-extent-cache-test PRIVATE Threads::Threads)
 enable_testing()
 add_test(NAME region-extent-cache COMMAND region-extent-cache-test)
+
+add_executable(native-list-tokens-test tests/native_list_tokens_test.cpp)
+target_include_directories(native-list-tokens-test PRIVATE src)
+add_test(NAME native-list-tokens COMMAND native-list-tokens-test)
