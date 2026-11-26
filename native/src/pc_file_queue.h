@@ -87,6 +87,11 @@ public:
     Id open(const std::filesystem::path& path, OpenOptions options, std::error_code& ec) {
         auto file = File::open(path, options, ec);
         if (!file) return 0;
+        return attach(std::move(file), ec);
+    }
+    Id attach(std::shared_ptr<File> file, std::error_code& ec) {
+        ec.clear();
+        if (!file) { ec = error(std::errc::bad_file_descriptor); return 0; }
         std::lock_guard lock(m_);
         if (stopping_ || !next_file_) { ec = error(std::errc::too_many_files_open); return 0; }
         const Id id = next_file_++;
@@ -100,13 +105,13 @@ public:
     }
     bool close(Id id) { std::lock_guard lock(m_); return files_.erase(id) != 0; }
     Id read_at(Id file, uint64_t offset, void* dst, uint64_t n, Callback cb, std::error_code& ec) {
-        if (n && !dst) { ec = error(std::errc::invalid_argument); return 0; }
+        if (!valid_range(offset, n) || (n && !dst)) { ec = error(std::errc::invalid_argument); return 0; }
         auto op = std::make_shared<Op>();
         op->offset = offset; op->dst = dst; op->size = n; op->callback = std::move(cb);
         return submit(file, std::move(op), ec);
     }
     Id write_at(Id file, uint64_t offset, const void* src, uint64_t n, Callback cb, std::error_code& ec) {
-        if ((n && !src) || n > SIZE_MAX) { ec = error(std::errc::invalid_argument); return 0; }
+        if (!valid_range(offset, n) || (n && !src)) { ec = error(std::errc::invalid_argument); return 0; }
         auto op = std::make_shared<Op>();
         op->offset = offset; op->size = n; op->write = true; op->callback = std::move(cb);
         if (n) { const auto* p = static_cast<const unsigned char*>(src); op->source.assign(p, p + size_t(n)); }
