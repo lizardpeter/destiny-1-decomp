@@ -1419,7 +1419,12 @@ bool Renderer::init(const Options& o) {
         log("native renderer: recording on %u thread%s (runs of %u+ draws in one pass split)", rec_threads + 1,
             rec_threads ? "s" : "", rec_min_run);
     }
-    list_rec = !debug && passlog_frame == UINT64_MAX && !std::getenv("D1_NG_TRACE") && !std::getenv("D1_NG_DRAWSTATS");
+    // Capturing on the engine threads is cheap; recording Vulkan commands
+    // there before the actual submit order is known is not yet safe for shared
+    // mutable resources. Keep it as an explicitly requested research mode.
+    const char* early = std::getenv("D1_NG_EARLY_RECORD");
+    list_rec = early && std::atoi(early) != 0 && !debug && passlog_frame == UINT64_MAX &&
+               !std::getenv("D1_NG_TRACE") && !std::getenv("D1_NG_DRAWSTATS");
     log("native renderer: command lists recorded %s", list_rec ? "on the engine's threads as they end" : "at submission");
     start_loader();
     {
@@ -5870,8 +5875,10 @@ bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<
 }
 void fill_late(const LateCb& l, uint64_t src, uint32_t size) {
     if (!g) return;
+    if (l.off > g->ring.size || l.size > g->ring.size - l.off) return;
     uint8_t* dst = g->ring.map + l.off;
-    const uint32_t n = src >= 0x10000 ? std::min(size, l.size) : 0;
+    const uint32_t n = src >= 0x10000 ?
+        uint32_t(std::min<uint64_t>(std::min(size, l.size), guest_region_extent(src))) : 0;
     if (n) std::memcpy(dst, reinterpret_cast<const void*>(src), n);
     if (n < l.size) std::memset(dst + n, 0, l.size - n);
     if (size > l.size) {  // (bigger next time)
