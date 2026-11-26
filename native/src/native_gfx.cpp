@@ -35,6 +35,7 @@
 #include "host_memory.h"
 #include "native_record_registry.h"
 #include "../gfx/native_record_fifo.h"
+#include "../gfx/native_cbm_contract.h"
 #include "native_submission.h"
 #include "../gfx/native_close_contract.h"
 #include "../gfx/native_resource_identity.h"
@@ -1135,6 +1136,56 @@ bool native_ring_enabled() {
     }();
     return enabled;
 }
+bool native_cbm_enabled(){
+    static const bool enabled=[] {
+        const char* v=std::getenv("D1_PC_NATIVE_CBM");
+        return v&&std::atoi(v)!=0;
+    }();
+    return enabled;
+}
+// The retail CBM still owns chunk indices and list fence bookkeeping.
+// Replace its two GPU memory allocations with ordinary PC host memory.
+D1_SYSV void h_cbm_init(uint64_t cbm,uint32_t bytes){
+    using namespace ng::cbm;
+    const auto l=layout(bytes,os::granularity());
+    if(!l.bytes||field<uint64_t>(cbm,0)||field<uint64_t>(cbm,0x30)){
+        log("nd: invalid or repeated native CBM initialization");std::abort();
+    }
+    void* memory=nullptr;
+    for(uint64_t hint:{0xA80000000ull,0xA00000000ull,0x980000000ull,0x900000000ull}){
+        void* p=os::alloc(hint,l.bytes,os::kRead|os::kWrite,false);
+        if(p&&uint64_t(p)<(1ull<<40)-l.bytes){memory=p;break;}
+        if(p)os::release(p,l.bytes);
+    }
+    if(!memory){log("nd: native CBM backing allocation failed");std::abort();}
+    const uint64_t base=uint64_t(memory);
+    register_native_host_region(base,l.bytes);
+    using NewFn=D1_SYSV uint64_t(*)(uint64_t);
+    using InitFn=D1_SYSV void(*)(uint64_t);
+    using SizeFn=D1_SYSV void(*)(uint64_t,uint32_t,uint32_t);
+    using BackFn=D1_SYSV void(*)(uint64_t,uint32_t,uint64_t);
+    const auto allocator=reinterpret_cast<NewFn>(nr::g_base+0x12AACB0)(0x50);
+    const auto table=reinterpret_cast<NewFn>(nr::g_base+0x12AAA90)(slot_count*slot_bytes);
+    if(!allocator||!table){log("nd: CBM metadata allocation failed");std::abort();}
+    reinterpret_cast<InitFn>(nr::g_base+0x6B100)(allocator);
+    reinterpret_cast<SizeFn>(nr::g_base+0x6B150)(allocator,chunk_bytes,bytes);
+    // Metadata remains compatible with the original destructor.
+    for(uint32_t i=0;i<slot_count;++i){
+        put_field(table,uint64_t(i)*8,uint32_t(0));
+        put_field(table,uint64_t(i)*8+4,invalid_chain);
+    }
+    put_field(cbm,0,table);
+    put_field(cbm,8,uint64_t(0));
+    put_field(cbm,0x18,uint32_t(0));
+    put_field(cbm,0x20,base+l.label);
+    put_field(cbm,0x30,allocator);
+    put_field(base,l.label,uint32_t(0));
+    reinterpret_cast<BackFn>(nr::g_base+0x6B190)(allocator,bytes,base);
+    log("nd: native CBM backing %p (%u bytes, %u chunks), host completion label",
+        memory,bytes,uint32_t(bytes/chunk_bytes));
+    // Backing remains process-owned even after retail metadata teardown:
+    // pending native completion callbacks must never target recycled memory.
+}
 std::mutex g_fifo_m;
 std::unordered_map<uint64_t,std::unique_ptr<ng::NativeRecordFifo>> g_fifos;
 ng::NativeRecordFifo& native_fifo(uint64_t global) {
@@ -1584,6 +1635,7 @@ bool install() {
     ok &= hook(0x7DE950, &h_end_submit, o_end_submit, "cmdlist_end_and_submit");
     if (native_drain_enabled()) ok &= hook(0x7DD060, &h_drain, o_drain, "native_device_drain");
     if (native_ring_enabled()) ok &= hook(0x7DEA90, &h_reserve_record, o_reserve_record, "native_worker_reserve");
+    if (native_cbm_enabled()) rep(0x7EF7D0,reinterpret_cast<const void*>(&h_cbm_init));
     g_on = ok;
     log("nd: native device layer: %zu Gnm entry points replaced%s",
         sizeof kNoops / sizeof kNoops[0] + 8, ok ? "" : " - REQUIRED REPLACEMENTS FAILED");
