@@ -20,6 +20,13 @@ int main(){
     check(cohort.observe(res(257,8)));
     check(cohort.observe(res(1,2)));
     using namespace d1::ng;
+    struct CollisionHash {size_t operator()(uint32_t)const{return 0;}};
+    SegmentTable<uint32_t,uint32_t,CollisionHash> flat;
+    for(unsigned pass=0;pass<8;++pass){
+        flat.clear();
+        for(uint32_t i=0;i<512;++i)check(flat.insert(i,i+pass).second);
+        for(uint32_t i=0;i<512;++i){const auto [value,added]=flat.insert(i,9999);check(!added&&value==i+pass);}
+    }
     Draw a{},b{};
     a.kind=b.kind=Draw::Indexed;
     a.ires=b.ires={res(1,2),0x10000,256};

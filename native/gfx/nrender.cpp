@@ -406,6 +406,7 @@ struct Pipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     Shader* vs = nullptr;
     Shader* ps = nullptr;
+    uint16_t vertex_slots=0,instance_slots=0,range_slots=0;
 };
 
 struct SamplerEntry {
@@ -4050,6 +4051,12 @@ Pipeline* Renderer::pipeline_resolve(const Draw& dr, Image* const* colors, Image
 
     auto p = std::make_unique<Pipeline>();
     p->vs = vs, p->ps = ps;
+    for(const auto& a:vs->res.attribs){
+        const uint16_t bit=uint16_t(1u<<(a.vb_slot&15));
+        if(!(p->vertex_slots&bit)&&a.index_vgpr!=0)p->instance_slots|=bit;
+        p->vertex_slots|=bit;
+        if(a.index_vgpr==0)p->range_slots|=bit;
+    }
 
     VkPipelineShaderStageCreateInfo stages[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
@@ -5024,9 +5031,8 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     // Check if any vertex stream used by this draw lacks an engine resource buffer and needs [vfirst, vlast]
     bool need_vrange = !ige && dr.kind == Draw::Indexed && dr.index_addr >= 0x10000 && dr.count;
     if (!need_vrange && ige_whole) {
-        for (const auto& a : p->vs->res.attribs) {
-            if (a.index_vgpr != 0) continue;
-            const uint32_t slot = a.vb_slot & 15;
+        for(uint32_t m=p->range_slots;m;m&=m-1){
+            const uint32_t slot=__builtin_ctz(m);
             const uint32_t* v = dr.vb[slot];
             const uint64_t base = uint64_t(v[0]) | uint64_t(v[1] & 0xFFF) << 32;
             const uint32_t stride = v[1] >> 16 & 0x3FFF;
@@ -5052,14 +5058,13 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         if (vfirst > vlast) vfirst = vlast = 0;
     }
 
-    for (const auto& a : p->vs->res.attribs) {
-        const uint32_t slot = a.vb_slot & 15;
-        if (vmask >> slot & 1) continue;
+    for(uint32_t m=p->vertex_slots;m;m&=m-1){
+        const uint32_t slot=__builtin_ctz(m);
         const uint32_t* v = dr.vb[slot];
         const uint64_t base = uint64_t(v[0]) | uint64_t(v[1] & 0xFFF) << 32;
         const uint32_t stride = v[1] >> 16 & 0x3FFF;
         const uint32_t records = std::max(v[2], 1u);
-        const bool per_instance = a.index_vgpr != 0;
+        const bool per_instance = (p->instance_slots>>slot&1)!=0;
         const Draw::Res& R = dr.vres[slot];
 
         // Fast path: engine vertex buffer resource bound from base (vfirst = 0 when ige_whole or auto draw)
@@ -5358,7 +5363,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
         // needs no repeated pipeline, geometry or descriptor resolution.
         // Keep draw order; direct emission is the safe default. The optional
         // multi-draw path additionally collapses the Vulkan API calls.
-        std::array<VkDrawIndexedIndirectCommand,64> batch{};
+        std::array<VkDrawIndexedIndirectCommand,64> batch;
         size_t n=1;
         batch[0]={count,std::max(1u,dr.instances),first_index,vertex_offset,0};
         static const bool batch_on=[]{
@@ -5516,12 +5521,13 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     if (local_geometry_enabled() && !rc().lr && !(debug_toggles() & 8)) {
         // Prepare each exact resource epoch/range once per ordered segment, before
         // any graphics secondary begins. Different versions remain distinct.
-        std::unordered_set<GeometryKey, GeometryKeyHash> seen_geometry;
+        static thread_local SegmentTable<GeometryKey,bool,GeometryKeyHash> seen_geometry;
+        seen_geometry.clear();
         bool copied = false;
         auto prepare = [&](const Draw::Res& r) {
             if (!r.id || !r.size) return;
             const GeometryKey key{r.id, r.base, r.size, 0, 0};
-            if (seen_geometry.insert(key).second) copied |= prepare_local_geometry(r);
+            if (seen_geometry.insert(key,true).second) copied |= prepare_local_geometry(r);
         };
         const Draw* prev=nullptr;
         for (size_t di = 0; di < count; ++di) {
