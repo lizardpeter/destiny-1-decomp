@@ -301,9 +301,9 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
         // Resolve each bound stream exactly once; all attributes in that stream
         // consume the same native allocation identity, offset and vertex count.
         struct StreamBinding {
-            uint64_t base=0,resource_base=0,resource_size=0,identity=0;
-            uint32_t count=0;
-            bool valid=false;
+            uint64_t base,resource_base,resource_size,identity;
+            uint32_t count;
+            bool valid;
         };
         StreamBinding streams[32];
         uint32_t prepared=0;
@@ -316,6 +316,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
             const uint32_t bit=1u<<stream;
             if (!(prepared&bit)) {
                 prepared|=bit;
+                binding={};
                 uint32_t h=field<uint32_t>(dev,0x1D78+4*stream);
                 uint32_t stream_off=field<uint32_t>(dev,0x1DF8+4*stream);
                 uint32_t vcnt=ds->vb_count[stream];
@@ -366,7 +367,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
                     d->tex_mask[s] |= uint16_t(1u << i);
                     d->tex_res[s][i]=after;
                     d->tex_obj[s][i]=t;
-                    if(leases&&leases->pin(after))ng::capture_texture_source(d->tex[s][i],after,t);
+                    if(leases&&leases->pin_source(d->tex[s][i],after))ng::capture_texture_source(d->tex[s][i],after,t);
                 }
             }
             if (const uint64_t p = field<uint64_t>(dev, (s ? 0x2278 : 0x22F8) + i * 8); p >= 0x10000) {
