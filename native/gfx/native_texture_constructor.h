@@ -77,6 +77,66 @@ uint64_t construct(void* descriptor,const Request& q,Layout layout,Footprint foo
 // F89BD0: sum each mip's slice footprint and retain the largest alignment.
 // The seed is produced by the original F896C0 descriptor-to-layout leaf.
 constexpr uint32_t invalid=0x80d30000u;
+constexpr uint32_t tile_class(uint32_t table_word){return (table_word>>22)&7;}
+constexpr uint32_t array_mode(uint32_t table_word){return (table_word>>2)&15;}
+constexpr uint32_t remap_tile(uint32_t tile,uint32_t table_word,uint32_t mode){
+    if(array_mode(table_word)==mode)return tile;
+    switch(tile_class(table_word)){
+        case 0:return mode==2?9u:UINT32_MAX;
+        case 1:return mode==2?13u:UINT32_MAX;
+        case 2:return 5;
+        case 4:
+            switch(mode){
+                case 2:return 13;case 3:return 19;case 4:return 14;
+                case 5:return 16;case 6:return 17;case 7:return 20;
+                case 11:return 18;case 12:return 15;case 13:return 21;
+                default:return UINT32_MAX;
+            }
+        default:return UINT32_MAX;
+    }
+}
+constexpr uint32_t mip_last(uint32_t word3){
+    const uint32_t kind=word3>>28;
+    return (kind==14||kind==15)?0:(word3>>16)&15;
+}
+constexpr uint32_t slice_count(const uint32_t* w){
+    const uint32_t kind=w[3]>>28,depth=(w[4]&0x1fff)+1;
+    uint32_t layers=kind==11?depth*6:kind==10?1:depth;
+    return (w[3]&0x02000000u)?next_pow2(layers):layers;
+}
+// F896C0 descriptor-to-layout request, with the table word obtained from
+// the original immutable 32-entry tile-mode table by the integration layer.
+template<class Layout>
+uint32_t prepare(LayoutInput& in,const uint32_t* w,uint32_t level,uint32_t slice,
+                 uint32_t table_word,Layout layout){
+    if(!w||level>mip_last(w[3]))return invalid;
+    const uint32_t kind=w[3]>>28,tile=(w[3]>>20)&31;
+    const uint32_t format=((w[1]>>20)&63)|(((w[1]>>26)&15)<<8)|((w[3]&0xfff)<<12);
+    const uint32_t df=format&63;
+    in.flags=0;
+    if(kind!=10&&tile_class(table_word)==2){
+        if(df==2||df==4)in.flags|=2;
+        if(df==1)in.flags|=4;
+    }
+    in.flags|=(kind==10?0x20u:0u)|(kind==11?0x10u:0u)|
+        ((w[3]&0x02000000u)?0x1000u:0u);
+    in.tile=tile;in.format=format;
+    in.width=std::max(1u,((w[2]&0x3fff)+1)>>(level&31));
+    in.height=std::max(1u,(((w[2]>>14)&0x3fff)+1)>>(level&31));
+    in.depth=kind==10?std::max(1u,((w[4]&0x1fff)+1)>>(level&31)):1;
+    in.samples=1u<<((kind==14||kind==15)?((w[3]>>16)&15):0);
+    in.base_pitch=level?((w[4]>>13)&0x3fff)+1:0;
+    in.mip=level;
+    if((kind==10&&slice)||slice>=slice_count(w))return invalid;
+    in.unused=slice; // +0x20 is the slice index, not reserved padding
+    LayoutOutput out{};
+    const uint32_t status=layout(out,in);
+    if(status)return status;
+    const uint32_t adjusted=remap_tile(tile,table_word,out.words[6]);
+    if(adjusted==UINT32_MAX)return invalid;
+    in.tile=adjusted;
+    return 0;
+}
 template<class Layout>
 uint32_t footprint(uint64_t& bytes,uint32_t& alignment,const uint32_t* w,
                    const LayoutInput& seed,Layout layout){

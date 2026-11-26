@@ -242,3 +242,5 @@ GPU full-backed high-side redistribution and inactive top release are now source
 Resource move copy/commit orchestration (0x7D3560/0x7D37B0 and completion callbacks) is now source-defined under the default-on native bind cohort, retaining original allocator metadata leaves and ordered native blitter semantics. See gpu-resources.md for scope and validation limits.
 
 The native bind cohort now replaces the texture descriptor constructor entry points 0xF83530/0xF83AB0. It retains the original surface layout and mip footprint calculation leaves 0xF85CB0/0xF89BD0 pending full layout reconstruction. See gpu-resources.md.
+
+The texture constructor success path now uses native descriptor preparation, tile-mode adjustment and mip footprint accumulation; the original F85CB0 per-surface layout calculation and immutable tile-mode table remain dependencies. Other original callers of the preparation helpers are unchanged.

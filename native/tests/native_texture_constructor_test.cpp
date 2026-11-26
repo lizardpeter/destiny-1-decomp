@@ -68,5 +68,25 @@ int main(){
     })==42&&size==2*100*32&&align==256);
     seed.depth=2;
     check(footprint(size,align,cw,seed,[](auto&,const auto&){std::abort();return 0u;})==invalid);
+    check(tile_class((4u<<22)|(3u<<2))==4);
+    check(array_mode((4u<<22)|(3u<<2))==3);
+    check(remap_tile(14,(4u<<22)|(4u<<2),4)==14);
+    check(remap_tile(14,(4u<<22)|(4u<<2),2)==13);
+    check(remap_tile(14,(4u<<22)|(4u<<2),9)==UINT32_MAX);
+    LayoutInput decoded{};
+    check(!prepare(decoded,cw,2,5,(4u<<22)|(4u<<2),[](LayoutOutput& o,const LayoutInput& i){
+        check(i.width==16&&i.height==16&&i.depth==1&&i.base_pitch==128&&i.mip==2);
+        check(i.flags==0x1010&&i.unused==5&&i.samples==1);
+        o.words[6]=2;return 0u;
+    }));
+    check(decoded.tile==13);
+    check(prepare(decoded,cw,7,0,0,[](auto&,const auto&){std::abort();return 0u;})==invalid);
+    check(prepare(decoded,cw,0,32,0,[](auto&,const auto&){std::abort();return 0u;})==invalid);
+    Request volume{64,32,8,5,2,14,0,0,true};
+    uint32_t vw[8]{};encode(vw,volume,64,14);
+    check(!prepare(decoded,vw,1,0,(2u<<22)|(4u<<2),[](LayoutOutput& o,const LayoutInput& i){
+        check(i.depth==4&&i.flags==0x1020);o.words[6]=4;return 0u;
+    }));
+    check(prepare(decoded,vw,0,1,0,[](auto&,const auto&){std::abort();return 0u;})==invalid);
     std::printf("native texture constructor: %llu cases passed\n",(unsigned long long)cases);
 }

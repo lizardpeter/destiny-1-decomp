@@ -1104,13 +1104,15 @@ uint32_t calculate_layout(LayoutOutput& out,const LayoutInput& in){
 D1_SYSV uint32_t calculate_footprint(uint64_t* bytes,uint32_t* alignment,void* descriptor){
     if(!bytes||!alignment||!descriptor)return invalid;
     LayoutInput seed{};
-    using PrepareFn=D1_SYSV uint32_t(*)(LayoutInput*,void*,uint32_t,uint32_t);
-    const auto status=reinterpret_cast<PrepareFn>(nr::g_base+0xF896C0)(&seed,descriptor,0,0);
-    // The original ignores this return. Keep its path for unsuccessful
-    // preparation rather than interpreting an incomplete layout seed.
-    if(status)return original_footprint(bytes,alignment,descriptor);
     uint32_t words[8];
     std::memcpy(words,descriptor,sizeof words);
+    const uint32_t tile=(words[3]>>20)&31;
+    // F87240/F87270 read these bitfields from the same original table.
+    const uint32_t table_word=nr::eb<uint32_t>(0x16C7880+uint64_t(tile)*4);
+    const auto status=prepare(seed,words,0,0,table_word,calculate_layout);
+    // The original ignores preparation errors; preserve its fallback
+    // instead of consuming a potentially incomplete request.
+    if(status)return original_footprint(bytes,alignment,descriptor);
     return footprint(*bytes,*alignment,words,seed,calculate_layout);
 }
 uint64_t build(void* p,const Request& q){
