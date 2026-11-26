@@ -6,11 +6,11 @@
 
 namespace d1::fios_contract {
 // Exact scalar transformations from the retail libSceFios2.prx (01.33).
-// 0x2AD70: low access bits and three independent flag bits.
+// 0x2AD70: low access bits and four independent flag bits.
 constexpr uint32_t to_kernel_open_flags(uint32_t flags) {
     const uint32_t access = (flags & 3) == 2 ? 1 : (flags & 3) == 3 ? 2 : 0;
     return access | ((flags & 4) << 1) | ((flags & 8) << 6) |
-           ((flags & 16) << 6) | ((flags & 16) << 4);
+           ((flags & 16) << 6) | ((flags & 0x1000) << 4);
 }
 // 0x2AB90: already-encoded kernel status input (not raw -1/errno).
 // Unrecognized negative encoded statuses pass through unchanged.
