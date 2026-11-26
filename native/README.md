@@ -2,10 +2,14 @@
 
 Transitional native PC port: the original x86-64 game machine code still runs directly
 on the host. The PC executable requires its own Vulkan renderer; no external console
-renderer or null-GPU interpreter is compiled in. The retail loader still needs the
-original `eboot.bin`, `sce_module/libc.prx` and `sce_module/libSceFios2.prx`. Recovered
-functions are being migrated into independently compiled native code. This is not yet
-a source-complete standalone game. See `docs/native-platform-migration.md`.
+renderer or null-GPU interpreter is compiled in. The loader still needs the
+original `eboot.bin` and `sce_module/libc.prx`; the original FIOS PRX is never loaded.
+Recovered functions are being migrated into independently compiled native code. This
+is not yet a source-complete standalone game. See the mandatory
+[native-only architecture](../docs/native-only-architecture.md).
+There is no legacy provider selection for reconstructed resource binding, close/drain/ring,
+CBM, FIOS or libc leaf cohorts. Remaining original allocator/layout and platform leaves
+are migration blockers, not supported alternatives.
 
 No game files are in this repository. You need your own decrypted 01.33 eboot,
 `sce_module/` and the `/app0` tree (packages etc.).
@@ -120,36 +124,25 @@ Native renderer (`native/gfx`):
 | Legacy frame skipping | Removed: all submitted frames execute on the native renderer; no fabricated occlusion results |
 | `D1_NG_NOCACHE=1` | no geometry cache and no texture change tracking |
 | Native device | Required; startup fails if the native renderer or required device hooks cannot be installed. The retail submit boundary associates engine record addresses with native lists, not packet tokens |
-| `D1_PC_NATIVE_CBM_POOL=1` | Experimental native chunk/slot allocator, requires native CBM; replaces original metadata and reclaim, retains record fields and EOP label |
-| `D1_PC_NATIVE_CBM=1` | Experimental host-owned command-buffer backing and completion label; retains original chunk metadata and reclaim logic |
-| `D1_PC_NATIVE_BIND=1` | Experimental source-defined bind/repoint, mip transition and native blitter queue/storage; retains legacy tag fields and layout constructors |
-| `D1_PC_NATIVE_RING=1` | Experimental native ready-FIFO and source-defined main begin/worker reservation, requires native close and drain; original record layout mirrored for compatibility |
-| `D1_PC_NATIVE_DRAIN=1` | Experimental source-defined record drain, requires `D1_PC_NATIVE_CLOSE=1`; direct native queue submission, retains original producer ring and progress labels |
-| `D1_PC_NATIVE_CLOSE=1` | Experimental source-defined main/worker command-list close, without fabricated command-buffer extent. Keeps original ring, segment accounting and completion labels; not yet live-validated |
 | Early recording | Retail device adapter now records only in actual submit order, including the original close-time completion labels. Parallel native secondary command recording remains enabled |
-| `D1_ND_RES=0` | the engine's GPU resources (textures, vertex and index buffers) are tracked by write-protecting their memory again, instead of by the engine's own resource events (default: kept per resource and epoch, see docs/gpu-resources.md). The log's "engine resources" line counts uses, moves with the same contents and real changes |
 | `D1_NG_PREFETCH=0` | engine resources are uploaded at their first draw instead of on the renderer's loader thread when the engine binds or moves them (default). The log's "loader" line counts uploads ahead of use, moves kept and work dropped because the resource changed again |
 | `D1_NG_DYNAMIC_COPY=0` | memory that is no engine resource (dynamic vertex / index buffers, dynamic textures, small render targets the CPU rewrites) is write-tracked again instead of following the engine's own write announcements (texture unlocks, copy-queue writes); default: nothing is write-protected, 0 write faults |
 | `D1_NG_VERIFY_DYN=1` / `D1_NG_LOG_FAULTS=1` / `D1_ND_LOG_UNLOCK=1` / `D1_ND_LOG_UNREG=1` | (testing) hash dynamic textures at every use and report changes without an event / write faults by writing code address / dynamic texture unlocks / vertex buffers that are no engine resource |
 | `D1_NG_RECOPY=0` | (testing) dynamic vertices, indices and constants a recorded list copied are not copied again when the list is submitted |
-| `D1_NG_CENSUS=<file>` | (research, with `D1_ND_RES=0 D1_NG_DYNAMIC_COPY=0`) every code address that writes GPU-read memory, with two callers and the range written (docs/gpu-memory-census.md) |
+| `D1_NG_CENSUS=<file>` | (research, with dynamic-copy instrumentation) every code address that writes GPU-read memory, with two callers and the range written (docs/gpu-memory-census.md) |
 | `D1_NG_FEEDBACK_COPY=0` | (testing) draws that sample a render target they also render into read it in place, as before test-29 (undefined in Vulkan: garbage on most real GPUs) |
 | `D1_NG_LOG_FEEDBACK=1` / `D1_NG_LOG_SNAPS=1` / `D1_NG_LOG_DMA_TEX=1` | (diagnostics) draws that sample their own render targets / the target copies made for them / copy-queue writes into texture memory |
 | `D1_ND_RES_EVENTS=1` / `D1_ND_RES_STATS=1` / `D1_ND_POOL_WATCH=1` | (research) resource event counts with content checks / which handle pools draws use / who writes the handle-pool table |
 | `D1_ND_LIST_STATS=1` | (diagnostics) draws and lists per device context per frame |
 | `D1_ND_CB_CHECK=1` | (diagnostics) how many draws take constant buffers from bindings made in earlier lists |
 | `D1_NG_RECORD_THREADS=<n>` | threads recording runs of draws in one render pass in parallel (secondary command buffers); default up to 6 (hardware threads - 4), 0 = one thread. `D1_NG_RECORD_RUN=<n>`: fewest draws split (default 64) |
-| `D1_NG_GNM_DRAWS=1` | also run the engine's Gnm draw code (constant update engine, draw packets) for captured draws (default: capture only) |
 | `D1_NG_ASYNC=0` | record and submit on the game's submitting thread (default: a separate GPU queue thread, at most 2 flips ahead) |
 | `D1_NG_RING_SYSMEM=1` | keep the upload ring in system memory (default: device-local host-visible memory when the GPU offers it) |
 | `D1_NG_PENDING_STATS=1` | log the pending draw / constant event lookups per submission |
 | `D1_NG_FRAMES_IN_FLIGHT=<n>` | frames the CPU may record ahead of the GPU (default 2) |
 | `D1_NG_GPU_TIMING=1` | optional GPU submission timestamp spans, collected after fences complete; logs summed/mean/max spans (not utilization, spans can overlap). |
-| `D1_PC_LIBC_LEAVES=0` | diagnostic A/B only: disable native libc memory/string leaves and optional math wrappers; allocator/stdio/exception ABI still uses the original module |
-| `D1_PC_LIBC_MATH=1` | experimental: 18 native scalar math/time-difference import replacements, in addition to 19 default memory/string leaves. Original floating-point behavior and Windows integration still need validation |
 | `D1_PC_PTHREAD_KEYS=1` | experimental native guest key registry with a single host exit-notification key; guest destructor/cancellation behavior still needs live validation |
-| `D1_NATIVE_FIOS=1` | Experimental: omit original libSceFios2.prx and require all 25 observed FIOS NIDs to resolve to native implementations. Original libc.prx and eboot.bin remain mandatory. Live game and Windows validation pending |
-| `D1_FIOS_TRACE=1` | Bounded first 32 calls per FIOS import argument trace for either native or original provider |
+| `D1_FIOS_TRACE=1` | Bounded first 32 calls per native FIOS import argument trace |
 | `D1_NATIVE_FRAME_TRACE=1` | optional scheduler instrumentation: observe published 0x591D40 frame records, including follow-up steps and aggregate timing channels; reports every 10 seconds. |
 | `D1_NATIVE_FIXED_TICK=1` | experimental fixed-step path: preserve the original accumulator period and temporarily suppress the forced one-primary-step branch during timing calculation. Not the default; animation, physics, networking, and stage scheduling need live validation. |
 | `D1_NG_READBACK=<pixels>` | largest never-sampled render target written back to guest memory for the CPU (default 4096, 0 off); `D1_NG_LOG_READBACK=1` lists the decisions |
