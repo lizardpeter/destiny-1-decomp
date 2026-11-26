@@ -273,3 +273,7 @@ add_test(NAME native-asset-region COMMAND native-asset-region-test)
 add_executable(native-asset-suballocation-test tests/native_asset_suballocation_test.cpp)
 target_include_directories(native-asset-suballocation-test PRIVATE src)
 add_test(NAME native-asset-suballocation COMMAND native-asset-suballocation-test)
+
+add_executable(native-resource-move-test tests/native_resource_move_test.cpp)
+target_include_directories(native-resource-move-test PRIVATE gfx)
+add_test(NAME native-resource-move COMMAND native-resource-move-test)
