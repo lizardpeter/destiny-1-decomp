@@ -1275,6 +1275,7 @@ struct Renderer {
     uint32_t rec_min_run = 64;  // fewest draws in a pass worth splitting
     uint64_t par_runs = 0, par_draws = 0;
     uint64_t native_stage_reuse=0,inline_run_draws=0,inline_runs=0;
+    uint64_t native_view_cache_hits=0,native_view_cache_misses=0;
     uint64_t batched_draws=0,indirect_batches=0;
     void start_workers();
     void run_parallel(Draw* const* run, size_t n);
@@ -4811,11 +4812,11 @@ static bool same_sampler_stage(const Draw& a,const Draw& b,unsigned stage){
     return true;
 }
 void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
-    struct TvEntry { uint64_t key = 0, gen = 0, target_gen = 0; ViewHandle vh{}; Image* tex = nullptr; };
+    struct TvEntry { uint64_t key = 0, gen = 0, target_gen = 0; ViewHandle vh{}; Image* tex = nullptr; uint64_t res=0; uint32_t words[8]{}; };
     static thread_local std::unique_ptr<TvEntry[]> tvc_ptr;
     if (!tvc_ptr) tvc_ptr = std::make_unique<TvEntry[]>(4096);
     TvEntry* const tvc = tvc_ptr.get();
-    struct SmpPair { uint64_t key = 0; uint16_t lin = 0, near = 0; };
+    struct SmpPair { uint64_t key = 0; uint16_t lin = 0, near = 0; uint32_t words[4]{}; };
     static thread_local std::unique_ptr<SmpPair[]> smc_ptr;
     if (!smc_ptr) smc_ptr = std::make_unique<SmpPair[]>(1024);
     SmpPair* const smc = smc_ptr.get();
@@ -4859,7 +4860,8 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
                 TvEntry& e = tvc[key & 4095];
                 ViewHandle vh;
                 const uint64_t dependency = tres ? 0 : tg;
-                if (e.key == key && e.gen == gen && e.target_gen == dependency && e.vh.id) {
+                if (e.key == key && e.gen == gen && e.target_gen == dependency && e.vh.id &&
+                    e.res==tres&&std::memcmp(e.words,T,32)==0) {
                     vh = e.vh;
                     if (e.tex) e.tex->last_used = sub_no, e.tex->last_frame = st.frames;
                 } else {
@@ -4867,7 +4869,8 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
                     Image* tex = tv_texture;
                     if (!tres) if (Image* ri = target_for(fmt::decode_tsharp(T)))
                         vh = texture_view(T, ri->is3d ? gcn::TexDim::Tex3D : gcn::TexDim::Tex2D, tres), tex = nullptr;
-                    e = {key, gen, dependency, vh, tex};
+                    e = {key, gen, dependency, vh, tex,tres,{}};
+                    std::memcpy(e.words,T,32);
                 }
                 // Snapshots are pass-local, not part of the persistent cache.
                 // Resolve by the actual target object, including stencil/read aliases.
@@ -4900,10 +4903,11 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
                 const uint32_t* S = dr.smp[s][slot];
                 const uint64_t key = hash_bytes(S, 16) | 1;
                 SmpPair& se = smc[key & 1023];
-                if (se.key != key || !se.lin || !se.near) {
+                if (se.key != key || !se.lin || !se.near||std::memcmp(se.words,S,16)!=0) {
                     const uint16_t lin = sampler_id(S, false);
                     const uint16_t near = sampler_id(S, true);
-                    se = {key, lin, near};
+                    se = {key, lin, near,{}};
+                    std::memcpy(se.words,S,16);
                 }
                 dr.smp_lin[s][slot] = se.lin;
                 dr.smp_near[s][slot] = se.near;
@@ -5441,6 +5445,17 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     st.t_tgt += now_ns() - t_tgt0;
     struct Seen { uint64_t key, sub, res; const uint32_t* words; ViewHandle native; };
     static thread_local std::vector<Seen> seen(1u << 13);
+    // Persistent material-view cache across ordered segments. Registered
+    // assets have no target dependencies. Generation invalidation precedes
+    // image retirement; source epoch and every view word must still match.
+    struct NativeView {
+        const Renderer* owner=nullptr;
+        uint64_t key=0,res=0,gen=0;
+        uint32_t words[8]{};
+        Image* image=nullptr;
+        ViewHandle view{};
+    };
+    static thread_local std::vector<NativeView> native_views(1u<<14);
     // A submission can contain several resource-write boundaries. A descriptor
     // seen before one of them must be checked again in the next segment.
     static thread_local uint64_t preparation_epoch = 0;
@@ -5497,6 +5512,22 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                     if(already){use_native(s,i,already->native);continue;}
                     if(!vacant)vacant=&seen[home];
                     *vacant={k,epoch,res,t,{}};
+                    NativeView* cache=nullptr;
+                    if(res&&!rc().lr){
+                        cache=&native_views[k&(native_views.size()-1)];
+                        const uint64_t gen=views_gen.load(std::memory_order_relaxed);
+                        if(cache->owner==this&&cache->key==k&&cache->res==res&&cache->gen==gen&&
+                           cache->image&&cache->view.id&&std::memcmp(cache->words,t,32)==0&&
+                           cache->image->matches_epoch(t,res)){
+                            cache->image->last_used=rc().submit_no;
+                            cache->image->last_frame=st.frames;
+                            vacant->native=cache->view;
+                            use_native(s,i,cache->view);
+                            ++native_view_cache_hits;
+                            continue;
+                        }
+                        ++native_view_cache_misses;
+                    }
                     const uint64_t b = fmt::decode_tsharp(t).base;
                     const bool possible_target=!d->tex_res[s][i]&&target_bases.count(b)!=0;
                     if(possible_target)tsharp_bases.insert(b);
@@ -5511,6 +5542,12 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                         if(res&&image&&!rc().lr){
                             vacant->native=texture_view(t,slot_dim(t),res,image);
                             use_native(s,i,vacant->native);
+                            if(cache&&vacant->native.id&&image->matches_epoch(t,res)){
+                                cache->owner=this;cache->key=k;cache->res=res;
+                                cache->gen=views_gen.load(std::memory_order_relaxed);
+                                std::memcpy(cache->words,t,32);
+                                cache->image=image;cache->view=vacant->native;
+                            }
                         }
                     }
                 }
@@ -7433,6 +7470,9 @@ void print_stats() {
     log("native renderer: native indexed draw batching: %llu follower draws bypassed CPU preparation, %llu multi-draw indirect calls",
         (unsigned long long)g->batched_draws,(unsigned long long)g->indirect_batches);
     g->batched_draws=g->indirect_batches=0;
+    log("native renderer: persistent native material views: %llu hits, %llu misses",
+        (unsigned long long)g->native_view_cache_hits,(unsigned long long)g->native_view_cache_misses);
+    g->native_view_cache_hits=g->native_view_cache_misses=0;
     g->native_stage_reuse=g->inline_run_draws=g->inline_runs=0;
     s.memo_hits = s.memo_misses = s.memo_gen = 0, g->par_draws = g->par_runs = 0;
     if (const double f = double(s.frames - s.t_frames); f > 0 && g->list_rec)
