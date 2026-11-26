@@ -1599,40 +1599,6 @@ void begin_list(uint64_t dev) {
     g_ctx[c].cur.store(l, std::memory_order_relaxed);
     ++g_lists_made;
 }
-// The retail ring (0x7DB810 / 0x7DCEC0 / 0x7DE950) uses the difference
-// between its begin and end pointers to decide whether a record is ready
-// to submit. Until that ring is reconstructed, reserve one word of size
-// bookkeeping. No packet or list ID is written or decoded.
-bool mark_record_nonempty(uint64_t cb) {
-    using ReserveFn = D1_SYSV bool (*)(uint64_t, uint32_t, uint64_t);
-    uint32_t* p = field<uint32_t*>(cb, 0x10);
-    if (!p || field<uint64_t>(cb, 8) < uint64_t(p) ||
-        field<uint64_t>(cb, 8) - uint64_t(p) < sizeof(uint32_t)) {
-        const uint64_t reserve = field<uint64_t>(cb, 0x18);
-        if (!reserve || !reinterpret_cast<ReserveFn>(reserve)(cb, 1, field<uint64_t>(cb, 0x20))) return false;
-        p = field<uint32_t*>(cb, 0x10);
-    }
-    if (!p || field<uint64_t>(cb, 8) < uint64_t(p) ||
-        field<uint64_t>(cb, 8) - uint64_t(p) < sizeof(uint32_t)) return false;
-    *reinterpret_cast<uint32_t**>(cb + 0x10) = p + 1;
-    return true;
-}
-List* end_list(uint64_t dev) {
-    const int c = ctx_of_dev(dev);
-    const uint64_t gfx = field<uint64_t>(dev, 0x50), rec = field<uint64_t>(dev, 0x58);
-    if (c < 0 || !gfx || !rec || !mark_record_nonempty(gfx)) {
-        log("nd: cannot publish native list to retail record");
-        std::abort();
-    }
-    List* l = list_of(c);
-    // The original close appends its EOP label through our device callback,
-    // then publishes the record ready flag. Do not record speculatively here.
-    if (!g_records.publish(rec, l)) {
-        log("nd: native list record reused before submission (%#llx)", (unsigned long long)rec);
-        std::abort();
-    }
-    return l;
-}
 void clear_current(uint64_t dev, List* list) {
     const int c = ctx_of_dev(dev);
     if (c >= 0) g_ctx[c].cur.compare_exchange_strong(list, nullptr);
@@ -1643,65 +1609,18 @@ void add(int c, ng::Draw* d) {
     else nr::release_draw(d);
 }
 
-using Dev1Fn = D1_SYSV void (*)(uint64_t);
-using DrainFn = D1_SYSV bool (*)(uint64_t);
-DrainFn o_drain;
-using Dev3Fn = D1_SYSV void (*)(uint64_t, uint64_t, uint64_t);
-using Dev4Fn = D1_SYSV void (*)(uint64_t, uint64_t, uint64_t, uint64_t);
-using BeginFn = D1_SYSV uint64_t (*)(uint64_t);
-BeginFn o_begin;
-Dev1Fn o_end_submit;
-Dev3Fn o_end;
+using Dev4Fn = D1_SYSV void (*)(uint64_t,uint64_t,uint64_t,uint64_t);
 Dev4Fn o_begin_inherit;
-bool native_ring_enabled();
 uint64_t native_begin(uint64_t dev);
 D1_SYSV uint64_t h_begin(uint64_t dev) {
-    if(native_ring_enabled())return native_begin(dev);
-    const uint64_t record=o_begin(dev);
-    begin_list(dev);
-    return record;
+    return native_begin(dev);
 }
 D1_SYSV void h_begin_inherit(uint64_t dev, uint64_t rec, uint64_t a, uint64_t saved) {
     o_begin_inherit(dev, rec, a, saved);
     begin_list(dev);
 }
-bool native_close_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("D1_PC_NATIVE_CLOSE");
-        return (!v||std::atoi(v)!=0);
-    }();
-    return enabled;
-}
 template<class T> void put_field(uint64_t base,uint64_t offset,T value) {
     std::memcpy(reinterpret_cast<void*>(base+offset),&value,sizeof value);
-}
-bool native_drain_enabled() {
-    static const bool enabled=[] {
-        const char* v=std::getenv("D1_PC_NATIVE_DRAIN");
-        return native_close_enabled()&&(!v||std::atoi(v)!=0);
-    }();
-    return enabled;
-}
-bool native_ring_enabled() {
-    static const bool enabled=[] {
-        const char* v=std::getenv("D1_PC_NATIVE_RING");
-        return native_drain_enabled()&&(!v||std::atoi(v)!=0);
-    }();
-    return enabled;
-}
-bool native_cbm_enabled(){
-    static const bool enabled=[] {
-        const char* v=std::getenv("D1_PC_NATIVE_CBM");
-        return (!v||std::atoi(v)!=0);
-    }();
-    return enabled;
-}
-bool native_cbm_pool_enabled(){
-    static const bool enabled=[] {
-        const char* v=std::getenv("D1_PC_NATIVE_CBM_POOL");
-        return native_cbm_enabled()&&(!v||std::atoi(v)!=0);
-    }();
-    return enabled;
 }
 std::unique_ptr<ng::cbm::Pool> g_cbm_pool;
 std::array<uint32_t,ng::cbm::slot_count*2> g_cbm_table{};
@@ -1729,7 +1648,7 @@ D1_SYSV void h_cbm_init(uint64_t cbm,uint32_t bytes){
     if(!memory){log("nd: native CBM backing allocation failed");std::abort();}
     const uint64_t base=uint64_t(memory);
     register_native_host_region(base,l.bytes);
-    if(native_cbm_pool_enabled()){
+    {
         if(g_cbm_pool){log("nd: duplicate native CBM pool");std::abort();}
         g_cbm_manager=cbm;g_cbm_base=base;
         g_cbm_pool=std::make_unique<Pool>(uint32_t(bytes/chunk_bytes),field<uint32_t>(cbm,0x1c));
@@ -1741,31 +1660,6 @@ D1_SYSV void h_cbm_init(uint64_t cbm,uint32_t bytes){
         log("nd: native CBM owns %u chunks and all 512 completion slots",uint32_t(bytes/chunk_bytes));
         return;
     }
-    using NewFn=D1_SYSV uint64_t(*)(uint64_t);
-    using InitFn=D1_SYSV void(*)(uint64_t);
-    using SizeFn=D1_SYSV void(*)(uint64_t,uint32_t,uint32_t);
-    using BackFn=D1_SYSV void(*)(uint64_t,uint32_t,uint64_t);
-    const auto allocator=reinterpret_cast<NewFn>(nr::g_base+0x12AACB0)(0x50);
-    const auto table=reinterpret_cast<NewFn>(nr::g_base+0x12AAA90)(slot_count*slot_bytes);
-    if(!allocator||!table){log("nd: CBM metadata allocation failed");std::abort();}
-    reinterpret_cast<InitFn>(nr::g_base+0x6B100)(allocator);
-    reinterpret_cast<SizeFn>(nr::g_base+0x6B150)(allocator,chunk_bytes,bytes);
-    // Metadata remains compatible with the original destructor.
-    for(uint32_t i=0;i<slot_count;++i){
-        put_field(table,uint64_t(i)*8,uint32_t(0));
-        put_field(table,uint64_t(i)*8+4,invalid_chain);
-    }
-    put_field(cbm,0,table);
-    put_field(cbm,8,uint64_t(0));
-    put_field(cbm,0x18,uint32_t(0));
-    put_field(cbm,0x20,base+l.label);
-    put_field(cbm,0x30,allocator);
-    put_field(base,l.label,uint32_t(0));
-    reinterpret_cast<BackFn>(nr::g_base+0x6B190)(allocator,bytes,base);
-    log("nd: native CBM backing %p (%u bytes, %u chunks), host completion label",
-        memory,bytes,uint32_t(bytes/chunk_bytes));
-    // Backing remains process-owned even after retail metadata teardown:
-    // pending native completion callbacks must never target recycled memory.
 }
 D1_SYSV bool h_cbm_retire(uint64_t cbm){
     cbm_require(cbm);
@@ -1864,11 +1758,9 @@ void append_record(uint64_t global,uint64_t record,bool ready) {
         __atomic_store_n(reinterpret_cast<uint32_t*>(global+0x2C8),sequence+1,__ATOMIC_RELEASE);
         put_field(global,0xB4,field<uint32_t>(global,0xB4)^1u);
     };
-    if(native_ring_enabled()){
-        if(!native_fifo(global).reserve(record,ready,mirror)){
-            log("nd: native record FIFO full or duplicate reservation");std::abort();
-        }
-    } else mirror(field<uint32_t>(global,0x2C8));
+    if(!native_fifo(global).reserve(record,ready,mirror)){
+        log("nd: native record FIFO full or duplicate reservation");std::abort();
+    }
 }
 void reset_record(uint64_t record) {
     // 0x6AC60 initializes the common 24-byte record header.
@@ -1917,10 +1809,7 @@ uint64_t native_begin(uint64_t dev) {
     reinterpret_cast<ContextFn>(nr::g_base+0x7EF9C0)(nr::g_base+0x26E4840,dev+0x50);
     return record;
 }
-using ReserveRecordFn=D1_SYSV void(*)(uint64_t,uint64_t);
-ReserveRecordFn o_reserve_record;
 D1_SYSV void h_reserve_record(uint64_t dev,uint64_t record) {
-    if(!native_ring_enabled()){o_reserve_record(dev,record);return;}
     const uint64_t global=field<uint64_t>(dev,0);
     put_field(global,0x2D8,nr::eb<uint8_t>(0x18DCC30));
     reset_record(record);
@@ -1931,7 +1820,6 @@ D1_SYSV void h_reserve_record(uint64_t dev,uint64_t record) {
 // native record identities rather than importing a Gnm submission. The
 // original scheduler lock and cooperative progress helper are still required.
 D1_SYSV bool h_drain(uint64_t dev) {
-    if(!native_drain_enabled())return reinterpret_cast<DrainFn>(nr::g_base+0x7DD060)(dev);
     const uint64_t global=field<uint64_t>(dev,0);
     using LockFn=D1_SYSV void(*)(uint32_t,uint32_t);
     using HelpFn=D1_SYSV bool(*)();
@@ -1966,18 +1854,8 @@ D1_SYSV bool h_drain(uint64_t dev) {
             put_field(global,0xC8+uint64_t(ng::record_ring_slot(head))*8,uint64_t(0));
             put_field(global,0x2CC,head+1);
         };
-        if(native_ring_enabled()) {
-            record=native_fifo(global).take_ready(mirror);
-            if(!record)break;
-        } else {
-            const uint32_t head=field<uint32_t>(global,0x2CC);
-            const uint32_t tail=__atomic_load_n(reinterpret_cast<uint32_t*>(global+0x2C8),__ATOMIC_ACQUIRE);
-            if(!ng::ring_pending(head,tail))break;
-            record=field<uint64_t>(global,0xC8+uint64_t(ng::record_ring_slot(head))*8);
-            if(!record){log("nd: pending native ring slot is empty");std::abort();}
-            if(!__atomic_load_n(reinterpret_cast<uint32_t*>(record+0x18),__ATOMIC_ACQUIRE))break;
-            mirror(head);
-        }
+        record=native_fifo(global).take_ready(mirror);
+        if(!record)break;
         for(;;){
             const auto progress=field<uint64_t>(nr::g_base+0x26E4840,0x20);
             if(ng::progress_ready(__atomic_load_n(reinterpret_cast<uint32_t*>(progress),__ATOMIC_ACQUIRE),
@@ -2059,28 +1937,22 @@ void native_close(uint64_t dev,uint32_t kind,bool worker) {
     clear_current(dev,list);
     auto ready=[&]{__atomic_exchange_n(reinterpret_cast<uint32_t*>(rec+0x18),1u,__ATOMIC_SEQ_CST);};
     if(plan.append_ring){ready();append_record(global,rec,true);}
-    else if(native_ring_enabled()){
+    else {
         if(!native_fifo(global).publish(rec,ready)){
             log("nd: worker closed without a native FIFO reservation");std::abort();
         }
-    } else ready();
+    }
     put_field(dev,0x50,uint64_t(0));
     put_field(dev,0x58,uint64_t(0));
     // Worker records were enqueued by 0x7DEA90 before recording started.
     if(worker&&ng::worker_should_submit(completed,previous,nr::eb<uint8_t>(0x18DCC30)))
         h_drain(dev);
 }
-D1_SYSV void h_end(uint64_t dev, uint64_t rec, uint64_t kind) {
-    if(native_close_enabled()) {native_close(dev,uint32_t(kind),false);return;}
-    List* list = end_list(dev);
-    o_end(dev, rec, kind);
-    clear_current(dev, list);
+D1_SYSV void h_end(uint64_t dev, uint64_t, uint64_t kind) {
+    native_close(dev,uint32_t(kind),false);
 }
 D1_SYSV void h_end_submit(uint64_t dev) {
-    if(native_close_enabled()) {native_close(dev,0,true);return;}
-    List* list = end_list(dev);
-    o_end_submit(dev);
-    clear_current(dev, list);
+    native_close(dev,0,true);
 }
 
 D1_SYSV uint64_t s_noop() { return 0; }
@@ -2281,14 +2153,14 @@ bool install() {
     rep(0xF80A80, reinterpret_cast<const void*>(&s_pred_off));
     rep(0xF8F3A0, reinterpret_cast<const void*>(&s_dma));
     rep(0xF8B500, reinterpret_cast<const void*>(&s_set_cbs));
-    ok &= hook(0x7DCCE0, &h_begin, o_begin, "cmdlist_begin");
+    rep(0x7DCCE0,reinterpret_cast<const void*>(&h_begin));
     ok &= hook(0x7DD6A0, &h_begin_inherit, o_begin_inherit, "cmdlist_begin_inherit");
-    ok &= hook(0x7DCEC0, &h_end, o_end, "cmdlist_end");
-    ok &= hook(0x7DE950, &h_end_submit, o_end_submit, "cmdlist_end_and_submit");
-    if (native_drain_enabled()) ok &= hook(0x7DD060, &h_drain, o_drain, "native_device_drain");
-    if (native_ring_enabled()) ok &= hook(0x7DEA90, &h_reserve_record, o_reserve_record, "native_worker_reserve");
-    if (native_cbm_enabled()) rep(0x7EF7D0,reinterpret_cast<const void*>(&h_cbm_init));
-    if(native_cbm_pool_enabled()){
+    rep(0x7DCEC0,reinterpret_cast<const void*>(&h_end));
+    rep(0x7DE950,reinterpret_cast<const void*>(&h_end_submit));
+    rep(0x7DD060,reinterpret_cast<const void*>(&h_drain));
+    rep(0x7DEA90,reinterpret_cast<const void*>(&h_reserve_record));
+    rep(0x7EF7D0,reinterpret_cast<const void*>(&h_cbm_init));
+    {
         rep(0x7EF180,reinterpret_cast<const void*>(&h_cbm_wait));
         rep(0x7EF2A0,reinterpret_cast<const void*>(&h_cbm_retire));
         rep(0x7EEF90,reinterpret_cast<const void*>(&h_cbm_reclaim));
@@ -2696,7 +2568,7 @@ NativeSubmission* native_device_capture_record(uint64_t record) {
 }
 NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
     const uint64_t array=uint64_t(dcbs);
-    auto* list=nd::native_close_enabled() && count<=64 && array>0x30
+    auto* list=count<=64 && array>0x30
         ? nd::g_records.take_record(array-0x30) : nd::g_records.take(array,count);
     if(!list)log("nd: unknown retail submission record %#llx (%u segments)",(unsigned long long)array,count);
     return capture_native_list(list);
