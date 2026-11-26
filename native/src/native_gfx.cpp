@@ -33,6 +33,7 @@
 #include "os.h"
 #include "frame_telemetry.h"
 #include "host_memory.h"
+#include "native_asset_region.h"
 #include "native_record_registry.h"
 #include "../gfx/native_record_fifo.h"
 #include "../gfx/native_cbm_contract.h"
@@ -539,6 +540,45 @@ bool hook(uint64_t off, Fn host, Fn& orig, const char* name) {
     orig = reinterpret_cast<Fn>(t);
     return true;
 }
+
+// Engine GPU-class backing (0xB4780 reserve / 0xB4630 commit).
+// Keep the 0x30-byte retail descriptor and higher-level suballocation intact.
+namespace asset_backing {
+using ReserveFn=D1_SYSV uint64_t(*)(uint32_t,uint64_t,uint64_t,uint64_t);
+using CommitFn=D1_SYSV uint64_t(*)(uint64_t,uint64_t,uint8_t);
+ReserveFn original_reserve;
+CommitFn original_commit;
+template<class T> void store(uint64_t region,uint64_t off,T value){
+    std::memcpy(reinterpret_cast<void*>(region+off),&value,sizeof value);
+}
+D1_SYSV uint64_t reserve(uint32_t type,uint64_t bytes,uint64_t name,uint64_t region){
+    if(type!=1)return original_reserve(type,bytes,name,region);
+    const uint64_t rounded=asset_region::reserve_size(bytes);
+    const uint64_t base=rounded?reserve_native_asset_region(rounded):0;
+    store(region,0,uint64_t(0));store(region,8,uint64_t(0));
+    store(region,0x10,bytes);store(region,0x18,base);
+    store(region,0x20,name);store(region,0x28,type);
+    store(region,0x2c,uint8_t(0));
+    return base;
+}
+D1_SYSV uint64_t commit(uint64_t region,uint64_t bytes,uint8_t top){
+    if(field<uint32_t>(region,0x28)!=1)return original_commit(region,bytes,top);
+    const uint64_t base=field<uint64_t>(region,0x18);
+    const auto p=asset_region::plan(base,field<uint64_t>(region,0x10),
+        field<uint64_t>(region,0),field<uint64_t>(region,8),bytes,
+        top!=0,field<uint8_t>(region,0x2c)!=0);
+    if(!p.address||!commit_native_asset_region(base,p.address,bytes))return 0;
+    store(region,top?8:0,p.next_cursor);
+    return p.address;
+}
+bool install(){
+    const char* v=std::getenv("D1_PC_NATIVE_ASSET_BACKING");
+    if(!v||std::atoi(v)==0)return true;
+    bool ok=hook(0xB4780,&reserve,original_reserve,"asset_region_reserve");
+    ok&=hook(0xB4630,&commit,original_commit,"asset_region_commit");
+    return ok;
+}
+} // namespace asset_backing
 
 // ---------------------------------------------------------------------------- engine resource events
 namespace resev {
@@ -2105,6 +2145,7 @@ bool native_gfx_install() {
     ok &= hook(0x7DF630, &r_alloc_constants, o_alloc_constants, "alloc_constants");
     ok &= hook(0x7DEC20, &r_set_vertex_buffer, o_set_vertex_buffer, "set_vertex_buffer");
     ok &= hook(0x7E0780, &r_dispatch, o_dispatch, "dispatch");
+    ok &= asset_backing::install();
     ok &= nd::install();
     log("native gfx: %s", ok ? "native device ready" : "required native device hooks failed");
     return ok;

@@ -14,4 +14,8 @@ bool guest_move_current_mapping(uint64_t dst,uint64_t src,uint64_t size,uint64_t
 bool guest_write_current_mapping(uint64_t addr, uint64_t size, uint64_t identity,
                                  void (*write)(void*, void*), void* context);
 void register_native_host_region(uint64_t base, uint64_t size);
+// Private host backing for engine GPU-class regions. Reserve/commit are
+// separate so the original two-ended allocator can retain stable addresses.
+uint64_t reserve_native_asset_region(uint64_t size);
+bool commit_native_asset_region(uint64_t base,uint64_t address,uint64_t size);
 } // namespace d1

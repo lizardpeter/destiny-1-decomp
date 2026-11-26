@@ -265,3 +265,7 @@ target_include_directories(native-cbm-pool-test PRIVATE gfx)
 target_link_libraries(native-cbm-pool-test PRIVATE Threads::Threads)
 add_test(NAME native-cbm-pool COMMAND native-cbm-pool-test)
 set_tests_properties(native-cbm-pool PROPERTIES TIMEOUT 60)
+
+add_executable(native-asset-region-test tests/native_asset_region_test.cpp)
+target_include_directories(native-asset-region-test PRIVATE src)
+add_test(NAME native-asset-region COMMAND native-asset-region-test)

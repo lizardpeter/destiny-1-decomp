@@ -27,6 +27,7 @@
 #include "hle.h"
 #include "host_memory.h"
 #include "native_mapping_contract.h"
+#include "native_asset_region.h"
 #include "pc_mount_adapter.h"
 #include "runtime.h"
 #include "region_extent_cache.h"
@@ -95,6 +96,8 @@ struct Region { uint64_t size; int prot; bool direct; uint64_t phys; char name[3
 static std::map<uint64_t, Region> g_regions;  // start -> region
 static std::atomic<uint64_t> g_regions_gen{1};
 static uint64_t g_va_next = 0x400000000ull;
+// Only reservations created by the native asset hook may be committed by it.
+static std::map<uint64_t,uint64_t> g_native_asset_reservations;
 
 static int host_prot(int p) {
     int h = 0;
@@ -121,6 +124,44 @@ static uint64_t pick_va(uint64_t want, uint64_t len, uint64_t align) {
 static void* do_map(uint64_t want, uint64_t len, int prot, bool fixed, bool direct, uint64_t off, uint64_t align) {
     uint64_t va = pick_va(want, len, align);
     return direct ? os::phys_map(va, len, off, host_prot(prot), fixed) : os::alloc(va, len, host_prot(prot), fixed);
+}
+
+uint64_t reserve_native_asset_region(uint64_t size) {
+    if(!size||(size&(asset_region::alignment-1)))return 0;
+    std::lock_guard lk(g_mem_mutex);
+    const uint64_t va=pick_va(0,size,asset_region::alignment);
+    if(!va||va>=asset_region::address_limit||size>asset_region::address_limit-va)return 0;
+    void* p=os::reserve(va,size,false);
+    if(!p)return 0;
+    if(uint64_t(p)!=va){os::release(p,size);return 0;}
+    g_native_asset_reservations.emplace(va,size);
+    log("native asset region: reserved %#llx bytes at %#llx",
+        (unsigned long long)size,(unsigned long long)va);
+    return va;
+}
+
+bool commit_native_asset_region(uint64_t base,uint64_t address,uint64_t size) {
+    if(!size||((address|size)&(asset_region::alignment-1)))return false;
+    std::lock_guard lk(g_mem_mutex);
+    const auto reservation=g_native_asset_reservations.find(base);
+    if(reservation==g_native_asset_reservations.end()||
+       !mapping_contains(base,reservation->second,address,size))return false;
+    // Never replace an existing mapped allocation, even inside our reservation.
+    auto next=g_regions.lower_bound(address);
+    if(next!=g_regions.end()&&asset_region::overlaps(address,size,next->first,next->second.size))return false;
+    if(next!=g_regions.begin()){
+        const auto prev=std::prev(next);
+        if(asset_region::overlaps(address,size,prev->first,prev->second.size))return false;
+    }
+    void* p=os::alloc(address,size,os::kRead|os::kWrite,true);
+    if(uint64_t(p)!=address)return false;
+    Region r{size,0x33,false,0,"native_asset",0};
+    r.identity=g_regions_gen.fetch_add(1,std::memory_order_release)+1;
+    g_regions.emplace(address,r);
+    gpu_on_map(address,size);
+    log("native asset region: committed %#llx bytes at %#llx",
+        (unsigned long long)size,(unsigned long long)address);
+    return true;
 }
 
 static uint64_t sceKernelGetDirectMemorySize() { return kDirectMemSize; }
@@ -210,6 +251,13 @@ static int32_t sceKernelMunmap(void* addr, uint64_t len) {
     gpu_on_unmap(reinterpret_cast<uint64_t>(addr), len);
     std::lock_guard lk(g_mem_mutex);
     g_regions.erase(reinterpret_cast<uint64_t>(addr));
+    // A released reservation is no longer a safe target for fixed host commits.
+    // Conservatively invalidate on any partial unmap as well.
+    for(auto it=g_native_asset_reservations.begin();it!=g_native_asset_reservations.end();){
+        if(asset_region::overlaps(uint64_t(addr),len,it->first,it->second))
+            it=g_native_asset_reservations.erase(it);
+        else ++it;
+    }
     g_regions_gen.fetch_add(1, std::memory_order_release);
     return os::release(addr, len) ? SCE_OK : sce_err(22);
 }

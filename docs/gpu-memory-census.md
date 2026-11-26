@@ -17,7 +17,7 @@ going through a resource event, so each can be handled at its source.
   memory system) and `0x1279240`.
 - `0xB4630(region, size, from_top)` commits memory for a region: `sceKernelAllocateDirectMemory`
   + `sceKernelMapDirectMemory` with protection 0x33 (CPU and GPU read / write). Memory type 3
-  (write-combined, GPU) when the region's type field (`+0x6C`) is 1, else type 0.
+  (write-combined, GPU) when the commit descriptor's type field (`+0x28`, confirmed at `0xB46A6`) is 1, else type 0. The descriptor starts at global table entry +0x08; the separate allocation class at entry +0x6C is read by `0xB3080`.
 - `0xB4780(type, size, name, region)` reserves a region's address range
   (`sceKernelReserveVirtualRange`) and names it (`sceKernelSetVirtualRangeName`).
 - The regions are a table of 0x70-byte entries at `0x1AF9D68`; `0xB3080` maps the ten
