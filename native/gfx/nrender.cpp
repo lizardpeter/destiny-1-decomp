@@ -6083,6 +6083,16 @@ void Renderer::load_buffer(const LoadJob& j) {
 
 void Renderer::load_texture(const LoadJob& j) {
     const uint32_t* t = j.t;
+    const auto key=tex_key(t,j.res);
+    // The foreground can resolve a queued job before the loader starts.
+    // Check exact residency before decoding the layout or touching source memory.
+    {
+        std::lock_guard lk(m);
+        auto it=textures.find(key);
+        if(it!=textures.end()&&it->second&&it->second->matches_epoch(t,j.res)){
+            ++ld_skipped;return;
+        }
+    }
     const auto ts = fmt::decode_tsharp(t);
     const auto fi = fmt::data_format(ts.dfmt);
     const VkFormat f = fmt::vk_format(ts.dfmt, ts.nfmt);
@@ -6107,14 +6117,6 @@ void Renderer::load_texture(const LoadJob& j) {
        !(smi.from_callback&&ts.base==smi.hi_base&&ts.width==smi.full_w&&ts.height==smi.full_h&&
          ts.last_level+1==smi.full_mips&&smi.hi_bytes>=sf.total_size))return;
     if(j.mapping.empty()||j.size!=sf.total_size||!sf.total_size||sf.total_size>(128ull<<20))return;
-    const auto key = tex_key(t, j.res);
-    {
-        std::lock_guard lk(m);
-        auto it = textures.find(key);
-        if (it != textures.end() && it->second && !it->second->stale &&
-            it->second->res_val==j.res&&it->second->src_addr==ts.base&&
-            it->second->descriptor_epoch[0]&&texture_source_layout_equal(it->second->resident_descriptor[0],t)) {++ld_skipped;return;}
-    }
     // Own a complete tiled snapshot before detiling; the loader may be
     // delayed past the original package's mapping lifetime.
     static thread_local std::vector<uint8_t> source;
@@ -6124,15 +6126,19 @@ void Renderer::load_texture(const LoadJob& j) {
     const uint64_t content = hash_bytes(source.data(),sf.total_size);
     {
         std::lock_guard lk(m);
-        if (opt.res_current(j.obj)!=j.res||!guest_matches_current_spans(ts.base,sf.total_size,j.mapping,source.data())) { ++ld_stale; return; }
+        if(opt.res_current(j.obj)!=j.res){++ld_stale;return;}
         auto it = textures.find(key);
         if (it != textures.end() && it->second && !it->second->stale) {
             Image* img = it->second.get();
             const bool same_layout=img->descriptor_epoch[0]&&
                 texture_source_layout_equal(img->resident_descriptor[0],t)&&
                 !img->low_size&&!img->hi_size;
-            if(img->res_val==j.res&&img->src_addr==ts.base&&same_layout){++ld_skipped;return;}
+            if(img->matches_epoch(t,j.res)){++ld_skipped;return;}
             if(same_layout&&img->content==content&&img->src_size==sf.total_size){
+                // Only the relocation branch publishes here. New uploads
+                // validate once after detiling, at their actual publication.
+                if(!guest_matches_current_spans(ts.base,sf.total_size,j.mapping,source.data())||
+                   opt.res_current(j.obj)!=j.res){++ld_stale;return;}
                 img->remember_relocation();
                 img->res_val=j.res;img->res_obj=j.obj;img->src_addr=ts.base;
                 std::memcpy(img->resident_descriptor[0],t,32);
@@ -6163,6 +6169,13 @@ void Renderer::load_texture(const LoadJob& j) {
     if (missing < sf.levels) fill_missing_mips(missing, scratch.data(), level_off, sizes, ts, fi, sf, is3d);
     if(opt.res_current(j.obj)!=j.res){++ld_stale;return;}
     std::lock_guard lk(m);
+    // A foreground draw may have completed the upload during detiling.
+    if(auto it=textures.find(key);it!=textures.end()&&it->second&&it->second->matches_epoch(t,j.res)){
+        ++ld_skipped;return;
+    }
+    // Validate before allocating a command slot for a job that may be stale.
+    if(opt.res_current(j.obj)!=j.res||!guest_matches_current_spans(ts.base,sf.total_size,j.mapping,source.data())||
+       opt.res_current(j.obj)!=j.res){++ld_stale;return;}
     Recorder* const prev_tr = tr;
     struct Restore { Recorder* p; ~Restore() { tr = p; } } restore{prev_tr};
     tr = &up_rec;
@@ -6170,11 +6183,6 @@ void Renderer::load_texture(const LoadJob& j) {
     up_rec.submit_no = submit_seq.load();
     begin_record();
     if (up_rec.cur == UINT32_MAX) return;
-    // Recheck the resource epoch after acquiring m. For a normal surface the
-    // upload consumes the already-detiled CPU scratch; streaming uses its own ranges.
-    if(opt.res_current(j.obj)!=j.res||!guest_matches_current_spans(ts.base,sf.total_size,j.mapping,source.data())){
-        ++ld_stale;return;
-    }
     if (upload_texture(t,j.res,j.obj,scratch.data(),total,sf.total_size,content)) ++ld_tex;
 }
 
@@ -6352,6 +6360,9 @@ void Renderer::load_split_texture(const LoadJob& j){
     // Native linear data is now owned by this job, independent of tag pointers.
     // Validate mapping/content identity before publishing it to the GPU.
     std::lock_guard lk(m);
+    if(auto it=textures.find(key);it!=textures.end()&&it->second&&it->second->matches_epoch(j.t,j.res)){
+        ++ld_skipped;return;
+    }
     if(opt.res_current(j.obj)!=j.res){++ld_stale;return;}
     for(const auto& range:ranges)
         if(!guest_matches_current_spans(range.base,range.source_size,range.mapping,range.tiled.data())){
