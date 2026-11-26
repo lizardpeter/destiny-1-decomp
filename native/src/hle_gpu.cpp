@@ -1,10 +1,4 @@
-// Event queues, video out and a "null GPU" for libSceGnmDriver.
-//
-// The null GPU walks submitted PM4 command buffers and performs only their memory side
-// effects — end-of-pipe/end-of-shader fence writes, WRITE_DATA, DMA_DATA fills/copies —
-// and raises the end-of-pipe interrupt. Nothing is drawn. This lets the game's frame
-// pacing (which waits on GPU fences and flip events) run headless until a real renderer
-// replaces it.
+// Retail graphics/event ABI adapter. All rendering and GPU work are native Vulkan.
 #include <time.h>
 #include <x86intrin.h>
 
@@ -12,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -346,128 +341,15 @@ HLE("sceVideoOutSubmitFlip", sceVideoOutSubmitFlip)
 // ------------------------------------------------------------------ null GPU command processor
 static std::mutex g_gnm_mutex;
 static std::vector<Equeue*> g_eop_eqs;
-static std::atomic<uint64_t> g_packets{0};
-static uint64_t g_op_counts[256];
-static bool g_rendered = false;
-static uint64_t g_zpass = 0;
-static bool g_pred_on = false;
-static uint64_t g_pred_draws = 0, g_pred_sets = 0;
-
 void print_call_rates(uint64_t frames);
 static void gpu_stats(uint64_t frame) {
-    static const bool on = getenv("D1_GPU_STATS") != nullptr;
-    if (!on || frame % 300) return;
-    static uint64_t last_draw = 0, last_disp = 0, last_pk = 0;
-    const uint64_t draw = g_op_counts[0x27] + g_op_counts[0x2D] + g_op_counts[0x35] + g_op_counts[0x38] + g_op_counts[0x25];
-    const uint64_t disp = g_op_counts[0x15] + g_op_counts[0x16];
-    const uint64_t pk = g_packets.load();
-    static uint64_t last_pd = 0, last_ps = 0, last_zp = 0;
-    log("gpu stats @%llu: %.1f draws (%.1f predicated, %.1f SET_PREDICATION), %.1f dispatches, %.0f packets, %.1f occlusion dumps per frame",
-        (unsigned long long)frame, (draw - last_draw) / 300.0, (g_pred_draws - last_pd) / 300.0,
-        (g_pred_sets - last_ps) / 300.0, (disp - last_disp) / 300.0, (pk - last_pk) / 300.0, (g_zpass - last_zp) / 300.0);
-    last_zp = g_zpass;
-    last_draw = draw, last_disp = disp, last_pk = pk, last_pd = g_pred_draws, last_ps = g_pred_sets;
-    print_call_rates(300);
+    if (getenv("D1_GPU_STATS") && frame % 300 == 0) print_call_rates(300);
 }
 
 static void signal_eop() {
     std::vector<Equeue*> qs;
     { std::lock_guard lk(g_gnm_mutex); qs = g_eop_eqs; }
     for (auto* q : qs) q->trigger(0x40, kFilterGraphics, 0x40);
-}
-
-static uint64_t gpu_clock() {
-    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::high_resolution_clock::now().time_since_epoch()).count());
-}
-
-static void run_dcb(const uint32_t* p, uint64_t dwords, int depth) {
-    uint64_t i = 0;
-    bool eop = false;
-    while (i < dwords) {
-        uint32_t h = p[i];
-        uint32_t type = h >> 30;
-        if (type == 2) { ++i; continue; }
-        uint32_t count = ((h >> 16) & 0x3FFF) + 1;
-        if (type == 0) { i += 1 + count; continue; }
-        if (type != 3) { log("null GPU: bad PM4 header %#x at dword %llu", h, i); return; }
-        uint32_t op = (h >> 8) & 0xFF;
-        const uint32_t* b = p + i + 1;
-        ++g_op_counts[op];
-        ++g_packets;
-        if (g_pred_on && (h & 1) && (op == 0x27 || op == 0x2D || op == 0x35 || op == 0x38 || op == 0x25)) ++g_pred_draws;
-        switch (op) {
-        case 0x20:
-            g_pred_on = ((b[1] >> 16) & 7) != 0;
-            ++g_pred_sets;
-            break;
-        case 0x46: {
-            const uint32_t et = b[0] & 0x3F;
-            if (((b[0] >> 8) & 0xF) == 1 && (et == 0x39 || et == 0x15) && count >= 3 && !g_rendered) {
-                static uint64_t pixel_counter = 0;
-                const uint64_t a = uint64_t(b[1] & ~7u) | (uint64_t(b[2] & 0xFFFF) << 32);
-                auto* r = reinterpret_cast<volatile uint64_t*>(a);
-                if (a >= 0x10000 && guest_region_extent(a) >= 8 * 16) {
-                    for (int k = 0; k < 8; ++k) r[k * 2] = pixel_counter | 0x8000000000000000ull;
-                    pixel_counter += 0x2FFFFFFull;
-                    ++g_zpass;
-                }
-            }
-            break;
-        }
-        case 0x47: {
-            uint64_t addr = b[1] | (uint64_t(b[2] & 0xFFFF) << 32);
-            uint32_t data_sel = b[2] >> 29, int_sel = (b[2] >> 24) & 3;
-            if (data_sel == 1) *reinterpret_cast<volatile uint32_t*>(addr) = b[3];
-            else if (data_sel == 2) *reinterpret_cast<volatile uint64_t*>(addr) = b[3] | (uint64_t(b[4]) << 32);
-            else if (data_sel == 3 || data_sel == 4) *reinterpret_cast<volatile uint64_t*>(addr) = gpu_clock();
-            if (int_sel) eop = true;
-            break;
-        }
-        case 0x48: {
-            uint64_t addr = b[1] | (uint64_t(b[2] & 0xFFFF) << 32);
-            if ((b[2] >> 29) == 2) *reinterpret_cast<volatile uint32_t*>(addr) = b[3];
-            break;
-        }
-        case 0x49: {
-            uint64_t addr = b[2] | (uint64_t(b[3] & 0xFFFF) << 32);
-            uint32_t data_sel = b[1] >> 29;
-            if (data_sel == 1) *reinterpret_cast<volatile uint32_t*>(addr) = b[4];
-            else if (data_sel == 2) *reinterpret_cast<volatile uint64_t*>(addr) = b[4] | (uint64_t(b[5]) << 32);
-            else if (data_sel == 3) *reinterpret_cast<volatile uint64_t*>(addr) = gpu_clock();
-            break;
-        }
-        case 0x37: {
-            uint64_t addr = b[1] | (uint64_t(b[2]) << 32);
-            uint32_t n = count - 3;
-            uint32_t dst_sel = (b[0] >> 8) & 0xF;
-            if (dst_sel == 2 || dst_sel == 5) std::memcpy(reinterpret_cast<void*>(addr), b + 3, n * 4);
-            break;
-        }
-        case 0x50: {
-            uint32_t src_sel = (b[0] >> 29) & 3, dst_sel = (b[0] >> 20) & 3;
-            uint64_t src = b[1] | (uint64_t(b[2]) << 32), dst = b[3] | (uint64_t(b[4]) << 32);
-            uint32_t bytes = b[5] & 0x1FFFFF;
-            if (dst_sel == 0 || dst_sel == 3) {
-                if (src_sel == 2) {
-                    auto* d = reinterpret_cast<uint32_t*>(dst);
-                    for (uint32_t k = 0; k < bytes / 4; ++k) d[k] = b[1];
-                } else if (src_sel == 0 || src_sel == 3) {
-                    std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), bytes);
-                }
-            }
-            break;
-        }
-        case 0x3F:
-            if (depth < 4) run_dcb(reinterpret_cast<const uint32_t*>(b[0] | (uint64_t(b[1] & 0xFFFF) << 32)),
-                                   b[2] & 0xFFFFF, depth + 1);
-            break;
-        default:
-            break;
-        }
-        i += 1 + count;
-    }
-    if (eop) signal_eop();
 }
 
 bool native_device_active();
@@ -477,18 +359,17 @@ void native_device_execute_submit(NativeSubmission* batch);
 void native_device_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes);
 void gnm_signal_eop() { signal_eop(); }
 static void submit_now(uint32_t count, uint32_t* const* dcbs, const uint32_t* dcb_sizes) {
-    if (native_device_active()) return native_device_submit(count, dcbs, dcb_sizes);
-    for (uint32_t k = 0; k < count; ++k)
-        if (dcbs[k] && dcb_sizes[k]) run_dcb(dcbs[k], dcb_sizes[k] / 4, 0);
+    if (!native_device_active()) {
+        log("native GPU: submit attempted without an installed native device");
+        std::abort();
+    }
+    native_device_submit(count, dcbs, dcb_sizes);
 }
 
 namespace gpuq {
 struct Job {
     bool flip = false;
     NativeSubmission* native = nullptr; // consumed once by the queue thread
-    std::vector<std::vector<uint32_t>> fallback_words;
-    std::vector<uint32_t*> dcbs;
-    std::vector<uint32_t> sizes;
     int32_t buf = -1;
     int64_t arg = 0;
 };
@@ -509,8 +390,6 @@ void run(Job& j) {
     if (j.native) {
         native_device_execute_submit(j.native);
         j.native = nullptr;
-    } else if (!j.dcbs.empty()) {
-        submit_now(uint32_t(j.dcbs.size()), j.dcbs.data(), j.sizes.data());
     }
     if (!j.flip) return;
     void* addr = nullptr;
@@ -562,21 +441,11 @@ void push(Job&& j) {
     cv.notify_one();
 }
 void capture_submit(Job& j, uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
-    if (native_device_active()) {
-        j.native = native_device_capture_submit(count, dcbs, sizes);
-        return;
+    if (!native_device_active()) {
+        log("native GPU: queued submit attempted without an installed native device");
+        std::abort();
     }
-    // Research/null path: own the packet data as well. Never defer reads of
-    // a caller's mutable command memory to the queue thread.
-    j.fallback_words.resize(count);
-    j.dcbs.resize(count);
-    j.sizes.resize(count);
-    for (uint32_t k = 0; k < count; ++k) {
-        const uint32_t n = dcbs[k] ? sizes[k] / 4 : 0;
-        if (n) j.fallback_words[k].assign(dcbs[k], dcbs[k] + n);
-        j.dcbs[k] = j.fallback_words[k].data();
-        j.sizes[k] = n * 4;
-    }
+    j.native = native_device_capture_submit(count, dcbs, sizes);
 }
 void push_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
     Job j;
@@ -697,9 +566,7 @@ bool gpu_on_fault(void* uc, void* addr) {
 }
 
 void print_gpu_summary() {
-    log("null GPU: %llu packets, %llu flips", g_packets.load(), g_frames.load());
-    for (int op = 0; op < 256; ++op)
-        if (g_op_counts[op]) log("  PM4 op %#04x x%llu", op, g_op_counts[op]);
+    log("native GPU: %llu presented frames", (unsigned long long)g_frames.load());
 }
 
 }  // namespace d1
