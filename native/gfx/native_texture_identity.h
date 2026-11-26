@@ -10,6 +10,9 @@ inline std::array<uint32_t,8> texture_identity_words(const uint32_t* t){
     for(unsigned i=0;i<8;++i)c[i]=t[i];
     const uint32_t type=t[3]>>28;
     c[0]=0;c[1]&=~0xfffffu;
+    // Component selection belongs to the VkImageView, not the stored image.
+    // All swizzle variants of a registered source share the same allocation.
+    c[3]&=~0xfffu;
     if(type==10||type==12||type==13){c[3]&=~0xf000u;return c;}
     c[2]=0;c[3]&=~0xff000u;c[4]&=0x1fffu;
     if(type==8||type==9||type==11){

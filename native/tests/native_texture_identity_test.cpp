@@ -16,5 +16,21 @@ int main(){
     moved[0]=0xffff;moved[1]^=0x12300;moved[3]^=0x1000;
     check(texture_source_layout_equal(high,moved));
     moved[3]^=1u<<20;check(!texture_source_layout_equal(high,moved));
+    // Distinct swizzles and minimum LOD still reference the same bytes.
+    uint32_t view[8];for(unsigned i=0;i<8;++i)view[i]=high[i];
+    view[3]^=0xfffu;view[1]^=0xabc00u;
+    check(texture_identity_words(high)==texture_identity_words(view));
+    check(texture_source_layout_equal(high,view));
+    view[1]^=1u<<20;
+    check(texture_identity_words(high)!=texture_identity_words(view));
+    check(!texture_source_layout_equal(high,view));
+    // Array and volume resources also use view-level component selection.
+    for(uint32_t type:{10u,12u,13u}){
+        high[3]=(high[3]&0x0fffffffu)|(type<<28);
+        for(unsigned i=0;i<8;++i)view[i]=high[i];
+        view[3]^=0xfffu;
+        check(texture_identity_words(high)==texture_identity_words(view));
+        check(texture_source_layout_equal(high,view));
+    }
     std::puts("split descriptor identity and independent source layout checks passed");
 }
