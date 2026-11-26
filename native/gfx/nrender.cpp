@@ -15,6 +15,7 @@
 #include "native_staging_pages.h"
 #include "native_resource_identity.h"
 #include "native_descriptor_slots.h"
+#include "native_texture_identity.h"
 #include "../src/native_ranges.h"
 #include "../src/host_memory.h"
 
@@ -891,7 +892,7 @@ struct Renderer {
     }
     uint64_t dma_tex_hits = 0, feedback_draws = 0, readback_stale = 0, cpu_stale = 0;
     uint64_t texture_range_rejects=0, split_partial_kept=0, split_descriptor_rejects=0, texture_upload_failures=0;
-    uint64_t resident_descriptor_hits=0,readback_unused_skipped=0;
+    uint64_t resident_descriptor_hits=0,readback_unused_skipped=0,split_layout_guesses=0;
     std::atomic<uint64_t> expired_gpu_results{0};
     // The GPU's results reached guest memory (a readback): copies made from that memory (a
     // texture over a render target's memory, e.g. glyphs drawn into a cache texture) are stale.
@@ -1052,6 +1053,7 @@ struct Renderer {
         uint16_t full_w = 0, full_h = 0, full_d = 1;
         uint8_t full_mips = 1, has_hi = 0;
         bool from_callback = false;
+        fmt::TSharp low_layout{};
     };
     std::mutex mip_m;
     std::unordered_map<uint32_t, StreamMipInfo> stream_mips;  // res_id -> authored full dimensions & mip bases
@@ -1097,17 +1099,8 @@ struct Renderer {
     // resource ID (res >> 32) guarantees one persistent VkImage for the texture's lifetime.
     static uint64_t tex_key(const uint32_t* t, uint64_t res) {
         if (!res) return hash_bytes(t, 32) & ~(1ull << 63);
-        const auto ts = fmt::decode_tsharp(t);
-        if (ts.type == 10 || ts.type == 12 || ts.type == 13) {
-            uint32_t c[8];
-            std::memcpy(c, t, 32);
-            c[0] = 0, c[1] &= ~0xFFFFFu, c[3] &= ~0xF000u;
-            return hash_bytes(c, 32, (res >> 32) * 0x9E3779B97F4A7C15ull) | (1ull << 63);
-        }
-        uint32_t c[8];
-        std::memcpy(c, t, 32);
-        c[0] = 0, c[1] &= ~0xFFFFFu, c[2] = 0, c[3] &= ~0xFF000u, c[4] &= 0x1FFFu;
-        return hash_bytes(c, 32, (res >> 32) * 0x9E3779B97F4A7C15ull) | (1ull << 63);
+        const auto c=texture_identity_words(t);
+        return hash_bytes(c.data(),32,(res>>32)*0x9E3779B97F4A7C15ull)|(1ull<<63);
     }
     void evict_textures();
     uint16_t sampler_id(const uint32_t* s, bool nearest = false);
@@ -2360,6 +2353,9 @@ Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res, uint64_t obj, co
                 if (info.low_base) cur.low_base = info.low_base;
                 if (info.hi_base) cur.hi_base = info.hi_base;
             }
+            if(cur.has_hi&&cur.full_mips>1&&ts.base&&ts.base==cur.low_base&&
+               ts.last_level+1==uint32_t(cur.full_mips)-1)
+                cur.low_layout=ts;
             info = cur;
         }
     }
@@ -2431,6 +2427,10 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     const uint32_t full_d = streamed ? smi.full_d : (is3d ? ts.depth : 1);
     const uint32_t full_levels = streamed ? smi.full_mips : std::min(ts.last_level + 1, tiling::kMaxMips);
     const bool cur_is_low = streamed && ts.last_level + 1 < full_levels;
+    const auto matches_shape=[&](const Image* img){
+        return img->format==f&&img->w==full_w&&img->h==full_h&&img->d==full_d&&
+               img->layers==layers&&img->levels==full_levels&&img->cube==cube&&img->is3d==is3d;
+    };
 
     tiling::Surface sf;
     sf.tile_mode = ts.tiling, sf.bpp = fi.bpp, sf.block = fi.block, sf.pow2 = ts.pow2;
@@ -2465,10 +2465,13 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         img->last_used = rc().submit_no;
         img->last_frame = st.frames;
         if (res && img->res_val) {
-            const bool have_want = streamed
+            const unsigned layout_slot=streamed&&!cur_is_low?1:0;
+            const bool same_layout=img->descriptor_epoch[layout_slot]&&
+                texture_source_layout_equal(img->resident_descriptor[layout_slot],t);
+            const bool have_want = matches_shape(img)&&same_layout&&(streamed
                 ? (img->res_val == res && (cur_is_low ? (img->low_loaded && img->low_base == ts.base)
                               : (img->hi_loaded && img->hi_base == ts.base && img->low_loaded && img->low_base == smi.low_base)))
-                : (img->res_val == res && img->src_addr == ts.base);
+                : (img->res_val == res && img->src_addr == ts.base));
             if (have_want) {
                 const unsigned slot=streamed&&!cur_is_low?1:0;
                 std::memcpy(img->resident_descriptor[slot],t,32);
@@ -2478,7 +2481,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 st.t_tex_hit += now_ns() - t_in;
                 return img;
             }
-            if (!streamed && img->src_size == cur_bytes &&
+            if (!streamed && matches_shape(img)&&same_layout&&img->src_size == cur_bytes &&
                 (prepared ? prepared_hash==img->content :
                  (guest_readable_range(ts.base,cur_bytes)&&hash_bytes(reinterpret_cast<const void*>(ts.base),cur_bytes)==img->content))) {
                 img->res_val = res, img->src_addr = ts.base;
@@ -2490,11 +2493,16 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 return img;
             }
             ++st.res_changed;
-            if (streamed && img->res_val != res) {
+            if (streamed && (img->res_val != res||!matches_shape(img))) {
                 // Epoch changes may represent writes at unchanged addresses. Until
                 // per-mip content identities are proven, refresh conservatively.
                 img->low_loaded = img->hi_loaded = false;
                 img->descriptor_epoch[0]=img->descriptor_epoch[1]=0;
+            }
+            if(streamed&&!same_layout){
+                if(cur_is_low)img->low_loaded=false;
+                else img->hi_loaded=false;
+                img->descriptor_epoch[layout_slot]=0;
             }
             prev = std::move(it->second);
             textures.erase(it), found = false; ++views_gen;
@@ -2675,6 +2683,15 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 sf_low.pitch = sf_low.width;
                 sf_low.depth = is3d ? std::max(1u, full_d >> 1) : 1;
                 sf_low.levels = full_levels - 1;
+                // A small mip chain may use a different physical tile mode
+                // and pitch from the high descriptor. Prefer its actual
+                // captured layout over a guess derived from mip zero.
+                const auto& low=smi.low_layout;
+                if(low.base==smi.low_base&&low.dfmt==ts.dfmt&&low.nfmt==ts.nfmt&&
+                   low.last_level+1==sf_low.levels){
+                    sf_low.width=low.width;sf_low.height=low.height;
+                    sf_low.pitch=low.pitch;sf_low.tile_mode=low.tiling;sf_low.pow2=low.pow2;
+                }else ++split_layout_guesses;
                 tiling::layout(sf_low);
                 if (guest_readable_range(smi.low_base,sf_low.total_size)) {
                     if (upload_range(sf_low, smi.low_base, 0, full_levels - 1, 1)) {
@@ -6427,9 +6444,14 @@ void notify_texture_mips(const uint32_t* tsharp, uint64_t res, uint64_t obj, uin
             info.full_mips = *reinterpret_cast<const uint8_t*>(obj + 0x31);
             info.has_hi = *reinterpret_cast<const uint8_t*>(obj + 0x34);
         }
+        if(info.low_base!=low_base)info.low_layout={};
         info.low_base = low_base;
         info.hi_base = hi_base;
         info.from_callback = true;
+        if(tsharp&&!hi_base&&low_base){
+            const auto low=fmt::decode_tsharp(tsharp);
+            if(low.base==low_base)info.low_layout=low;
+        }
     }
     if (tsharp) prefetch_texture(tsharp, res, obj);
 }
@@ -6741,6 +6763,8 @@ void print_stats() {
             (unsigned long long)g->resident_descriptor_hits,(unsigned long long)g->readback_unused_skipped,
             double(g->ring_worker_reserved)/1048576.0,double(g->ring_worker_payload)/1048576.0);
         g->resident_descriptor_hits=g->readback_unused_skipped=g->ring_worker_reserved=g->ring_worker_payload=0;
+        log("native renderer: split low layouts reconstructed without a captured descriptor %llu",(unsigned long long)g->split_layout_guesses);
+        g->split_layout_guesses=0;
         {
             std::lock_guard dl(g->bindless_m);
             uint32_t live=0,peak=0,binding=0;
