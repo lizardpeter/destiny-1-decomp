@@ -56,7 +56,7 @@ static uint8_t* near_alloc(size_t n) {
 static size_t prologue_len(const uint8_t* p) {
     if (p[0] >= 0x50 && p[0] <= 0x57) return 1;                                  // push r64
     if (p[0] == 0x41 && p[1] >= 0x50 && p[1] <= 0x57) return 2;                  // push r8-r15
-    if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0xE5) return 3;                  // mov rbp, rsp
+    // 0xB2F40 begins with push r14; push rbx; movsxd rbx,r8d.\n    // Register-only MOVSXD is position independent; do not admit memory operands.\n    if (p[0] >= 0x48 && p[0] <= 0x4F && p[1] == 0x63 && (p[2] & 0xC0) == 0xC0) return 3;\n    if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0xE5) return 3;                  // mov rbp, rsp
     if (p[0] == 0x48 && p[1] == 0x83 && p[2] == 0xEC) return 4;                  // sub rsp, imm8
     if (p[0] == 0x48 && p[1] == 0x81 && p[2] == 0xEC) return 7;                  // sub rsp, imm32
     return 0;
