@@ -1314,8 +1314,6 @@ D1_SYSV uint64_t build_3d(void* p,uint32_t w,uint32_t h,uint32_t depth,uint32_t 
 // this synchronous callback scope. Addresses alone cannot prove a full chain.
 struct MipBounds {uint64_t low=0,high=0,low_size=0,high_size=0;};
 thread_local MipBounds mip_bounds;
-using MipHandlesFn=D1_SYSV void(*)(uint64_t,uint32_t,uint32_t);
-MipHandlesFn o_mip_relocation;
 uint64_t mip_allocation_size(uint32_t h,uint64_t base){
     if(h==UINT32_MAX||base<0x10000)return 0;
     using SizeFn=D1_SYSV uint64_t(*)(uint32_t*);
@@ -1347,8 +1345,41 @@ D1_SYSV void h_mip_handles(uint64_t tag,uint32_t low,uint32_t high){
     // Malformed or unbound handle: never strand the publication gate.
     if(pending_mip_bind.owns_lock())pending_mip_bind.unlock();
 }
+// 0xDE3B0: resolve the memory link container, optionally following
+// its indirect owner. The tag's flags determine which record owns links.
+uint64_t mip_link_container(uint32_t tag){
+    using namespace ng::move;
+    const auto slot=relocation::datum_slot(tag);
+    const auto id=field<uint32_t>(slot,0x10);
+    if(!memory_link_container(id))return 0;
+    auto container=relocation::entry(id);
+    if(container&&(field<uint16_t>(slot,4)&4))
+        container=relocation::entry(field<uint32_t>(container,0xc));
+    return container;
+}
+// Complete 0xE00D0 -> 0xDE860 -> 0xE01C0 notification path.
+// The original linked-resource table and callback ordering are retained;
+// no console code or trampoline is needed for this notification chain.
 D1_SYSV void h_mip_relocation(uint64_t tag,uint32_t low,uint32_t high){
-    MipBoundsScope bounds(low,high);o_mip_relocation(tag,low,high);
+    MipBoundsScope bounds(low,high);
+    if(uint32_t(tag)==UINT32_MAX)return;
+    const auto container=mip_link_container(uint32_t(tag));
+    if(!container)return;
+    const uint32_t token=field<uint32_t>(container,0x10);
+    const uint64_t table=nr::eb<uint64_t>(0x2587A10);
+    using Callback=D1_SYSV void(*)(uint64_t,uint64_t,uint64_t);
+    ng::move::visit_memory_links(token,
+        [&](uint16_t i){
+            const auto base=table+field<uint64_t>(table,0);
+            return field<uint32_t>(base,uint64_t(i)*field<uint64_t>(table,0x10));
+        },
+        [&](uint16_t i){
+            return field<uint16_t>(table,field<uint64_t>(table,8)+8+uint64_t(i)*4);
+        },
+        [&](uint32_t resource){
+            const auto callback=nr::eb<Callback>(0x254EE80);
+            if(callback)callback(resource,mip_bounds.low,mip_bounds.high);
+        });
 }
 using MipFn = D1_SYSV void (*)(uint32_t, uint64_t, uint64_t);
 MipFn o_mips;
@@ -1503,7 +1534,9 @@ bool install() {
     if(!handle_hook)log("nd: replacing native texture_mip_handle_bounds (eboot+0xe01e0) failed");
     else log("nd: native texture_mip_handle_bounds replacement installed");
     mip_pair_hooked=mip_hook&&handle_hook;ok &= mip_pair_hooked;
-    ok &= hook(0xE00D0,&h_mip_relocation,o_mip_relocation,"texture_mip_relocation_bounds");
+    const bool relocation_hook=replace_eboot_function(0xE00D0,reinterpret_cast<const void*>(&h_mip_relocation));
+    if(!relocation_hook)log("nd: replacing native texture_mip_relocation_bounds (eboot+0xe00d0) failed");
+    ok &= relocation_hook;
     if(native_bind_enabled()){
         ok &= hook(0xF89BD0,&texture_constructor::calculate_footprint,texture_constructor::original_footprint,"texture_footprint");
         ok &= replace_eboot_function(0xF83530,reinterpret_cast<const void*>(&texture_constructor::build_2d));
