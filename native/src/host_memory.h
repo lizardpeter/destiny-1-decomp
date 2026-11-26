@@ -5,6 +5,8 @@
 namespace d1 {
 // Host mapping metadata used by native GPU resources. No retail ABI types.
 uint64_t guest_region_extent(uint64_t addr);
+// CPU-readable contiguous mapped coverage, not a resource allocation size.
+bool guest_readable_range(uint64_t addr,uint64_t size);
 uint64_t guest_mapping_identity(uint64_t addr, uint64_t size);
 // Copy a stable mapping while the host's tracked mapping table is locked.
 bool guest_copy_current_mapping(uint64_t addr, uint64_t size, uint64_t identity, void* destination);

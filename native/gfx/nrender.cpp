@@ -846,9 +846,16 @@ struct Renderer {
         // Preserve actual copy order above. Only the subsequent notification
         // ranges are merged; visit the native image table once per list.
         ranges = native_ranges::merged_writes(ranges);
+        // Update watched generations directly: do not enqueue the same DMA
+        // writes for a second full texture-cache invalidation in pre_pass.
         if (dynamic_copy) {
-            std::lock_guard dl(dyn_m);
-            for (const auto& [a, e] : ranges) dyn_q.emplace_back(a, e - a);
+            dyn_events += ranges.size();
+            for(auto& [base,entry]:dyn_mem){
+                if(!native_ranges::overlaps(ranges,base,std::max<uint64_t>(entry.first,1)))continue;
+                ++entry.second;
+                ++dyn_bumps;
+                if(dyn_targets.count(base))++dyn_target_bumps;
+            }
         }
         auto overlaps = [&](uint64_t a, uint64_t n) { return native_ranges::overlaps(ranges, a, n); };
         bool changed = false;
@@ -879,6 +886,7 @@ struct Renderer {
             }
     }
     uint64_t dma_tex_hits = 0, feedback_draws = 0, readback_stale = 0, cpu_stale = 0;
+    uint64_t texture_range_rejects=0, split_partial_kept=0, split_descriptor_rejects=0, texture_upload_failures=0;
     std::atomic<uint64_t> expired_gpu_results{0};
     // The GPU's results reached guest memory (a readback): copies made from that memory (a
     // texture over a render target's memory, e.g. glyphs drawn into a cache texture) are stale.
@@ -2385,7 +2393,10 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                               smi.low_base && ts.base == smi.low_base;
         const bool high_desc = ts.width == smi.full_w && ts.height == smi.full_h &&
                                ts.last_level + 1 == smi.full_mips && smi.hi_base && ts.base == smi.hi_base;
-        if ((!low_desc && !high_desc) || !smi.low_base) return nullptr;
+        if ((!low_desc && !high_desc) || !smi.low_base) {
+            ++split_descriptor_rejects;
+            return nullptr;
+        }
     }
     const uint32_t full_w = streamed ? smi.full_w : ts.width;
     const uint32_t full_h = streamed ? smi.full_h : ts.height;
@@ -2401,7 +2412,10 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
     tiling::layout(sf);
     const uint64_t cur_bytes = cur_is_low ? sf.total_size : (streamed ? sf.mips[0].size : sf.total_size);
-    if(prepared ? prepared_source_size!=cur_bytes : guest_region_extent(ts.base)<cur_bytes)return nullptr;
+    if(prepared ? prepared_source_size!=cur_bytes : !guest_readable_range(ts.base,cur_bytes)){
+        ++texture_range_rejects;
+        return nullptr;
+    }
 
     std::unique_ptr<Image> prev;
     auto it = textures.find(key);
@@ -2434,7 +2448,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             }
             if (!streamed && img->src_size == cur_bytes &&
                 (prepared ? prepared_hash==img->content :
-                 (guest_region_extent(ts.base)>=cur_bytes&&hash_bytes(reinterpret_cast<const void*>(ts.base),cur_bytes)==img->content))) {
+                 (guest_readable_range(ts.base,cur_bytes)&&hash_bytes(reinterpret_cast<const void*>(ts.base),cur_bytes)==img->content))) {
                 img->res_val = res, img->src_addr = ts.base;
                 ++views_gen;
                 ++st.res_moves;
@@ -2500,7 +2514,11 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         if (!src_lv_count || src_lv_begin >= s_src.levels || src_lv_count > s_src.levels - src_lv_begin ||
             dst_lv_begin >= full_levels || src_lv_count > full_levels - dst_lv_begin) return false;
         const auto& last = s_src.mips[src_lv_begin + src_lv_count - 1];
-        if (!base_addr || (prepared ? prepared_source_size : guest_region_extent(base_addr)) < last.offset + last.size) return false;
+        if (!base_addr || (prepared ? prepared_source_size < last.offset + last.size :
+                          !guest_readable_range(base_addr,last.offset + last.size))) {
+            ++texture_range_rejects;
+            return false;
+        }
         uint64_t total = 0;
         std::vector<uint64_t> sizes(src_lv_count), level_off(src_lv_count);
         // The engine rounds the compressed low descriptor to a block boundary.
@@ -2623,7 +2641,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 sf_low.depth = is3d ? std::max(1u, full_d >> 1) : 1;
                 sf_low.levels = full_levels - 1;
                 tiling::layout(sf_low);
-                if (guest_region_extent(smi.low_base) >= sf_low.total_size) {
+                if (guest_readable_range(smi.low_base,sf_low.total_size)) {
                     if (upload_range(sf_low, smi.low_base, 0, full_levels - 1, 1)) {
                         img->low_loaded = true;
                         img->low_base = smi.low_base;
@@ -2675,8 +2693,21 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
 
     if (prev) bury(std::move(prev));
     if (!ok) {
-        bury(std::move(img));
-        textures.erase(key); ++views_gen; // failed upload must be retryable
+        ++texture_upload_failures;
+        // A failed high-level upgrade must not destroy the independently
+        // valid low chain. Keep only a matching, already uploaded low chain;
+        // high descriptors still fail closed until mip 0 is actually ready.
+        if(streamed && img->low_loaded && img->low_base==smi.low_base){
+            img->hi_loaded=false;
+            img->last_used=rc().submit_no;
+            img->last_frame=st.frames;
+            textures[key]=std::move(img);
+            ++split_partial_kept;
+        }else{
+            bury(std::move(img));
+            textures.erase(key);
+        }
+        ++views_gen;
         return nullptr;
     }
     Image* out = img.get();
@@ -6638,6 +6669,10 @@ void print_stats() {
             (unsigned long long)g->readback_stale, (unsigned long long)g->cpu_stale);
         if (const uint64_t expired = g->expired_gpu_results.exchange(0))
             log("native renderer: %llu delayed results rejected (mapping expired or unwritable)", (unsigned long long)expired);
+        log("native renderer: texture failures since last report: %llu mapped range, %llu split descriptor, %llu upload, %llu valid low chains retained",
+            (unsigned long long)g->texture_range_rejects,(unsigned long long)g->split_descriptor_rejects,
+            (unsigned long long)g->texture_upload_failures,(unsigned long long)g->split_partial_kept);
+        g->texture_range_rejects=g->split_descriptor_rejects=g->texture_upload_failures=g->split_partial_kept=0;
         g->snap_copies = g->snap_reused = g->dma_stale = g->readback_stale = g->cpu_stale = 0;
         log("native renderer: dynamic data refreshed at submission (no mapped VRAM reads): constants %llu of %llu, vertices %llu of %llu, indices %llu of %llu",
             (unsigned long long)g->recopy_changed[0], (unsigned long long)g->recopy_n[0], (unsigned long long)g->recopy_changed[1],

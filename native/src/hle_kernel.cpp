@@ -397,6 +397,17 @@ static bool readable_span_locked(uint64_t addr,MappingSpan& span){
     span={r->first,r->second.size,r->second.identity};
     return true;
 }
+bool guest_readable_range(uint64_t addr,uint64_t size){
+    if(!size||size>UINT64_MAX-addr)return false;
+    std::lock_guard lk(g_mem_mutex);
+    while(size){
+        MappingSpan r{};
+        if(!readable_span_locked(addr,r)||!mapping_contains(r.base,r.size,addr,1))return false;
+        const uint64_t n=std::min(size,r.size-(addr-r.base));
+        addr+=n;size-=n;
+    }
+    return true;
+}
 bool guest_capture_move_spans(uint64_t dst,uint64_t src,uint64_t size,MappingSpans& dst_spans,MappingSpans& src_spans){
     std::lock_guard lk(g_mem_mutex);
     const bool ok=capture_mapping_spans(src,size,src_spans,readable_span_locked)&&
