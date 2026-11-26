@@ -19,7 +19,14 @@ inline const char* find_last_char(const char* a, int c) { return std::strrchr(a,
 inline char* copy_string(char* d, const char* s) { return std::strcpy(d, s); }
 inline char* copy_prefix(char* d, const char* s, size_t n) { return std::strncpy(d, s, n); }
 inline char* append(char* d, const char* s) { return std::strcat(d, s); }
-inline char* append_prefix(char* d, const char* s, size_t n) { return std::strncat(d, s, n); }
+inline char* append_prefix(char* d, const char* s, size_t n) {
+    char* end = d + std::strlen(d);
+    size_t count = 0;
+    while (count < n && s[count]) ++count;
+    std::memcpy(end, s, count);
+    end[count] = 0;
+    return d;
+}
 inline size_t span(const char* a, const char* b) { return std::strspn(a, b); }
 inline size_t reject_span(const char* a, const char* b) { return std::strcspn(a, b); }
 inline const char* find_any(const char* a, const char* b) { return std::strpbrk(a, b); }
