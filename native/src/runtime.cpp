@@ -254,6 +254,23 @@ d1_call_guest:
     pop %rbx
     pop %rbp
     ret
+    .globl d1_call_guest4
+d1_call_guest4:
+    push %rbp
+    push %rbx
+    mov %rsp, %rbx
+    and $-16, %rsp
+    lea d1_root_frame(%rip), %rbp
+    mov %rdi, %rax
+    mov %rsi, %rdi
+    mov %rdx, %rsi
+    mov %rcx, %rdx
+    mov %r8, %rcx
+    call *%rax
+    mov %rbx, %rsp
+    pop %rbx
+    pop %rbp
+    ret
 )");
 
 // Thread entry that scePthreadExit can leave early: d1_call_guest_exitable saves its stack
@@ -327,9 +344,9 @@ static thread_local Tcb* t_tcb = nullptr;
 
 void* tls_create_thread_block() {
     const Module& exe = rt().modules[0];
-    const uint64_t align = std::max<uint64_t>(exe.tls_align, 16);
-    g_static_tls_size = (exe.tls_memsz + align - 1) & ~(align - 1);
+    // Static TLS size is published once by link_all, before guest threads start.
     uint8_t* blk = static_cast<uint8_t*>(aligned_alloc64(g_static_tls_size + sizeof(Tcb) + 64));
+    if (!blk) throw std::bad_alloc();
     std::memset(blk, 0, g_static_tls_size + sizeof(Tcb) + 64);
     uint8_t* tls = blk + 64;
     Tcb* tcb = reinterpret_cast<Tcb*>(tls + g_static_tls_size);
@@ -393,6 +410,10 @@ void* native_libc_leaf(const std::string& nid, bool include_math); // pc_libc_im
 
 void link_all() {
     auto& mods = rt().modules;
+    if (mods.empty()) throw std::runtime_error("no executable for TLS layout");
+    const auto& exe = mods.front();
+    const uint64_t tls_align = std::max<uint64_t>(exe.tls_align, 16);
+    g_static_tls_size = (exe.tls_memsz + tls_align - 1) & ~(tls_align - 1);
     int next_modid = 1;
     for (auto& m : mods)
         if (m.tls_memsz) m.tls_modid = next_modid++;
