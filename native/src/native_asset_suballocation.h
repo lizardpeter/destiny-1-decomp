@@ -9,7 +9,7 @@ struct State {
     uint64_t base=0, low_backed=0, high_backed=0, capacity=0;
     uint64_t committed=0, low_used=0, high_used=0;
 };
-enum class Path { fallback, ready, grow_low, grow_high };
+enum class Path { fallback, ready, grow_low, grow_high, redistribute_high };
 struct Allocation {
     Path path=Path::fallback;
     uint64_t address=0, low_backed=0, high_backed=0, used=0, growth=0, padding=0;
@@ -34,8 +34,16 @@ constexpr Allocation allocate(const State& s,uint64_t bytes,bool top,bool growab
                 s.low_backed,s.high_backed,s.high_used+bytes,0};
         // 0xB2CA4..0xB2CB3: GPU region discards the entire remaining
         // high-side slack into its padding ledger before committing.
-        // Handle a single successful growth only; full-backed redistribution
-        // and multi-iteration exhaustion retain the original slow path.
+        // At full commitment, 0xB2CDA moves the logical split. The
+        // retail fit comparison is made before consuming the padding.
+        // Do not adopt anomalous states where that comparison would
+        // permit the resulting high side to overlap the live low side.
+        if(s.committed==s.capacity) {
+            if(bytes>s.low_backed-s.low_used)return {};
+            return {Path::redistribute_high,s.base+s.capacity-s.high_backed-bytes,
+                s.low_backed-bytes,s.high_backed+bytes,s.high_backed+bytes,0,slack};
+        }
+        // Multi-iteration exhaustion retains the original slow path.
         const uint64_t gap=s.capacity-s.committed;
         if(bytes>gap)return {};
         const uint64_t rounded=(bytes+asset_region::alignment-1)&~(asset_region::alignment-1);
@@ -64,8 +72,15 @@ constexpr Allocation allocate(const State& s,uint64_t bytes,bool top,bool growab
     return {Path::grow_low,s.base+s.low_used,s.low_backed+growth,s.high_backed,end,growth};
 }
 struct Release { bool handled=false, success=false, dirty=false; uint64_t used=0; };
+// Inactive top-side release follows the first descriptor's address, or
+// its successor if the released address equals the first. The original
+// list is read by the adapter only when this branch actually needs it.
+struct ContainerHead {
+    bool known=false, first_present=false, next_present=false;
+    uint64_t first_address=0, next_address=0;
+};
 constexpr Release release(const State& s,uint64_t address,uint64_t bytes,bool top,
-                          bool growable,bool relaxed_low,bool top_active) {
+                          bool growable,bool relaxed_low,bool top_active,ContainerHead head={}) {
     if(!valid(s)||!bytes)return {};
     if(!top) {
         if(bytes>s.low_used)return {};
@@ -73,10 +88,17 @@ constexpr Release release(const State& s,uint64_t address,uint64_t bytes,bool to
         if(!relaxed_low&&address!=s.base+used)return {true,false,false,s.low_used};
         return {true,true,false,used};
     }
-    // With the top-active flag clear the original walks the container list
-    // and derives the new cursor from live descriptors. Do not fake it.
-    if(!top_active)return {};
     const uint64_t end=s.base+(growable?s.capacity:s.committed);
+    if(!top_active) {
+        if(address!=end-s.high_used)return {true,true,false,s.high_used};
+        if(!head.known)return {};
+        if(!head.first_present)return {true,true,false,0};
+        if(head.first_address==address&&!head.next_present)return {true,true,false,0};
+        const uint64_t next=head.first_address==address?head.next_address:head.first_address;
+        // 0xB3044 adds address-next to the existing high-used count.
+        if(next<s.base+s.low_used||next>end)return {};
+        return {true,true,false,end-next};
+    }
     if(address!=end-s.high_used)return {true,true,true,s.high_used};
     if(bytes>s.high_used)return {};
     return {true,true,false,s.high_used-bytes};

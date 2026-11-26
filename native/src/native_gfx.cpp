@@ -597,7 +597,9 @@ D1_SYSV uint64_t allocate(uint64_t bytes,uint32_t tag,uint8_t top,int32_t index)
     const bool growable=nr::eb<uint8_t>(0x1AF9CE8)!=0;
     const auto a=asset_suballocation::allocate(s,bytes,top!=0,growable);
     if(a.path==asset_suballocation::Path::fallback)return original_alloc(bytes,tag,top,index);
-    if(a.path==asset_suballocation::Path::grow_high){
+    if(a.path==asset_suballocation::Path::redistribute_high){
+        store(r,0x50,field<uint64_t>(r,0x50)+a.padding);
+    } else if(a.path==asset_suballocation::Path::grow_high){
         // Preserve the original padding and used-side mutation even if
         // the following physical/host commit fails.
         store(r,0x50,field<uint64_t>(r,0x50)+a.padding);
@@ -614,12 +616,36 @@ D1_SYSV uint64_t allocate(uint64_t bytes,uint32_t tag,uint8_t top,int32_t index)
     account(tag,bytes,true);
     return a.address;
 }
+asset_suballocation::ContainerHead container_head(uint64_t r,uint64_t address){
+    using Head=asset_suballocation::ContainerHead;
+    const uint16_t first=field<uint16_t>(r,0x64);
+    if(first==0xffff)return Head{true};
+    // 0xB2FF6: both table offsets are relative to their own fields.
+    const uint64_t table=nr::g_base+0x1AD5000;
+    const uint64_t stride=field<uint64_t>(table,0x10);
+    const uint64_t entries=table+field<uint64_t>(table,0);
+    const uint64_t links=table+8+field<uint64_t>(table,8);
+    // 0xB3820 initializes 0x1D1 entries with 0x140-byte stride.
+    if(stride!=0x140||first>=0x1d1)return {};
+    const uint64_t addr=field<uint64_t>(entries+stride*first,0x30);
+    if(addr!=address)return Head{true,true,false,addr,0};
+    const uint16_t next=field<uint16_t>(links+uint64_t(first)*4,0);
+    if(next==0xffff)return Head{true,true,false,addr,0};
+    if(next>=0x1d1||next==first)return {};
+    return Head{true,true,true,addr,field<uint64_t>(entries+stride*next,0x30)};
+}
 D1_SYSV bool release(uint64_t address,uint64_t bytes,uint32_t tag,uint8_t top,int32_t index){
     if(index!=2)return original_free(address,bytes,tag,top,index);
     const uint64_t r=gpu_region();
-    const auto a=asset_suballocation::release(state(r),address,bytes,top!=0,
-        nr::eb<uint8_t>(0x1AF9CE8)!=0,nr::eb<uint8_t>(0x1AFA150)==1,
-        field<uint8_t>(r,0x58)!=0);
+    const auto s=state(r);
+    const bool growable=nr::eb<uint8_t>(0x1AF9CE8)!=0;
+    const bool active=field<uint8_t>(r,0x58)!=0;
+    asset_suballocation::ContainerHead head;
+    if(top&&!active&&asset_suballocation::valid(s)&&
+       address==s.base+(growable?s.capacity:s.committed)-s.high_used)
+        head=container_head(r,address);
+    const auto a=asset_suballocation::release(s,address,bytes,top!=0,
+        growable,nr::eb<uint8_t>(0x1AFA150)==1,active,head);
     if(!a.handled)return original_free(address,bytes,tag,top,index);
     if(!a.success)return false;
     if(a.dirty)store(r,0x59,uint8_t(1));

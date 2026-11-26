@@ -30,6 +30,11 @@ int main(){
                                 s.high_used=h.used;
                                 auto r=release(s,h.address,n*a,true,true,false,true);
                                 check(r.handled&&r.success&&!r.dirty&&r.used==hu*a);
+                            }else if(lo+hi==cap&&n<=lo-lu){
+                                check(h.path==Path::redistribute_high&&h.growth==0);
+                                check(h.padding==(hi-hu)*a&&h.used==(hi+n)*a);
+                                check(h.low_backed==(lo-n)*a&&h.high_backed==(hi+n)*a);
+                                check(h.address==b+(cap-hi-n)*a);
                             }else if(n<=cap-lo-hi){
                                 check(h.path==Path::grow_high&&h.growth==n*a);
                                 check(h.padding==(hi-hu)*a&&h.used==(hi+n)*a);
@@ -48,6 +53,16 @@ int main(){
     auto dirty=release(s,b,128,true,true,false,true);
     check(dirty.handled&&dirty.success&&dirty.dirty);
     check(!release(s,b+2*a,128,true,true,false,false).handled);
+    auto inactive=release(s,b+2*a,128,true,true,false,false,{true});
+    check(inactive.handled&&inactive.success&&inactive.used==0);
+    inactive=release(s,b+2*a,128,true,true,false,false,{true,true,true,b+2*a,b+2*a+128});
+    check(inactive.handled&&inactive.success&&inactive.used==a-128);
+    inactive=release(s,b+2*a,128,true,true,false,false,{true,true,false,b+2*a+256,0});
+    check(inactive.handled&&inactive.success&&inactive.used==a-256);
+    inactive=release(s,b+2*a,128,true,true,false,false,{true,true,false,b+2*a,0});
+    check(inactive.handled&&inactive.success&&inactive.used==0);
+    inactive=release(s,b,128,true,true,false,false);
+    check(inactive.handled&&inactive.success&&inactive.used==a&&!inactive.dirty);
     State grow{b,a,a,4*a,2*a,128,128};
     auto high=allocate(grow,a,false,true);
     check(high.path==Path::grow_low&&high.growth==a);
