@@ -136,3 +136,8 @@ add_test(NAME query-reduce COMMAND query-reduce-test)
 add_executable(pc-libc-leaf-test tests/pc_libc_leaf_test.cpp)
 target_include_directories(pc-libc-leaf-test PRIVATE src)
 add_test(NAME pc-libc-leaf COMMAND pc-libc-leaf-test)
+
+add_executable(pc-file-test tests/pc_file_test.cpp)
+target_include_directories(pc-file-test PRIVATE src)
+target_link_libraries(pc-file-test PRIVATE Threads::Threads)
+add_test(NAME pc-file COMMAND pc-file-test "${CMAKE_CURRENT_BINARY_DIR}/pc-file-test.bin")
