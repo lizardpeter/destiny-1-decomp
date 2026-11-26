@@ -503,6 +503,9 @@ static void run_dcb(const uint32_t* p, uint64_t dwords, int depth) {
 }
 
 bool native_device_active();
+struct NativeSubmission;
+NativeSubmission* native_device_capture_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes);
+void native_device_execute_submit(NativeSubmission* batch);
 void native_device_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes);
 void gnm_signal_eop() { signal_eop(); }
 static void submit_now(uint32_t count, uint32_t* const* dcbs, const uint32_t* dcb_sizes) {
@@ -514,6 +517,8 @@ static void submit_now(uint32_t count, uint32_t* const* dcbs, const uint32_t* dc
 namespace gpuq {
 struct Job {
     bool flip = false;
+    NativeSubmission* native = nullptr; // consumed once by the queue thread
+    std::vector<std::vector<uint32_t>> fallback_words;
     std::vector<uint32_t*> dcbs;
     std::vector<uint32_t> sizes;
     int32_t buf = -1;
@@ -533,11 +538,22 @@ bool enabled() {
     return on && !gpu_real() && native_gfx_active();
 }
 void run(Job& j) {
-    if (!j.flip) {
+    if (j.native) {
+        native_device_execute_submit(j.native);
+        j.native = nullptr;
+    } else if (!j.dcbs.empty()) {
         submit_now(uint32_t(j.dcbs.size()), j.dcbs.data(), j.sizes.data());
-        return;
     }
-    if (j.buf >= 0 && j.buf < 16) native_gfx_flip(g_vo.buffers[j.buf], g_vo.attr.width, g_vo.attr.height);
+    if (!j.flip) return;
+    void* addr = nullptr;
+    uint32_t width = 0, height = 0;
+    {
+        std::lock_guard lk(g_vo.m);
+        if (j.buf >= 0 && j.buf < 16) addr = g_vo.buffers[j.buf];
+        width = g_vo.attr.width;
+        height = g_vo.attr.height;
+    }
+    if (addr) native_gfx_flip(addr, width, height);
     do_flip(j.buf, j.arg);
 }
 void worker() {
@@ -577,10 +593,32 @@ void push(Job&& j) {
     lk.unlock();
     cv.notify_one();
 }
+void capture_submit(Job& j, uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
+    if (native_device_active()) {
+        j.native = native_device_capture_submit(count, dcbs, sizes);
+        return;
+    }
+    // Research/null path: own the packet data as well. Never defer reads of
+    // a caller's mutable command memory to the queue thread.
+    j.fallback_words.resize(count);
+    j.dcbs.resize(count);
+    j.sizes.resize(count);
+    for (uint32_t k = 0; k < count; ++k) {
+        const uint32_t n = dcbs[k] ? sizes[k] / 4 : 0;
+        if (n) j.fallback_words[k].assign(dcbs[k], dcbs[k] + n);
+        j.dcbs[k] = j.fallback_words[k].data();
+        j.sizes[k] = n * 4;
+    }
+}
 void push_submit(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes) {
     Job j;
-    j.dcbs.assign(dcbs, dcbs + count);
-    j.sizes.assign(sizes, sizes + count);
+    capture_submit(j, count, dcbs, sizes);
+    push(std::move(j));
+}
+void push_submit_and_flip(uint32_t count, uint32_t* const* dcbs, const uint32_t* sizes, int32_t buf, int64_t arg) {
+    Job j;
+    capture_submit(j, count, dcbs, sizes);
+    j.flip = true, j.buf = buf, j.arg = arg;
     push(std::move(j));
 }
 void push_flip(int32_t buf, int64_t arg) {
@@ -623,8 +661,7 @@ static int32_t sceGnmSubmitAndFlipCommandBuffers(uint32_t count, uint32_t* const
     }
     if (gpuq::enabled()) {
         { std::lock_guard lk(g_vo.m); ++g_vo.status.flip_pending_num; ++g_vo.status.gc_queue_num; }
-        gpuq::push_submit(count, dcbs, dcb_sizes);
-        gpuq::push_flip(int32_t(buf), arg);
+        gpuq::push_submit_and_flip(count, dcbs, dcb_sizes, int32_t(buf), arg);
         return SCE_OK;
     }
     submit(count, dcbs, dcb_sizes);
