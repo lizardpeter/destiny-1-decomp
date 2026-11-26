@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <random>
+#include <array>
 using namespace d1::ng;
 static void check(bool v){if(!v)std::abort();}
 int main(){
@@ -31,5 +32,30 @@ int main(){
     check(!ring_pending(0,0x80000000u));
     check(flip_sample_newer(1,1000001)&&!flip_sample_newer(1,1000000));
     check(flip_sample_newer(9,8)&&!flip_sample_newer(8,9));
-    std::puts("65536 close plans and 100000 native submission wrap cases passed");
+    // Exact ledger offsets, zero extents, low-32-bit wrap and full capacity.
+    for(unsigned i=0;i<100000;++i){
+        std::array<uint8_t,0x938> rec{};
+        std::array<uint8_t,0xa0> ctx{};
+        uint32_t slot=rng()%64,dn=rng()%128,cn=rng()%128;
+        uint64_t d=(uint64_t(rng())<<32)|rng(),c=(uint64_t(rng())<<32)|rng();
+        segment_write(rec.data(),0x24,slot);
+        segment_write(ctx.data(),0,d);segment_write(ctx.data(),0x10,d+dn);
+        segment_write(ctx.data(),0x80,c);segment_write(ctx.data(),0x90,c+cn);
+        check(record_segment(rec.data(),ctx.data(),2,0x118,1));
+        check(segment_read<uint32_t>(rec.data(),0x630+slot*4)==2);
+        check(segment_read<uint32_t>(rec.data(),0x730+slot*4)==0x118);
+        check(segment_read<uint32_t>(rec.data(),0x830+slot*4)==1);
+        const bool present=(dn|cn)>3;
+        check(segment_read<uint32_t>(rec.data(),0x24)==slot+unsigned(present));
+        if(present){
+            check(segment_read<uint32_t>(rec.data(),0x430+slot*4)==(dn&~3u));
+            check(segment_read<uint32_t>(rec.data(),0x530+slot*4)==(cn&~3u));
+            check(segment_read<uint64_t>(rec.data(),0x30+slot*8)==d);
+            check(segment_read<uint64_t>(rec.data(),0x230+slot*8)==((cn&~3u)?c:0));
+        }
+        segment_write(rec.data(),0x24,64u);
+        const auto before=rec;
+        check(!record_segment(rec.data(),ctx.data(),2,0x118,1)&&rec==before);
+    }
+    std::puts("65536 close plans, 200000 wrap/progress and 100000 native segment ledger cases passed");
 }
