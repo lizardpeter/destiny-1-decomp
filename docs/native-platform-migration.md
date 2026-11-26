@@ -67,3 +67,26 @@ Exact committed header/test blob hashes matched local sources. Six standalone su
 - pc-libc-math: 100,000 randomized scalar decomposition/rounding cases, all four rounding modes, signed zero, invalid domains and >32-bit integer values.
 
 All six registered with CTest. This is Linux standalone execution, not a Windows full-game build. GitHub and R2 host DNS resolution failed locally, and Vulkan/SDL development headers and a Windows cross compiler are unavailable. No claim of actual FIOS replacement or reduced stutter yet. Original `libSceFios2.prx` remains required (0/22 production imports redirected); file/stat/directory output layouts, true FIOS error values/open flags, callback TLS, in-flight buffer pinning, libc-to-FIOS dependencies and original behavior still need evidence before one coherent group switch. Libc has 19 default plus 18 opt-in native imports out of 143 distinct original eboot imports. No change to graphics quality or simulation timing in this pass.
+
+### Retail FIOS module analysis and native provider
+
+The exact decrypted CUSA00219 01.33 PRX files were inspected through the project's R2 object API (FIOS: 400209 bytes; libc: 927802 bytes). The combined import closure contains 25 unique FIOS exports: 22 from the executable and 8 from libc, with 5 shared. The additional libc-only names are sceFiosIsValidHandle (0x9090), sceFiosFHOpenWithModeSync (0xA430), and sceFiosRenameSync (0x9A90). Offsets below are module virtual addresses, not file offsets.
+
+| Evidence | Recovered contract |
+|---|---|
+| 0x2AD70 | File flag conversion, including 0x1000 -> kernel 0x10000 |
+| 0x2AB90 | Encoded kernel error conversion |
+| 0x9CE0 | Direct stat output: 0x50 bytes, size at 0, atime and mtime at 8/0x10 in ns, attribute bits at 0x20, mode at 0x48 |
+| 0x18AC0 | Directory worker: 0x418-byte entry, size/attributes/name length/path length/name offset at 0/8/0xc/0xe/0x10, path at 0x18 |
+| 0x3A70 / 0x3B70 | Positional read/write: attributes, handle, buffer, signed 64-bit count, signed 64-bit offset |
+| 0xA5E0 / 0xA430 | OpenSync delegates to OpenWithModeSync, with default mode -1 |
+| 0x5C90 | Operation actual count reads 64-bit field at +0x98 |
+| 0x5690 | Sync operation returns count on success/EOF, signed error otherwise |
+| 0xB8B0 | Directory open has five arguments; filter arguments not yet fully decoded |
+| 0xB9D0 | Directory read accepts attributes, handle and entry buffer |
+| 0xB620 / 0xC360 / 0x3F90 | Seek(handle, offset, origin), tell(handle), size(handle) |
+| 0x5480 | Operation deletion; early-delete/wait interaction still requires recovery |
+
+The two scalar functions were compared directly against extracted original x64 machine code on Linux: 65536 open flags and 65536 encoded kernel statuses, all matched. The original error mapper's raw -1/errno path was not exercised. No retail code bytes were added to the repository.
+
+The native core now contains independent file/directory/operation handle namespaces, bounded staging memory, a separate serial callback dispatcher, task submission, close-safe pending operations, explicit draining and recovered metadata structures. The original runtime log confirms separate SceFiosCallback and SceFiosIO threads. Standalone staging, callback, and binary-contract tests passed optimized and address/undefined-behavior sanitizer builds. The core header itself is not yet end-to-end compiled or linked into the retail loader; none of the 25 imports have been redirected in production. Remaining gates include guest TLS/callback invocation, destination allocation ownership, directory filters, early operation deletion, flag 0x10000 semantics, and full Windows/game validation. Host status mapping and directory metadata behavior beyond the directly recovered code remain provisional. D1_FIOS_TRACE=1 enables bounded argument-register tracing of original FIOS function imports, including libc callers. R2 binary access is available through the object API, but direct local checkout/download and full SDK build remain unavailable in this environment.
