@@ -94,10 +94,9 @@ void* main_thread(void*) {
     ensure_self("main");
     register_guest_thread("main");
     auto& mods = rt().modules;
-    // Start dependencies before dependents: libSceFios2 (needed by libc), then libc.
-    for (const char* name : {"libSceFios2.prx", "libc.prx"})
-        for (auto& m : mods)
-            if (m.name == name && m.init) {
+    // FIOS is a host service; only the remaining libc dependency starts here.
+    for (auto& m : mods)
+            if (m.name == "libc.prx" && m.init) {
                 log("starting %s at %s", m.name.c_str(), describe_addr(m.init).c_str());
                 int r = int(d1_call_guest(reinterpret_cast<const void*>(m.init), 0, 0, 0));
                 log("%s module_start returned %d", m.name.c_str(), r);
@@ -227,20 +226,11 @@ int main(int argc, char** argv) {
 
     try {
         rt().modules.push_back(load_module(eboot, kExeBase));
-        uint64_t base = kModBase;
-        const bool native_fios = native_fios_enabled();
-        if (native_fios && sce_module.empty()) throw std::runtime_error("native FIOS still requires original libc.prx");
-        for (const char* n : {"libSceFios2.prx", "libc.prx"}) {
-            if (sce_module.empty()) break;
-            if (native_fios && std::strcmp(n, "libSceFios2.prx") == 0) {
-                // Preserve the known 01.33 libc virtual base during the migration.
-                base += 0x10000000ull;
-                log("native FIOS: skipping libSceFios2.prx (native default)");
-                continue;
-            }
-            rt().modules.push_back(load_module(sce_module + "/" + n, base));
-            base += (rt().modules.back().size + 0xFFFFFFF) & ~uint64_t(0xFFFFFFF);
-        }
+        if (sce_module.empty()) throw std::runtime_error("native runtime still requires original libc.prx");
+        // Keep the established 01.33 libc address until the remaining libc
+        // ABI is reconstructed. FIOS is never mapped into the process.
+        rt().modules.push_back(load_module(sce_module + "/libc.prx", kModBase + 0x10000000ull));
+        log("native FIOS: mandatory host provider; original PRX not loaded");
         link_all();
         native_fios_prepare();
         install_game_hooks();
