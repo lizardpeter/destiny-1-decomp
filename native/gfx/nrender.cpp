@@ -355,6 +355,31 @@ struct Image {
     uint64_t target_revision=1, snapshot_revision=0;
     uint64_t descriptor_epoch[2] = {};
     uint32_t resident_descriptor[2][8] = {};
+    // A relocation with verified identical bytes can reuse the GPU image
+    // without discarding the immediately preceding captured descriptors.
+    struct Alias {uint64_t epoch=0;uint32_t words[8]{};};
+    std::array<Alias,4> aliases{};
+    unsigned alias_next=0;
+    bool matches_epoch(const uint32_t* t,uint64_t res)const{
+        if(stale||!res)return false;
+        auto matches=[&](const uint32_t* p){
+            return p[0]==t[0]&&(p[1]&255)==(t[1]&255)&&
+                   texture_source_layout_equal(p,t);
+        };
+        if(res_val==res){
+            for(unsigned i=0;i<2;++i)
+                if(descriptor_epoch[i]==res&&matches(resident_descriptor[i])&&
+                   (!(low_size||hi_size)||(low_loaded&&(i==0||hi_loaded))))return true;
+        }
+        if(low_size||hi_size)return false;
+        for(const auto& a:aliases)if(a.epoch==res&&matches(a.words))return true;
+        return false;
+    }
+    void remember_relocation(){
+        if(!res_val||!descriptor_epoch[0]||low_size||hi_size)return;
+        auto& a=aliases[alias_next++%aliases.size()];
+        a.epoch=res_val;std::memcpy(a.words,resident_descriptor[0],32);
+    }
 };
 
 struct Shader {
@@ -560,6 +585,11 @@ struct Renderer {
     std::unordered_map<uint64_t, Image*> target_by_base;            // newest target at an address
     std::vector<std::unique_ptr<Image>> retired;                    // replaced targets (still referenced)
     std::unordered_map<uint64_t, std::unique_ptr<Image>> textures;  // T# hash or resource ID
+    std::unordered_map<uint64_t,std::vector<std::unique_ptr<Image>>> texture_history;
+    uint64_t texture_history_bytes=0,texture_history_hits=0,texture_history_drops=0;
+    Image* historical_texture(uint64_t key,const uint32_t* t,uint64_t res);
+    void archive_texture(uint64_t key,std::unique_ptr<Image> img);
+    void trim_texture_history(bool all=false);
     std::unordered_map<uint64_t, SamplerEntry> samplers;
     std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders;
     std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> pipelines;
@@ -2379,6 +2409,14 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     };
     const uint64_t key = tex_key(t, res);
     ++st.tex_checks;
+    if(res){
+        if(auto* old=historical_texture(key,t,res)){
+            old->last_used=rc().submit_no;old->last_frame=st.frames;
+            ++texture_history_hits;++st.res_hits;
+            st.t_tex_hit+=now_ns()-t_in;
+            return old;
+        }
+    }
     // Registered image ownership is already established by the exact epoch
     // and successfully uploaded descriptor. No tile-layout calculation,
     // mutable tag read or host mapping lock is needed on this hot path.
@@ -2466,6 +2504,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         // the same-address streamed-mip shortcut silently reuse the dirty bytes.
         prev->low_loaded = prev->hi_loaded = false;
         prev->descriptor_epoch[0]=prev->descriptor_epoch[1]=0;
+        prev->aliases={};prev->alias_next=0;
         textures.erase(it), found = false; ++views_gen;
         ++st.tex_reloads;
     }
@@ -2494,6 +2533,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             if (!streamed && matches_shape(img)&&same_layout&&img->src_size == cur_bytes &&
                 (prepared ? prepared_hash==img->content :
                  (guest_readable_range(ts.base,cur_bytes)&&hash_bytes(reinterpret_cast<const void*>(ts.base),cur_bytes)==img->content))) {
+                img->remember_relocation();
                 img->res_val = res, img->src_addr = ts.base;
                 std::memcpy(img->resident_descriptor[0],t,32);
                 img->descriptor_epoch[0]=res;img->descriptor_epoch[1]=0;
@@ -2503,7 +2543,13 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 return img;
             }
             ++st.res_changed;
-            if (streamed && (img->res_val != res||!matches_shape(img))) {
+            if(img->res_val!=res){
+                // Preserve the old contents for already captured draws.
+                // A distinct image is required when the bytes changed.
+                archive_texture(key,std::move(it->second));
+                textures.erase(it);found=false;++views_gen;++st.tex_reloads;
+            }else{
+            if (streamed && !matches_shape(img)) {
                 // Epoch changes may represent writes at unchanged addresses. Until
                 // per-mip content identities are proven, refresh conservatively.
                 img->low_loaded = img->hi_loaded = false;
@@ -2517,6 +2563,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             prev = std::move(it->second);
             textures.erase(it), found = false; ++views_gen;
             ++st.tex_reloads;
+            }
         }
     }
     if (found) {
@@ -2546,6 +2593,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     if (prev && prev->format == f && prev->w == full_w && prev->h == full_h && prev->d == full_d &&
         prev->layers == layers && prev->levels == full_levels && prev->cube == cube && prev->is3d == is3d) {
         img = std::move(prev);
+        img->aliases={};img->alias_next=0;
         img->torn = 0;
         ++st.tex_inplace;
     } else {
@@ -3232,7 +3280,48 @@ void Renderer::evict_geo() {
 // Textures unused for a while are dropped (re-uploaded if the game uses them again): the
 // game streams, and an address range can hold many textures over a session. The image is
 // destroyed once the submissions that may still read it have completed.
+Image* Renderer::historical_texture(uint64_t key,const uint32_t* t,uint64_t res){
+    auto cur=textures.find(key);
+    if(cur!=textures.end()&&cur->second&&cur->second->res_val!=res&&
+       cur->second->matches_epoch(t,res))return cur->second.get();
+    auto it=texture_history.find(key);
+    if(it!=texture_history.end())
+        for(auto& img:it->second)if(img->matches_epoch(t,res))return img.get();
+    return nullptr;
+}
+void Renderer::archive_texture(uint64_t key,std::unique_ptr<Image> img){
+    if(!img)return;
+    constexpr uint64_t budget=256ull<<20;
+    if(img->stale||!img->res_val||img->mem.size>budget){
+        bury(std::move(img));return;
+    }
+    auto& list=texture_history[key];
+    if(list.size()>=3){
+        texture_history_bytes-=list.front()->mem.size;
+        bury(std::move(list.front()));list.erase(list.begin());
+        ++texture_history_drops;
+    }
+    texture_history_bytes+=img->mem.size;
+    img->last_frame=st.frames;
+    list.push_back(std::move(img));
+    if(texture_history_bytes>budget)trim_texture_history();
+}
+void Renderer::trim_texture_history(bool all){
+    constexpr uint64_t budget=256ull<<20;
+    for(auto it=texture_history.begin();it!=texture_history.end();){
+        auto& list=it->second;
+        for(auto p=list.begin();p!=list.end();){
+            if(all||(*p)->last_frame+120<st.frames||texture_history_bytes>budget){
+                texture_history_bytes-=(*p)->mem.size;
+                bury(std::move(*p));p=list.erase(p);
+                ++texture_history_drops;++views_gen;
+            }else ++p;
+        }
+        if(list.empty())it=texture_history.erase(it);else ++it;
+    }
+}
 void Renderer::evict_textures() {
+    trim_texture_history();
     // Use frame count (st.frames), NOT submit_seq (which increments ~28 times per frame).
     // Registered engine textures stay alive in their single persistent VkImage for as long as
     // their handle in the engine's resource registry still resolves to them.
@@ -3300,10 +3389,12 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
     }
     auto it = textures.find(tex_key(t, res));
     Image* img = it != textures.end() ? it->second.get() : nullptr;
+    if(res&&(!img||img->res_val!=res||img->stale))
+        if(auto* old=historical_texture(tex_key(t,res),t,res))img=old;
     const uint8_t fallback_kind = ts.nfmt == 4 ? 1u : ts.nfmt == 5 ? 2u : 0u;
     const ViewHandle fallback{dummy_views[int(dim) * 3 + fallback_kind], 0, uint8_t(dim), fallback_kind, fallback_kind == 0};
     if(!img||img->stale)return fallback;
-    if(res&&img->res_val!=res){++expired_texture_epochs;return fallback;}
+    if(res&&img->res_val!=res&&!img->matches_epoch(t,res)){++expired_texture_epochs;return fallback;}
     // A split texture has one native image, but each captured descriptor has its
     // own mip origin. A later low/high bind must not change an earlier draw.
     uint32_t origin = 0;
@@ -5035,7 +5126,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         reload_all = false;
         for (auto& [k, img] : textures)
             bury(std::move(img));
-        textures.clear(); ++views_gen;
+        textures.clear();trim_texture_history(true);++views_gen;
         log("native renderer: dropped every texture (D1_NG_SNAP_RELOAD)");
     }
     // resources first (copies cannot run inside a render pass): targets, then textures
@@ -5362,6 +5453,7 @@ void Renderer::load_texture(const LoadJob& j) {
                 !img->low_size&&!img->hi_size;
             if(img->res_val==j.res&&img->src_addr==ts.base&&same_layout){++ld_skipped;return;}
             if(same_layout&&img->content==content&&img->src_size==sf.total_size){
+                img->remember_relocation();
                 img->res_val=j.res;img->res_obj=j.obj;img->src_addr=ts.base;
                 std::memcpy(img->resident_descriptor[0],t,32);
                 img->descriptor_epoch[0]=j.res;img->descriptor_epoch[1]=0;
@@ -6868,6 +6960,10 @@ void print_stats() {
         log("native renderer: texture epoch cohort splits %llu, conflicting versions in one draw %llu",
             (unsigned long long)g->texture_cohort_splits,(unsigned long long)g->texture_draw_epoch_conflicts);
         g->texture_cohort_splits=g->texture_draw_epoch_conflicts=0;
+        log("native renderer: retained texture history %.1f MiB, %llu old-epoch hits, %llu versions dropped",
+            double(g->texture_history_bytes)/1048576.0,(unsigned long long)g->texture_history_hits,
+            (unsigned long long)g->texture_history_drops);
+        g->texture_history_hits=g->texture_history_drops=0;
         {
             std::lock_guard dl(g->bindless_m);
             uint32_t live=0,peak=0,binding=0;
