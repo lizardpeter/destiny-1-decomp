@@ -120,7 +120,7 @@ Native renderer (`native/gfx`):
 | `D1_NG_EVERY=<n>` / `D1_NG_EVERY_WORLD=<s>` / `D1_NG_EVERY_STATE=<state>` | draw every n-th frame only (software rendering); from `<s>` seconds in the world (or in the given state, e.g. `setup:orbit`), every frame. `D1_NG_EVERY=100000` skips drawing until then: rendered checks of a late screen at headless speed |
 | `D1_NG_NOCACHE=1` | no geometry cache and no texture change tracking |
 | `D1_ND=0` | turn the native device layer off: the engine's Gnm / Gnmx calls build PS4 command buffers again and the emulated GPU answers fences, labels and occlusion from them (default: no Gnm command buffers at all, see docs/gpu-device-sync.md). `D1_ND_LOG=1` logs the first lists and submissions |
-| `D1_ND_RECORD=0` | record the engine's command lists on the GPU queue thread at submission (as before) instead of on the engine's own threads as each list ends (default). The log's "lists recorded on the engine's threads" line gives their count, the time spent on the engine threads, the time spent waiting for the renderer lock, and the submission time per frame |
+| `D1_NG_EARLY_RECORD=1` | experimental: record eligible write-free lists on engine threads before submission; default: record in actual submission order on the GPU queue thread. Parallel secondary command recording remains enabled on the default path. |
 | `D1_ND_RES=0` | the engine's GPU resources (textures, vertex and index buffers) are tracked by write-protecting their memory again, instead of by the engine's own resource events (default: kept per resource and epoch, see docs/gpu-resources.md). The log's "engine resources" line counts uses, moves with the same contents and real changes |
 | `D1_NG_PREFETCH=0` | engine resources are uploaded at their first draw instead of on the renderer's loader thread when the engine binds or moves them (default). The log's "loader" line counts uploads ahead of use, moves kept and work dropped because the resource changed again |
 | `D1_NG_DYNAMIC_COPY=0` | memory that is no engine resource (dynamic vertex / index buffers, dynamic textures, small render targets the CPU rewrites) is write-tracked again instead of following the engine's own write announcements (texture unlocks, copy-queue writes); default: nothing is write-protected, 0 write faults |
@@ -138,6 +138,7 @@ Native renderer (`native/gfx`):
 | `D1_NG_RING_SYSMEM=1` | keep the upload ring in system memory (default: device-local host-visible memory when the GPU offers it) |
 | `D1_NG_PENDING_STATS=1` | log the pending draw / constant event lookups per submission |
 | `D1_NG_FRAMES_IN_FLIGHT=<n>` | frames the CPU may record ahead of the GPU (default 2) |
+| `D1_NG_GPU_TIMING=1` | optional GPU submission timestamp spans, collected after fences complete; logs summed/mean/max spans (not utilization, spans can overlap). |
 | `D1_NG_READBACK=<pixels>` | largest never-sampled render target written back to guest memory for the CPU (default 4096, 0 off); `D1_NG_LOG_READBACK=1` lists the decisions |
 | `D1_NG_STATS=1` | renderer statistics every 5 s instead of 15 s |
 | `D1_NG_LOG_FAULTS=1` | the 64 KiB regions the game keeps rewriting (write-protection faults) |
