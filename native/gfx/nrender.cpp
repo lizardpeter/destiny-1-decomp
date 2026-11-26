@@ -678,6 +678,8 @@ struct Renderer {
         std::vector<Copy> copies;
         // attachments the current pass's draws sample: read from a copy made before the pass
         std::vector<std::pair<Image*, Image*>> snaps;  // (attachment, snapshot)
+        // Transfer writes not yet made available to sampling/attachments.
+        std::vector<Image*> pending_uploads;
         // snapshots that still equal their attachment at this point of this command buffer (no
         // command recorded here since the copy writes it): a later pass samples them uncopied.
         // Per command buffer: lists are recorded in any order but run in submission order.
@@ -977,6 +979,8 @@ struct Renderer {
     PFN_vkCmdPushDescriptorSetKHR push_fn = nullptr;
     uint32_t max_push = 0;
     void barrier();
+    void before_upload(Image* img);
+    void flush_uploads();
     // bind = false (the pre-pass): create the image, but leave which image an address names
     // to the draws themselves, in order (a draw that reads last frame's contents of an
     // address must not see an image a later draw in this submission renders to)
@@ -1473,11 +1477,13 @@ void Renderer::begin_record() {
     if (bindless_set && pipe_layout)
         vkCmdBindDescriptorSets(sb.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_layout, 0, 1, &bindless_set, 0, nullptr);
     rc().snaps.clear(), rc().snap_key = 0, rc().fresh.clear(), rc().pass_live.clear(), rc().pass_written.clear();
+    rc().pending_uploads.clear();
     barrier();  // earlier submissions' writes before anything here
 }
 
 void Renderer::submit(const VkSemaphoreSubmitInfo* wait, const VkSemaphoreSubmitInfo* signal) {
     if (rc().cur == UINT32_MAX) return;
+    flush_uploads();
     Sub& sb = subs[rc().cur];
     if (sb.timepool) vkCmdWriteTimestamp2(sb.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, sb.timepool, 1);
     vkEndCommandBuffer(sb.cmd);
@@ -2054,6 +2060,45 @@ void Renderer::barrier() {
     di.memoryBarrierCount = 1;
     di.pMemoryBarriers = &mb;
     vkCmdPipelineBarrier2(rc().cmd, &di);
+    rc().pending_uploads.clear(); // the full dependency also covers transfer writes
+}
+
+// Native image upload dependencies are batched by image. A steady-state
+// preparation pass with no uploads emits no extra GPU barrier. Keep the
+// broader pass/submission barriers until the remaining shader and readback
+// hazards have been reconstructed.
+void Renderer::before_upload(Image* img) {
+    auto& pending = rc().pending_uploads;
+    if (std::find(pending.begin(), pending.end(), img) != pending.end())
+        flush_uploads(); // same image written again: order the two transfers
+    pending.push_back(img);
+}
+
+void Renderer::flush_uploads() {
+    auto& pending = rc().pending_uploads;
+    if (pending.empty()) return;
+    std::vector<VkImageMemoryBarrier2> barriers;
+    barriers.reserve(pending.size());
+    for (Image* img : pending) {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img->image;
+        const VkImageAspectFlags aspects = img->depth ?
+            VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | (img->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) :
+            VK_IMAGE_ASPECT_COLOR_BIT;
+        b.subresourceRange = {aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        barriers.push_back(b);
+    }
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = uint32_t(barriers.size());
+    di.pImageMemoryBarriers = barriers.data();
+    vkCmdPipelineBarrier2(rc().cmd, &di);
+    pending.clear();
 }
 
 // Gnm RenderTarget: CB_COLOR_BASE, PITCH, SLICE, VIEW, INFO, ATTRIB, packed size, CMASK...
@@ -2082,6 +2127,7 @@ Image* Renderer::color_target(const uint32_t* c, bool bind) {
         {  // new images hold undefined data (garbage on most GPUs): start from zero
             VkClearColorValue zero{};
             VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            before_upload(n.get());
             vkCmdClearColorImage(rc().cmd, n->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
         }
         n->base = base, n->swap = swap;
@@ -2174,6 +2220,7 @@ Image* Renderer::depth_target(const uint32_t* d, bool bind) {
         {
             VkClearDepthStencilValue z{0.0f, 0};
             VkImageSubresourceRange r{VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | (sfmt ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)), 0, 1, 0, 1};
+            before_upload(n.get());
             vkCmdClearDepthStencilImage(rc().cmd, n->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &r);
         }
         n->base = base;
@@ -2483,6 +2530,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             r.imageExtent = {std::max(1u, full_w >> dst_lv), std::max(1u, full_h >> dst_lv),
                              is3d ? std::max(1u, full_d >> dst_lv) : 1u};
         }
+        before_upload(img.get());
         vkCmdCopyBufferToImage(rc().cmd, sb.buf, img->image, VK_IMAGE_LAYOUT_GENERAL, src_lv_count, regions.data());
         if (own) subs[rc().cur].staging.push_back(sb);
         st.bytes_tex += total;
@@ -3883,6 +3931,7 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
     }
     if (!copy.empty()) {
         end_pass();  // (copies run outside render passes; the next draw begins the pass again)
+        flush_uploads();
         for (Image* img : copy) {
             auto& sn = snap_img[img];
             if (!sn || sn->w != img->w || sn->h != img->h || sn->format != img->format) {
@@ -3960,6 +4009,7 @@ void Renderer::begin_pass(Image* const* colors, Image* depth, bool secondaries) 
     if (!secondaries && rc().in_pass && key == rc().pass_key) return;
     if (key != rc().snap_key) rc().snaps.clear(), rc().snap_key = 0;
     end_pass();
+    flush_uploads();
     VkRenderingAttachmentInfo ca[8]{};
     uint32_t n = 0, w = UINT32_MAX, h = UINT32_MAX;
     for (uint32_t i = 0; i < 8; ++i) {
@@ -4712,7 +4762,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                     }
                 }
     }
-    barrier();
+    flush_uploads();
     st.t_pre += now_ns() - tp;
 }
 
@@ -5067,6 +5117,7 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
     if (R.q_on) store_query_predicates();
     R.q_on = false;
     queue_readbacks();
+    flush_uploads();
     if (subs[R.cur].timepool)
         vkCmdWriteTimestamp2(R.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, subs[R.cur].timepool, 1);
     vkEndCommandBuffer(R.cmd);
