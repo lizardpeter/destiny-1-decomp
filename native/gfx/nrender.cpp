@@ -3218,14 +3218,24 @@ void Renderer::publish_shader_mask(uint64_t key, uint16_t mask) {
 
 void Renderer::warm_shader_specs(const uint8_t* obj, bool vs, uint64_t res) {
     if (!obj || uint64_t(obj) < 0x10000 || warm_specs_by_shader.empty()) return;
-    const uint64_t ch = shader_code_hash(obj, vs, res);
-    if (!ch) return;
-    auto candidates = warm_specs_by_shader.find(mix(ch, vs));
-    if (candidates == warm_specs_by_shader.end()) return;
+    std::vector<size_t> candidates;
+    {
+        std::lock_guard lk(pipe_m);
+        if (!opt.res_current || opt.res_current(uint64_t(obj)) != res) return;
+        const uint64_t ch = shader_code_hash(obj, vs, res);
+        if (!ch) return;
+        auto it = warm_specs_by_shader.find(mix(ch, vs));
+        if (it == warm_specs_by_shader.end()) return;
+        candidates = it->second;
+    }
     auto live = [&](const ShaderRef& ref) {
         return ref.obj && ref.res && opt.res_current && opt.res_current(uint64_t(ref.obj)) == ref.res;
     };
-    for (size_t i : candidates->second) {
+    for (size_t i : candidates) {
+        // Do not monopolize the pipeline lock across an entire material's
+        // warmup batch. Foreground misses can acquire it between builds.
+        std::this_thread::yield();
+        std::lock_guard lk(pipe_m);
         if (spec_warmed[i]) continue;
         const DiskPipeSpec sp = pipe_specs[i];
         auto vit = hash_to_obj.find(mix(sp.vs_hash, true));
@@ -5037,9 +5047,10 @@ void Renderer::load_shader(const LoadJob& j) {
     if (j.base < 0x10000) return;
     const bool vs = j.kind == 2;
     const uint8_t* obj = reinterpret_cast<const uint8_t*>(j.base);
-    std::lock_guard lk(pipe_m);
     if (!j.res || !opt.res_current || opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
     if (vs) {
+        std::lock_guard lk(pipe_m);
+        if (opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
         gcn::TexDim dims[16];
         uint8_t kinds[16] = {};
         for (int i = 0; i < 16; ++i) dims[i] = gcn::TexDim::Tex2D;
