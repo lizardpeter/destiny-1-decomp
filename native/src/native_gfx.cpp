@@ -710,6 +710,11 @@ bool native_bind_enabled() {
     return enabled;
 }
 bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint) {
+    // Publish descriptor writes and their native version as a single
+    // transaction relative to command-list capture. Other resource types
+    // have their own binding contracts.
+    decltype(ng::texture_leases().retire()) texture_transaction;
+    if(type>=1&&type<=3)texture_transaction=ng::texture_leases().retire();
     if(native_bind_enabled()) {
         using namespace ng::binding;
         if(!supported(type,repoint))return false;
@@ -1226,6 +1231,9 @@ D1_SYSV uint64_t build_3d(void* p,uint32_t w,uint32_t h,uint32_t depth,uint32_t 
 using MipFn = D1_SYSV void (*)(uint32_t, uint64_t, uint64_t);
 MipFn o_mips;
 D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
+    // A descriptor and its two source allocations belong to one published
+    // generation. Draw capture cannot observe the constructor's partial writes.
+    auto transaction=ng::texture_leases().retire();
     if(native_bind_enabled()) {
         const uint64_t obj=nr::resreg::object_of(1,handle);
         if(!obj)return;

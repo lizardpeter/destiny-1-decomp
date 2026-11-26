@@ -2381,7 +2381,9 @@ Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res,uint64_t obj,cons
         }
     }
     // A draw captured an old epoch. Never attach today's mutable tag
-    // dimensions or mip addresses to that draw.
+    // dimensions or mip addresses to that draw. The source descriptor
+    // transaction is excluded while recovering live tag fields.
+    auto capture_gate=texture_leases().capture();
     if(!obj||!opt.res_current||opt.res_current(obj)!=res){
         info.valid=false;return info;
     }
