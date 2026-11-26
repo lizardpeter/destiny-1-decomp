@@ -32,6 +32,7 @@
 #include "pc_frontend.h"
 #include "settings.h"
 #include "runtime.h"
+#include "fios_imports.h"
 
 namespace d1 {
 void link_all();
@@ -227,12 +228,21 @@ int main(int argc, char** argv) {
     try {
         rt().modules.push_back(load_module(eboot, kExeBase));
         uint64_t base = kModBase;
+        const bool native_fios = native_fios_enabled();
+        if (native_fios && sce_module.empty()) throw std::runtime_error("native FIOS still requires original libc.prx");
         for (const char* n : {"libSceFios2.prx", "libc.prx"}) {
             if (sce_module.empty()) break;
+            if (native_fios && std::strcmp(n, "libSceFios2.prx") == 0) {
+                // Preserve the known 01.33 libc virtual base during the migration.
+                base += 0x10000000ull;
+                log("native FIOS: skipping libSceFios2.prx (experimental)");
+                continue;
+            }
             rt().modules.push_back(load_module(sce_module + "/" + n, base));
             base += (rt().modules.back().size + 0xFFFFFFF) & ~uint64_t(0xFFFFFFF);
         }
         link_all();
+        native_fios_prepare();
         install_game_hooks();
         if (!native_gfx_install()) throw std::runtime_error("Native Vulkan device initialization or required device hooks failed");
     } catch (const std::exception& e) {
