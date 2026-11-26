@@ -5340,7 +5340,7 @@ void Renderer::zpass(uint64_t dest) {
     } else {
         boundary = sb.q_used;
     }
-    sb.zrecs.push_back({dest, boundary, guest_mapping_identity(dest, 8 * 16)});
+    sb.zrecs.push_back({dest, boundary, guest_mapping_identity(dest, 7 * 16 + 8)});
     ++st.zpass_dumps;
 }
 
@@ -5428,13 +5428,13 @@ bool Renderer::init_pred_reduce() {
 bool Renderer::write_predicate(uint32_t slot, uint32_t first, uint32_t end) {
     Sub& sb = subs[rc().cur];
     if (first > end || end > sb.q_used) return false;
+    barrier(); // any prior conditional read must finish before slot reuse
     if (first == end) {
         vkCmdFillBuffer(rc().cmd, pred_buf.buf, uint64_t(slot) * 4, 4, 0);
     } else {
         if (!sb.qpool || !init_pred_reduce()) return false;
         // Order scratch reuse and any preceding conditional reads. All work
         // remains on the Vulkan queue; the CPU never waits for query values.
-        barrier();
         vkCmdCopyQueryPoolResults(rc().cmd, sb.qpool, first, end - first,
             pred_scratch.buf, 0, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
         barrier();
@@ -5451,9 +5451,9 @@ bool Renderer::write_predicate(uint32_t slot, uint32_t first, uint32_t end) {
 
 // Copies the predicate for the query at `base` (begin and end dumped in this submission) into
 // its slot: zero when no draws ran, otherwise the OR of actual 64-bit query counts.
-static bool query_span(const std::vector<Sub::ZRec>& zr, uint64_t base, uint32_t& b0, uint32_t& b1) {
+static bool query_span(const std::vector<Sub::ZRec>& zr, uint64_t base, uint32_t& b0, uint32_t& b1, uint64_t mapping = 0) {
     for (size_t i = zr.size(); i-- > 0;)
-        if (zr[i].dest == base + 8) {
+        if (zr[i].dest == base + 8 && (!mapping || zr[i].mapping == mapping)) {
             for (size_t j = i; j-- > 0;)
                 if (zr[j].dest == base && zr[j].mapping == zr[i].mapping && zr[j].mapping) {
                     b0 = zr[j].boundary, b1 = zr[i].boundary;
@@ -5475,11 +5475,11 @@ void Renderer::predicate(uint64_t base, bool draw_if_visible) {
     uint32_t b0 = 0, b1 = 0;
     const uint64_t mapping = guest_mapping_identity(base, 8 * 16);
     if (!mapping) return;
-    if (rc().q_on && query_span(sb.zrecs, base, b0, b1)) {
+    if (rc().q_on && query_span(sb.zrecs, base, b0, b1, mapping)) {
         const uint32_t slot = pred_slot(base, mapping);
         end_pass();  // (copies and compute run outside rendering)
         if (!write_predicate(slot, b0, b1)) {
-            pred_slots.erase(base);
+            pred_slots[base].mapping = 0; // retain slot ownership even when unavailable
             return;
         }
         rc().pred_cur = int32_t(slot);
@@ -5503,12 +5503,13 @@ void Renderer::store_query_predicates() {
     if (!pred_buf.buf) return;
     std::unordered_set<uint64_t> stored;
     for (const auto& z : sb.zrecs) {
-        if ((z.dest & 15) != 0 || !stored.insert(z.dest).second) continue;
+        if ((z.dest & 15) != 0) continue;
         uint32_t b0, b1;
         const uint64_t mapping = guest_mapping_identity(z.dest, 8 * 16);
-        if (!mapping || mapping != z.mapping || !query_span(sb.zrecs, z.dest, b0, b1)) continue;
+        if (!mapping || mapping != z.mapping || !stored.insert(z.dest).second ||
+            !query_span(sb.zrecs, z.dest, b0, b1, mapping)) continue;
         const uint32_t slot = pred_slot(z.dest, mapping);
-        if (!write_predicate(slot, b0, b1)) pred_slots.erase(z.dest);
+        if (!write_predicate(slot, b0, b1)) pred_slots[z.dest].mapping = 0;
     }
 }
 
@@ -5524,7 +5525,7 @@ void Renderer::write_zpass_results(Sub& sb) {
     for (uint32_t i = 0; i < sb.q_used; ++i) prefix[i + 1] = prefix[i] + res[i];
     for (const auto& z : sb.zrecs) {
         uint64_t v = (zcount_base + prefix[std::min<uint32_t>(z.boundary, sb.q_used)]) & 0x7FFFFFFFFFFFFFFFull;
-        if (!guest_write_current_mapping(z.dest, 8 * 16, z.mapping,
+        if (!guest_write_current_mapping(z.dest, 7 * 16 + 8, z.mapping,
                 [](void* dest, void* opaque) {
                     auto* r = static_cast<volatile uint64_t*>(dest);
                     const uint64_t value = *static_cast<const uint64_t*>(opaque);
