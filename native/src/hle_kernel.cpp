@@ -26,6 +26,7 @@
 
 #include "hle.h"
 #include "host_memory.h"
+#include "pc_mount_adapter.h"
 #include "runtime.h"
 #include "region_extent_cache.h"
 
@@ -48,28 +49,38 @@ int to_ps4_errno(int e) {
     }
 }
 
-std::string host_path(const char* guest) {
-    std::string g = guest ? guest : "";
-    auto& r = rt();
-    if (g.rfind("/app0", 0) == 0) return r.app0 + g.substr(5);
-    for (const char* mount : {"/temp0", "/temp", "/download0", "/data", "/savedata0", "/hostapp"})
-        if (g.rfind(mount, 0) == 0) {
-            std::string dir = r.data_root + mount;
-            mkdir(dir.c_str(), 0755);
-            return dir + g.substr(strlen(mount));
-        }
-    return r.data_root + "/unmapped" + g;
+// All retail path translation ends here. Native services use the two
+// explicit PC roots directly, without /app0 or other console mount names.
+static std::unique_ptr<pc_io::Paths> g_pc_paths;
+bool init_pc_filesystem() {
+    try {
+        g_pc_paths = std::make_unique<pc_io::Paths>(rt().app0, rt().data_root);
+        return true;
+    } catch (const std::exception& e) {
+        log("native filesystem initialization failed: %s", e.what());
+        return false;
+    }
 }
-
-// The game directory (/app0) is read-only: nothing the game does may change the installed
-// files. Writes there fail with EROFS, as on the console; everything the game writes goes to
-// the data folder.
-static bool read_only_path(const char* guest) {
-    return guest && std::string_view(guest).rfind("/app0", 0) == 0;
+static int32_t path_status(const std::error_code& ec) {
+    const auto c = ec.default_error_condition();
+    return sce_err(to_ps4_errno(c.category() == std::generic_category() ? c.value() : EIO));
 }
-static int32_t refuse_write(const char* op, const char* guest) {
-    log("%s %s refused: the game directory is read-only", op, guest);
-    return sce_err(30);  // EROFS
+static std::string resolve_retail_path(const char* guest, bool write, std::error_code& ec) {
+    auto name = pc_io::decode_retail_path(guest, ec);
+    if (!name) return {};
+    if (!g_pc_paths) { ec = pc_io::error(std::errc::io_error); return {}; }
+    // Preserve the old lazy creation of writable mount directories, but
+    // validate containment before creating anything.
+    const auto path = g_pc_paths->resolve(name->root, name->relative, write, ec);
+    if (ec) return {};
+    if (!name->mount.empty()) {
+        const auto mount = g_pc_paths->resolve(pc_io::Root::user_data, name->mount, true, ec);
+        if (ec) return {};
+        std::filesystem::create_directory(mount, ec);
+        if (ec) return {};
+    }
+    try { return path.string(); }
+    catch (const std::exception&) { ec = pc_io::error(std::errc::invalid_argument); return {}; }
 }
 
 // ------------------------------------------------------------------ memory
@@ -471,9 +482,10 @@ static void note_read(int fd, int64_t off, uint64_t n) {
             log("read %s @%#llx +%#llx", it->second.first.c_str(), off, n);
 }
 static int32_t sceKernelOpen(const char* path, int flags, uint16_t mode) {
-    if (read_only_path(path) && ((flags & 3) != 0 || (flags & (0x8 | 0x200 | 0x400))))
-        return refuse_write("open for writing", path);
-    std::string hp = host_path(path);
+    std::error_code ec;
+    const bool writing = (flags & 3) != 0 || (flags & (0x8 | 0x200 | 0x400));
+    std::string hp = resolve_retail_path(path, writing, ec);
+    if (ec) return path_status(ec);
     if (os::is_dir(hp)) {
         std::lock_guard lk(g_dir_mutex);
         int fd = g_next_dir_fd++;
@@ -586,8 +598,10 @@ HLE("sceKernelFsync", sceKernelFsync)
 static int32_t sceKernelFtruncate(int fd, int64_t l) { return ftruncate(fd, l) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno)); }
 HLE("sceKernelFtruncate", sceKernelFtruncate)
 static int32_t sceKernelTruncate(const char* p, int64_t l) {
-    if (read_only_path(p)) return refuse_write("truncate", p);
-    return truncate(host_path(p).c_str(), l) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
+    std::error_code ec;
+    const auto path = resolve_retail_path(p, true, ec);
+    if (ec) return path_status(ec);
+    return truncate(path.c_str(), l) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
 }
 HLE("sceKernelTruncate", sceKernelTruncate)
 
@@ -627,9 +641,12 @@ static int fd_stat(int fd, struct stat* s) {
     return fstat(fd, s);
 }
 static int32_t sceKernelStat(const char* p, Ps4Stat* o) {
+    std::error_code ec;
+    const auto path = resolve_retail_path(p, false, ec);
+    if (ec) return path_status(ec);
     if (file_log()) log("stat %s", p);
     struct stat s;
-    if (stat(host_path(p).c_str(), &s) != 0) return sce_err(to_ps4_errno(errno));
+    if (stat(path.c_str(), &s) != 0) return sce_err(to_ps4_errno(errno));
     fill_stat(s, o);
     return SCE_OK;
 }
@@ -649,28 +666,41 @@ static int ps4_fstat(int fd, Ps4Stat* o) {
 }
 HLE("fstat", ps4_fstat)
 static int32_t sceKernelMkdir(const char* p, uint16_t mode) {
-    if (read_only_path(p)) return refuse_write("mkdir", p);
-    return mkdir(host_path(p).c_str(), mode ? mode : 0755) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
+    std::error_code ec;
+    const auto path = resolve_retail_path(p, true, ec);
+    if (ec) return path_status(ec);
+    return mkdir(path.c_str(), mode ? mode : 0755) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
 }
 HLE("sceKernelMkdir", sceKernelMkdir)
 static int32_t sceKernelRmdir(const char* p) {
-    if (read_only_path(p)) return refuse_write("rmdir", p);
-    return rmdir(host_path(p).c_str()) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
+    std::error_code ec;
+    const auto path = resolve_retail_path(p, true, ec);
+    if (ec) return path_status(ec);
+    return rmdir(path.c_str()) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
 }
 HLE("sceKernelRmdir", sceKernelRmdir)
 static int32_t sceKernelUnlink(const char* p) {
-    if (read_only_path(p)) return refuse_write("unlink", p);
-    return unlink(host_path(p).c_str()) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
+    std::error_code ec;
+    const auto path = resolve_retail_path(p, true, ec);
+    if (ec) return path_status(ec);
+    return unlink(path.c_str()) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
 }
 HLE("sceKernelUnlink", sceKernelUnlink)
 static int32_t sceKernelRename(const char* a, const char* b) {
-    if (read_only_path(a) || read_only_path(b)) return refuse_write("rename", a);
-    return rename(host_path(a).c_str(), host_path(b).c_str()) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
+    std::error_code ec;
+    const auto from = resolve_retail_path(a, true, ec);
+    if (ec) return path_status(ec);
+    const auto to = resolve_retail_path(b, true, ec);
+    if (ec) return path_status(ec);
+    return rename(from.c_str(), to.c_str()) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
 }
 HLE("sceKernelRename", sceKernelRename)
 static int32_t sceKernelChmod(const char* p, uint16_t m) {
-    if (read_only_path(p)) return refuse_write("chmod", p);
-    chmod(host_path(p).c_str(), m); return SCE_OK; }
+    std::error_code ec;
+    const auto path = resolve_retail_path(p, true, ec);
+    if (ec) return path_status(ec);
+    return chmod(path.c_str(), m) == 0 ? SCE_OK : sce_err(to_ps4_errno(errno));
+}
 HLE("sceKernelChmod", sceKernelChmod)
 static int32_t sceKernelUtimes(const char*, const void*) { return SCE_OK; }
 HLE("sceKernelUtimes", sceKernelUtimes)
