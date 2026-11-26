@@ -23,6 +23,7 @@
 #include "render_bridge.h"
 #include "runtime.h"
 #include "settings.h"
+#include "frame_time_contract.h"
 
 namespace d1 {
 
@@ -1813,6 +1814,42 @@ static D1_SYSV void game_time_hook(float elapsed, float* dt, int32_t* ticks, flo
         *reinterpret_cast<int64_t*>(tc + 0x08) = 1000000 / fps;
 }
 
+// 0x591D40 publishes a 0x38-byte frame state before the job graph is kicked.
+// Observe the actual scheduled step, including follow-up steps that do not
+// call game_time_hook. This distinguishes accumulator loss from stage stalls.
+using PublishFrameTimeFn = D1_SYSV void (*)(uint32_t, uint32_t);
+static PublishFrameTimeFn g_publish_frame_time_orig = nullptr;
+static D1_SYSV void publish_frame_time_hook(uint32_t previous, uint32_t next) {
+    g_publish_frame_time_orig(previous, next);
+    const uint64_t b = rt().modules[0].base;
+    const uint32_t index = *reinterpret_cast<const uint32_t*>(b + 0x26C7048);
+    if (index > 1) return;
+    frame_time::PublishedFrameTime state{};
+    std::memcpy(&state, reinterpret_cast<const void*>(b + 0x26C6FD8 + uint64_t(index) * sizeof state), sizeof state);
+    static auto since = std::chrono::steady_clock::now();
+    static double elapsed_sum = 0, scheduled_sum = 0, aggregate_sum = 0, secondary_sum = 0;
+    static uint64_t published = 0, first = 0, followup = 0, zero = 0, negative = 0;
+    ++published;
+    negative += state.current_step < 0;
+    if (state.first_step) {
+        ++first;
+        elapsed_sum += state.elapsed;
+        aggregate_sum += state.primary_aggregate;
+        secondary_sum += state.secondary_aggregate;
+    } else ++followup;
+    if (state.has_primary) scheduled_sum += state.current_step;
+    else ++zero;
+    const auto now = std::chrono::steady_clock::now();
+    if (const double wall = std::chrono::duration<double>(now - since).count(); wall >= 10.0) {
+        log("native frame schedule: %.2f s wall, %.3f s elapsed, %.3f s planned primary, %.3f s published steps, %.3f s secondary | %llu records, %llu first, %llu follow-up, %llu zero, %llu negative",
+            wall, elapsed_sum, aggregate_sum, scheduled_sum, secondary_sum, (unsigned long long)published,
+            (unsigned long long)first, (unsigned long long)followup, (unsigned long long)zero, (unsigned long long)negative);
+        since = now;
+        elapsed_sum = scheduled_sum = aggregate_sum = secondary_sum = 0;
+        published = first = followup = zero = negative = 0;
+    }
+}
+
 // ---- current world-controller state (eboot+0x783AC0, the state manager's transition step)
 // The state manager keeps its current state index at +0x1B0; names at 0x1945340 (37).
 using StateStepFn = D1_SYSV void (*)(void*);
@@ -2744,6 +2781,11 @@ void install_game_hooks() {
     else log("hooks: text run hook FAILED (controller prompts stay)");
     if (const char* t = getenv("D1_MOUSE_TEST")) std::sscanf(t, "%d,%d", &g_mouse_test_dx, &g_mouse_test_dy);
     g_state_step_orig = reinterpret_cast<StateStepFn>(hook_function(exe.base + 0x783AC0, reinterpret_cast<const void*>(&state_step_hook)));
+    if (const char* v = getenv("D1_NATIVE_FRAME_TRACE"); v && std::atoi(v)) {
+        g_publish_frame_time_orig = reinterpret_cast<PublishFrameTimeFn>(
+            hook_function(exe.base + 0x591D40, reinterpret_cast<const void*>(&publish_frame_time_hook)));
+        if (!g_publish_frame_time_orig) log("hooks: frame schedule publication trace FAILED");
+    }
     if (settings().fps > 0) {
         g_time_init_orig = reinterpret_cast<TimeInitFn>(hook_function(exe.base + 0x593F00, reinterpret_cast<const void*>(&time_init_hook)));
         g_game_time_orig = reinterpret_cast<GameTimeFn>(hook_function(exe.base + 0x591710, reinterpret_cast<const void*>(&game_time_hook)));
