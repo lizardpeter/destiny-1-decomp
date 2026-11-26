@@ -39,6 +39,7 @@
 #include "../gfx/native_close_contract.h"
 #include "../gfx/native_resource_identity.h"
 #include "../gfx/native_resource_binding.h"
+#include "../gfx/native_blit_queue.h"
 #include "runtime.h"
 #include "tiling.h"
 
@@ -609,6 +610,34 @@ D1_SYSV void h_release(uint32_t type, uint32_t handle) {
     o_release(type, handle);
     nr::resreg::event(type, handle, false);
 }
+// 0x7DA8B0/0x7DA910/0x7DA960: source-defined reservation and
+// enqueue using the retail consumer's exact shared cursor and record ABI.
+D1_SYSV uint64_t h_blit_reserve() {
+    const uint64_t base=nr::eb<uint64_t>(0x26DF268);
+    if(!base)return 0;
+    auto* cursor=reinterpret_cast<uint64_t*>(base+0x28000);
+    uint64_t old=__atomic_load_n(cursor,__ATOMIC_ACQUIRE),updated;
+    uint32_t slot;
+    for(;;){
+        if(!ng::blit::reserve(old,updated,slot))return 0;
+        if(__atomic_compare_exchange_n(cursor,&old,updated,false,__ATOMIC_SEQ_CST,__ATOMIC_ACQUIRE))
+            return base+uint64_t(slot)*0x40;
+    }
+}
+D1_SYSV bool h_blit_can_request(uint32_t count) {
+    const uint64_t base=nr::eb<uint64_t>(0x26DF268);
+    return base&&ng::blit::can_request(__atomic_load_n(reinterpret_cast<uint64_t*>(base+0x28000),__ATOMIC_ACQUIRE),count);
+}
+D1_SYSV bool h_blit_enqueue(uint64_t dst,uint64_t src,uint32_t size,uint64_t callback,
+                            const uint64_t* a,const uint64_t* b,uint64_t record) {
+    if(!a||!b)return false;
+    if(!record)record=h_blit_reserve();
+    if(!record)return false;
+    // Stack arguments are copied by value before publishing the ready bit.
+    ng::blit::initialize(reinterpret_cast<void*>(record),{dst,src,size,callback,*a,*b});
+    __atomic_exchange_n(reinterpret_cast<uint32_t*>(record),1u,__ATOMIC_SEQ_CST);
+    return true;
+}
 using Two = D1_SYSV void (*)(uint64_t, uint64_t);
 Two o_copy, o_swap;
 D1_SYSV void h_copy(uint64_t a, uint64_t b) {
@@ -747,6 +776,11 @@ void install() {
     ok &= hook(0x7D3560, &h_copy, o_copy, "resource_move_copy");
     ok &= hook(0x7D37B0, &h_swap, o_swap, "resource_move_commit");
     ok &= hook(0x7D4480, &h_mips, o_mips, "texture_mips");
+    if(native_bind_enabled()){
+        ok &= replace_eboot_function(0x7DA8B0,reinterpret_cast<const void*>(&h_blit_reserve));
+        ok &= replace_eboot_function(0x7DA910,reinterpret_cast<const void*>(&h_blit_can_request));
+        ok &= replace_eboot_function(0x7DA960,reinterpret_cast<const void*>(&h_blit_enqueue));
+    }
     ok &= hook(0x82B490, &h_tech_a, o_tech_a, "tfx_technique_apply_a");
     ok &= hook(0x82B5C0, &h_tech_b, o_tech_b, "tfx_technique_apply_b");
     ok &= hook(0x82B730, &h_tech_c, o_tech_c, "tfx_technique_apply_c");

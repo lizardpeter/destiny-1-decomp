@@ -251,3 +251,7 @@ add_test(NAME native-mapping-contract COMMAND native-mapping-contract-test)
 add_executable(native-resource-binding-test tests/native_resource_binding_test.cpp)
 target_include_directories(native-resource-binding-test PRIVATE gfx)
 add_test(NAME native-resource-binding COMMAND native-resource-binding-test)
+
+add_executable(native-blit-queue-test tests/native_blit_queue_test.cpp)
+target_include_directories(native-blit-queue-test PRIVATE gfx)
+add_test(NAME native-blit-queue COMMAND native-blit-queue-test)
