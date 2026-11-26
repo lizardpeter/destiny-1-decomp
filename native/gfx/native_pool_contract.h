@@ -58,4 +58,54 @@ bool destroy(uint32_t value,Root root,Notify notify,Free free,ReleaseTag release
     std::memset(reinterpret_cast<void*>(node),0,0x40);
     return true;
 }
+// 77290/77310/77390: unlink a container from its active list and
+// recycle it at the specified end of a free list. Link offsets are
+// relative to the field at table+8, not the table base.
+inline uint16_t unlink(uint64_t links,uint64_t list,uint16_t id){
+    const auto p=links+uint64_t(id)*4;
+    const auto next=read<uint16_t>(p),prev=read<uint16_t>(p,2);
+    if(next==0xffff)write(list,2,prev);
+    else write(links+uint64_t(next)*4,2,prev);
+    if(prev==0xffff)write(list,0,next);
+    else write(links+uint64_t(prev)*4,0,next);
+    return next;
+}
+inline void push_free(uint64_t links,uint64_t list,uint16_t id,bool tail){
+    const uint64_t p=links+uint64_t(id)*4;
+    const unsigned end=tail?2:0,other=tail?0:2;
+    const auto old=read<uint16_t>(list,end);
+    write(p,end,old);write(p,other,uint16_t(0xffff));
+    if(old!=0xffff)write(links+uint64_t(old)*4,other,id);
+    write(list,end,id);
+    if(read<uint16_t>(list,other)==0xffff)write(list,other,id);
+    write(list,4,read<uint32_t>(list,4)+1);
+}
+inline uint16_t recycle(uint64_t table,uint64_t list,uint64_t special,uint16_t id,uint32_t kind){
+    const bool separate=kind==3||kind==4||kind==5;
+    if(separate&&id==0xffff)return 0xffff;
+    const auto links=table+8+read<uint64_t>(table,8);
+    const auto next=unlink(links,list,id);
+    if(separate){
+        write(list,4,read<uint32_t>(list,4)-1);
+        push_free(links,special,id,false);
+    }else{
+        push_free(links,table+0x24,id,kind==10);
+        write(list,4,read<uint32_t>(list,4)-1);
+    }
+    return next;
+}
+// B34F0: release allocation, and only on success recycle the container.
+template<class RegionIndex,class Release>
+bool release_container(uint64_t table,uint64_t regions,uint64_t special,uint16_t id,
+                       RegionIndex region_index,Release release){
+    const auto entry=table+read<uint64_t>(table)+uint64_t(id)*read<uint64_t>(table,0x10);
+    const auto kind=read<uint32_t>(entry,0x74),k=kind-1;
+    const int32_t region=k<10?region_index(k):0;
+    const bool top=k<10?((0x270u>>k)&1)!=0:true;
+    if(!release(read<uint64_t>(entry,0x30),read<uint64_t>(entry,0x50),
+                read<uint32_t>(entry,0x70),uint8_t(top),region))return false;
+    const auto list=regions+uint64_t(int64_t(region)*0x70)+(top?0x64:0x5c);
+    recycle(table,list,special,id,kind);
+    return true;
+}
 } // namespace d1::ng::pool

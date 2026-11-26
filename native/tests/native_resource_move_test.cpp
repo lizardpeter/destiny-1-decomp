@@ -66,5 +66,39 @@ int main(){
     pool::write(en,0x18,tb+0x20);pool::write(tb+0x20,8,da);pool::write(tb+0x20,0x10,uint32_t(16));
     pool::set_datum(tb,1,da+0x1000,0xc0000040);
     check(pool::read<uint32_t>(da+16)==0xc0000040&&pool::read<uint64_t>(da+16,8)==uint64_t(16-0x1000));
+    // Active list uses relative link offsets; verify normal head/tail and
+    // special recycling, including the release-failed no-mutation path.
+    for(uint32_t kind:{1u,3u,4u,5u,10u}){
+        std::array<uint8_t,0x300> tab{},regions{};
+        std::array<uint8_t,8> special{};
+        const auto tb=uint64_t(tab.data()),rg=uint64_t(regions.data()),sp=uint64_t(special.data());
+        const auto links=tb+0x80,entries=tb+0x100;
+        pool::write(tb,0,uint64_t(0x100));pool::write(tb,8,uint64_t(0x78));pool::write(tb,0x10,uint64_t(0x80));
+        const uint16_t id=1;
+        const auto item=entries+uint64_t(id)*0x80;
+        pool::write(item,0x30,uint64_t(0x4000));pool::write(item,0x50,uint64_t(0x100));
+        pool::write(item,0x70,uint32_t(5));pool::write(item,0x74,kind);
+        const bool top=((0x270u>>(kind-1))&1)!=0;
+        const auto active=rg+0x70+(top?0x64:0x5c);
+        pool::write(active,0,id);pool::write(active,2,id);pool::write(active,4,uint32_t(1));
+        pool::write(links+id*4,0,uint16_t(0xffff));pool::write(links+id*4,2,uint16_t(0xffff));
+        pool::write(tb,0x24,uint16_t(2));pool::write(tb,0x26,uint16_t(2));pool::write(tb,0x28,uint32_t(1));
+        pool::write(sp,0,uint16_t(2));pool::write(sp,2,uint16_t(2));pool::write(sp,4,uint32_t(1));
+        pool::write(links+8,0,uint16_t(0xffff));pool::write(links+8,2,uint16_t(0xffff));
+        const auto before=tab;
+        check(!pool::release_container(tb,rg,sp,id,[](uint32_t){return 1;},
+            [](uint64_t,uint64_t,uint32_t,uint8_t,int32_t){return false;}));
+        check(tab==before&&pool::read<uint32_t>(active,4)==1);
+        check(pool::release_container(tb,rg,sp,id,[](uint32_t){return 1;},
+            [&](uint64_t a,uint64_t n,uint32_t tag,uint8_t side,int32_t region){
+                check(a==0x4000&&n==0x100&&tag==5&&side==top&&region==1);return true;
+            }));
+        check(pool::read<uint16_t>(active)==0xffff&&pool::read<uint32_t>(active,4)==0);
+        const bool separate=kind==3||kind==4||kind==5;
+        const auto free_list=separate?sp:tb+0x24;
+        check(pool::read<uint32_t>(free_list,4)==2);
+        if(kind==10)check(pool::read<uint16_t>(free_list,2)==id&&pool::read<uint16_t>(links+8)==id);
+        else check(pool::read<uint16_t>(free_list)==id&&pool::read<uint16_t>(links+8,2)==id);
+    }
     std::printf("native resource move: %llu handle cases passed\n",(unsigned long long)cases);
 }
