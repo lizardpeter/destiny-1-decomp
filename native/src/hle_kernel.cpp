@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <iterator>
 #include <vector>
@@ -121,8 +122,22 @@ static uint64_t pick_va(uint64_t want, uint64_t len, uint64_t align) {
     return a;
 }
 
+// Called with g_mem_mutex held. Windows non-fixed hints can also carve
+// reserved placeholders, so reject any explicit overlap, not just MAP_FIXED.
+static bool native_asset_overlap(uint64_t address,uint64_t size) {
+    if(!address||!size||g_native_asset_reservations.empty())return false;
+    const auto next=g_native_asset_reservations.lower_bound(address);
+    if(next!=g_native_asset_reservations.end()&&
+       asset_region::overlaps(address,size,next->first,next->second))return true;
+    if(next!=g_native_asset_reservations.begin()){
+        const auto prev=std::prev(next);
+        return asset_region::overlaps(address,size,prev->first,prev->second);
+    }
+    return false;
+}
 static void* do_map(uint64_t want, uint64_t len, int prot, bool fixed, bool direct, uint64_t off, uint64_t align) {
     uint64_t va = pick_va(want, len, align);
+    if(native_asset_overlap(va,len))return nullptr;
     return direct ? os::phys_map(va, len, off, host_prot(prot), fixed) : os::alloc(va, len, host_prot(prot), fixed);
 }
 
@@ -240,6 +255,7 @@ HLE("sceKernelMapFlexibleMemory", sceKernelMapFlexibleMemory)
 static int32_t sceKernelReserveVirtualRange(void** addr, uint64_t len, int flags, uint64_t align) {
     std::lock_guard lk(g_mem_mutex);
     uint64_t va = pick_va(reinterpret_cast<uint64_t>(*addr), len, align);
+    if(native_asset_overlap(va,len))return sce_err(22);
     void* p = os::reserve(va, len, flags & 0x10);
     if (!p) return sce_err(12);
     *addr = p;
@@ -247,17 +263,39 @@ static int32_t sceKernelReserveVirtualRange(void** addr, uint64_t len, int flags
 }
 HLE("sceKernelReserveVirtualRange", sceKernelReserveVirtualRange)
 
-static int32_t sceKernelMunmap(void* addr, uint64_t len) {
-    gpu_on_unmap(reinterpret_cast<uint64_t>(addr), len);
-    std::lock_guard lk(g_mem_mutex);
-    g_regions.erase(reinterpret_cast<uint64_t>(addr));
-    // A released reservation is no longer a safe target for fixed host commits.
-    // Conservatively invalidate on any partial unmap as well.
-    for(auto it=g_native_asset_reservations.begin();it!=g_native_asset_reservations.end();){
-        if(asset_region::overlaps(uint64_t(addr),len,it->first,it->second))
-            it=g_native_asset_reservations.erase(it);
-        else ++it;
+// Native asset reservations are independent ownership units. Partial
+// release is not part of the recovered commit contract: reject it rather
+// than leave stale addresses or silently discard live backing.
+enum class AssetUnmap { unrelated, released, rejected };
+static AssetUnmap native_asset_unmap_locked(void* addr,uint64_t len) {
+    const uint64_t base=uint64_t(addr);
+    if(!native_asset_overlap(base,len))return AssetUnmap::unrelated;
+    auto reservation=g_native_asset_reservations.find(base);
+    if(reservation==g_native_asset_reservations.end()||
+       reservation->second!=len)return AssetUnmap::rejected;
+    // Delayed copies use the same mapping mutex. Invalidate all committed
+    // ranges, including growth chunks whose bases differ from the arena base.
+    gpu_on_unmap(base,len);
+    const bool released=os::release(addr,len);
+    auto first=g_regions.lower_bound(base);
+    auto last=g_regions.lower_bound(base+len);
+    g_regions.erase(first,last);
+    g_regions_gen.fetch_add(1,std::memory_order_release);
+    // A partially completed host release cannot safely be retried.
+    if(!released){
+        log("native asset region: host release failed");
+        std::abort();
     }
+    g_native_asset_reservations.erase(reservation);
+    return AssetUnmap::released;
+}
+static int32_t sceKernelMunmap(void* addr, uint64_t len) {
+    std::lock_guard lk(g_mem_mutex);
+    const auto native=native_asset_unmap_locked(addr,len);
+    if(native!=AssetUnmap::unrelated)
+        return native==AssetUnmap::released?SCE_OK:sce_err(22);
+    gpu_on_unmap(reinterpret_cast<uint64_t>(addr), len);
+    g_regions.erase(reinterpret_cast<uint64_t>(addr));
     g_regions_gen.fetch_add(1, std::memory_order_release);
     return os::release(addr, len) ? SCE_OK : sce_err(22);
 }
@@ -403,6 +441,7 @@ static int64_t ps4_pread_all(int fd, void* b, uint64_t n, int64_t off);
 static void* ps4_mmap(void* addr, uint64_t len, int prot, int flags, int fd, int64_t off) {
     const bool anon = flags & 0x1000, fixed = flags & 0x10;
     std::lock_guard lk(g_mem_mutex);
+    if(native_asset_overlap(uint64_t(addr),len)){errno=EINVAL;return reinterpret_cast<void*>(-1);}
     void* p = os::alloc(reinterpret_cast<uint64_t>(addr), len, anon ? host_prot(prot) : os::kRead | os::kWrite, fixed);
     if (!p) { errno = 12; return reinterpret_cast<void*>(-1); }
     if (!anon) {
@@ -412,7 +451,13 @@ static void* ps4_mmap(void* addr, uint64_t len, int prot, int flags, int fd, int
     return p;
 }
 HLE("mmap", ps4_mmap)
-static int ps4_munmap(void* a, uint64_t l) { return os::release(a, l) ? 0 : -1; }
+static int ps4_munmap(void* a, uint64_t l) {
+    std::lock_guard lk(g_mem_mutex);
+    const auto native=native_asset_unmap_locked(a,l);
+    if(native==AssetUnmap::released)return 0;
+    if(native==AssetUnmap::rejected){errno=EINVAL;return -1;}
+    return os::release(a,l)?0:-1;
+}
 HLE("munmap", ps4_munmap)
 static int ps4_msync(void* a, uint64_t l, int f) { return 0; }
 HLE("msync", ps4_msync)
