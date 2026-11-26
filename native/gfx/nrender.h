@@ -116,6 +116,8 @@ bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<
 void fill_late(const LateCb& l, uint64_t src, uint32_t size);
 void submit_recorded(const std::vector<uint32_t>& handles);
 void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj);
+// Called only with the texture capture gate held, once per list/epoch.
+void capture_texture_source(const uint32_t* tsharp,uint64_t res,uint64_t obj);
 void notify_texture_mips(const uint32_t* tsharp, uint64_t res, uint64_t obj, uint64_t low_base, uint64_t hi_base,
                          const uint32_t* low_descriptor=nullptr,uint64_t low_bytes=0,uint64_t hi_bytes=0);
 void prefetch_buffer(uint64_t base, uint64_t size, uint64_t res, uint64_t obj);

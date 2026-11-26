@@ -53,4 +53,25 @@ struct TextureKeyHash {
         return size_t(h);
     }
 };
+// An immutable source version is keyed by the complete resource epoch and
+// byte interpretation, not a raw tag pointer or a hash. View-only state
+// can change without changing the tiled source.
+struct TextureSourceKey {
+    uint64_t epoch=0;
+    std::array<uint32_t,8> words{};
+    bool operator==(const TextureSourceKey&)const=default;
+};
+inline TextureSourceKey texture_source_key(const uint32_t* t,uint64_t epoch){
+    TextureSourceKey k{epoch,{}};
+    for(unsigned j=0;j<8;++j)k.words[j]=t[j];
+    k.words[1]&=0xfff000ffu;
+    k.words[3]&=0xf3ff0000u;
+    return k;
+}
+struct TextureSourceKeyHash {
+    size_t operator()(const TextureSourceKey& k)const noexcept{
+        TextureKey key{uint32_t(k.epoch>>32),k.words};
+        return TextureKeyHash{}(key)^size_t(k.epoch*0x9e3779b97f4a7c15ull);
+    }
+};
 } // namespace d1::ng

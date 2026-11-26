@@ -955,6 +955,7 @@ struct Renderer {
                 (img->hi_loaded && overlaps(img->hi_base, img->hi_size))) {
                 if(img->res_val&&img->res_obj&&opt.res_current&&opt.res_current(img->res_obj)!=img->res_val)
                     continue; // old native GPU version is immutable
+                invalidate_source(img.get());
                 img->stale = true;
                 ++dma_stale;
                 changed = true;
@@ -1016,6 +1017,7 @@ struct Renderer {
                 !(img->hi_loaded && overlaps(img->hi_base, img->hi_size))) continue;
             if(img->res_val&&img->res_obj&&opt.res_current&&opt.res_current(img->res_obj)!=img->res_val)
                 continue;
+            invalidate_source(img.get());
             img->stale = true;
             ++cpu_stale;
             changed = true;
@@ -1176,6 +1178,56 @@ struct Renderer {
     };
     std::mutex mip_m;
     std::unordered_map<uint32_t, StreamHistory> stream_mips;
+    // CPU source ownership is separate from the renderer lock and the
+    // lifetime of the original streaming pool. Capture never takes m.
+    struct OwnedTexture {
+        StreamMipInfo info{};
+        struct Range {uint64_t base=0;std::vector<uint8_t> bytes;};
+        std::vector<Range> ranges;
+        uint64_t size=0;
+    };
+    struct CapturedSource {
+        ImageLifetime<Image>::Token ready;
+        std::shared_ptr<const OwnedTexture> owned;
+    };
+    std::mutex source_m;
+    std::unordered_map<TextureSourceKey,CapturedSource,TextureSourceKeyHash> captured_sources;
+    uint64_t captured_source_bytes=0;
+    std::atomic<uint64_t> captured_source_count{0},captured_source_budget_misses{0};
+    uint64_t captured_source_replays=0;
+    void capture_owned_texture(const uint32_t* words,uint64_t res,uint64_t obj);
+    std::shared_ptr<const OwnedTexture> find_owned_texture(const uint32_t* words,uint64_t res){
+        std::lock_guard lk(source_m);
+        const auto it=captured_sources.find(texture_source_key(words,res));
+        return it==captured_sources.end()?nullptr:it->second.owned;
+    }
+    void source_ready(const uint32_t* words,uint64_t res,Image* img){
+        if(!res||!img)return;
+        std::lock_guard lk(source_m);
+        captured_sources[texture_source_key(words,res)].ready=img->lifetime.token(img);
+    }
+    void invalidate_source(Image* img){
+        if(!img->res_val)return;
+        img->lifetime.retire();
+        std::lock_guard lk(source_m);
+        for(unsigned slot=0;slot<2;++slot){
+            const auto epoch=img->descriptor_epoch[slot];
+            if(!epoch)continue;
+            const auto it=captured_sources.find(texture_source_key(img->resident_descriptor[slot],epoch));
+            if(it==captured_sources.end())continue;
+            if(it->second.owned){captured_source_bytes-=it->second.owned->size;it->second.owned.reset();}
+            it->second.ready.reset();
+        }
+    }
+    void prune_sources(){
+        std::lock_guard lk(source_m);
+        for(auto it=captured_sources.begin();it!=captured_sources.end();){
+            if(texture_leases().pinned(it->first.epoch)){++it;continue;}
+            if(it->second.owned){captured_source_bytes-=it->second.owned->size;it->second.owned.reset();}
+            if(!ImageLifetime<Image>::resolve(it->second.ready))it=captured_sources.erase(it);
+            else ++it;
+        }
+    }
     StreamMipInfo get_stream_info(uint64_t res, uint64_t obj, const fmt::TSharp& ts, const uint32_t* words);
     ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res = 0, Image* prepared_image=nullptr);
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
@@ -2601,7 +2653,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     }
     // Existing exact old-epoch GPU images can still be used above. Do not
     // reload an old captured descriptor from a recycled host allocation.
-    if(res&&obj&&opt.res_current&&opt.res_current(obj)!=res){++expired_texture_epochs;return nullptr;}
+    const bool expired=res&&obj&&opt.res_current&&opt.res_current(obj)!=res;
+    const auto owned=expired&&!prepared&&!split_prepared?find_owned_texture(t,res):nullptr;
+    if(expired&&!owned){++expired_texture_epochs;return nullptr;}
     const auto ts = fmt::decode_tsharp(t);
     const auto fi = fmt::data_format(ts.dfmt);
     const VkFormat f = fmt::vk_format(ts.dfmt, ts.nfmt);
@@ -2610,7 +2664,8 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     uint32_t layers = (ts.type == 13 || ts.type == 12 || cube) ? ts.last_array + 1 : 1;
     if (cube) layers = std::max(6u, layers - layers % 6);
 
-    const StreamMipInfo smi = (!is3d && ts.type != 12 && ts.type != 13) ? get_stream_info(res, obj, ts, t) : StreamMipInfo{};
+    const StreamMipInfo smi=owned?owned->info:
+        (!is3d&&ts.type!=12&&ts.type!=13)?get_stream_info(res,obj,ts,t):StreamMipInfo{};
     if(!smi.valid){++expired_texture_epochs;return nullptr;}
     tiling::Surface sf;
     sf.tile_mode=ts.tiling;sf.bpp=fi.bpp;sf.block=fi.block;sf.pow2=ts.pow2;
@@ -2658,7 +2713,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                img->layers==layers&&img->levels==full_levels&&img->cube==cube&&img->is3d==is3d;
     };
     const uint64_t cur_bytes=(source==MipSource::split_chain||top_only)?sf.mips[0].size:sf.total_size;
-    if(prepared ? prepared_source_size!=cur_bytes : !guest_readable_range(ts.base,cur_bytes)){
+    if(prepared ? prepared_source_size!=cur_bytes : (!owned&&!guest_readable_range(ts.base,cur_bytes))){
         ++texture_range_rejects;
         return nullptr;
     }
@@ -2669,10 +2724,16 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     static thread_local std::vector<uint8_t> primary_source,secondary_source;
     MappingSpans primary_spans,secondary_spans;
     bool primary_ready=false;
-    const auto current_epoch=[&]{return !res||!obj||!opt.res_current||opt.res_current(obj)==res;};
+    const auto current_epoch=[&]{return owned||!res||!obj||!opt.res_current||opt.res_current(obj)==res;};
     auto capture_source=[&](uint64_t base,uint64_t bytes,std::vector<uint8_t>& dst,MappingSpans& spans){
-        if(!bytes||bytes>(512ull<<20)||!current_epoch()||
-           !guest_capture_read_spans(base,bytes,spans))return false;
+        if(!bytes||bytes>(512ull<<20)||!current_epoch())return false;
+        if(owned){
+            for(const auto& range:owned->ranges)if(range.base==base&&range.bytes.size()==bytes){
+                dst=range.bytes;return true;
+            }
+            return false;
+        }
+        if(!guest_capture_read_spans(base,bytes,spans))return false;
         dst.resize(bytes);
         return guest_copy_current_spans(base,bytes,spans,dst.data())&&current_epoch();
     };
@@ -2720,13 +2781,15 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
             if ((!split_resource||contiguous_high) && matches_shape(img)&&same_layout&&img->src_size == cur_bytes &&
                 (prepared ? prepared_hash==img->content :
                  (primary()&&hash_bytes(primary_source.data(),cur_bytes)==img->content&&
-                  guest_matches_current_spans(ts.base,cur_bytes,primary_spans,primary_source.data())&&current_epoch()))) {
+                  (owned||guest_matches_current_spans(ts.base,cur_bytes,primary_spans,primary_source.data()))&&current_epoch()))) {
                 img->remember_relocation();
                 img->res_val = res, img->src_addr = ts.base;
                 std::memcpy(img->resident_descriptor[0],t,32);
                 img->descriptor_epoch[0]=res;img->descriptor_epoch[1]=0;
                 ++views_gen;
                 ++st.res_moves;
+                if(split_resource)source_ready(t,res,img);
+                if(owned)++captured_source_replays;
                 st.t_tex_hit += now_ns() - t_in;
                 return img;
             }
@@ -2911,9 +2974,9 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                 tiling::detile(s_src,src_lv_begin+k,tiled,sb.map+level_off[k]);
             st.t_detile += now_ns() - td;
         }
-        if(!current_epoch()||(split?
+        if(!current_epoch()||(!owned&&(split?
            !guest_matches_current_spans(base_addr,needed,split->mapping,split->tiled.data()):
-           (!prepared&&(!spans||!guest_matches_current_spans(base_addr,captured,*spans,tiled))))){
+           (!prepared&&(!spans||!guest_matches_current_spans(base_addr,captured,*spans,tiled)))))){
             if(own)free_buffer(sb);
             ++st.tex_torn;
             return false;
@@ -2976,7 +3039,7 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
                     sf_low.pitch=low.pitch;sf_low.tile_mode=low.tiling;sf_low.pow2=low.pow2;
                 }else ++split_layout_guesses;
                 tiling::layout(sf_low);
-                if (guest_readable_range(smi.low_base,sf_low.total_size)) {
+                if (owned||guest_readable_range(smi.low_base,sf_low.total_size)) {
                     if (upload_range(sf_low, smi.low_base, 0, full_levels - 1, 1)) {
                         img->low_loaded = true;
                         img->low_base = smi.low_base;
@@ -3067,6 +3130,8 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     out->last_frame = st.frames;
     ++st.textures;
     textures[key] = std::move(img); ++views_gen;
+    if(split_resource)source_ready(t,res,out);
+    if(owned)++captured_source_replays;
     return out;
 }
 
@@ -3571,6 +3636,10 @@ void Renderer::trim_texture_history(bool all){
 }
 void Renderer::evict_textures() {
     trim_texture_history();
+    {
+        auto gate=texture_leases().retire();
+        prune_sources();
+    }
     // Reclaim native stream metadata independently from GPU images. Keep
     // every pending command-list lease, plus recent metadata for live assets.
     {
@@ -6101,6 +6170,89 @@ static bool split_2d_surface(const uint32_t* words,tiling::Surface& sf){
     sf.levels=std::min(d.last_level+1,tiling::kMaxMips);
     tiling::layout(sf);return true;
 }
+// Called from the engine capture thread with a shared publication gate.
+// Only split 1D/2D assets with an exact published descriptor are eligible.
+// The first list that references an unprepared epoch retains its actual
+// source bytes. Later lists share the same snapshot or ready GPU token.
+void Renderer::capture_owned_texture(const uint32_t* words,uint64_t res,uint64_t obj){
+    if(!res||!obj||!opt.res_current||opt.res_current(obj)!=res||guest_region_extent(obj)<0x44||
+       !*reinterpret_cast<const uint8_t*>(obj+0x34))return;
+    const auto ts=fmt::decode_tsharp(words);
+    if(ts.type<8||ts.type>9)return;
+    const auto key=texture_source_key(words,res);
+    {
+        std::lock_guard lk(source_m);
+        const auto it=captured_sources.find(key);
+        if(it!=captured_sources.end()&&(it->second.owned||ImageLifetime<Image>::resolve(it->second.ready)))return;
+    }
+    StreamMipInfo info{};
+    bool have=false;
+    {
+        std::lock_guard lk(mip_m);
+        const auto it=stream_mips.find(uint32_t(res>>32));
+        if(it!=stream_mips.end())if(const auto* entry=it->second.find(res)){info=*entry;have=true;}
+    }
+    if(!have){
+        // Initial low-res bind may not invoke 7D4480. The captured
+        // descriptor and authored mip count establish the low chain;
+        // a full-resolution descriptor without callback bounds does not.
+        info.obj=obj;info.epoch=res;info.has_hi=1;
+        info.full_w=*reinterpret_cast<const uint16_t*>(obj+0x28);
+        info.full_h=*reinterpret_cast<const uint16_t*>(obj+0x2a);
+        info.full_d=1;info.full_mips=*reinterpret_cast<const uint8_t*>(obj+0x31);
+        if(info.full_mips<2||ts.last_level+1!=uint32_t(info.full_mips)-1)return;
+        info.low_base=ts.base;info.low_layout=ts;std::memcpy(info.low_words.data(),words,32);
+    }
+    if(!info.valid||!info.has_hi||info.full_mips<2)return;
+    tiling::Surface sf;
+    if(!split_2d_surface(words,sf))return;
+    const auto fi=fmt::data_format(ts.dfmt);
+    const uint32_t lw=info.full_w<4?1u:uint32_t(info.full_w>>1),lh=std::max(1u,uint32_t(info.full_h>>1));
+    const bool low_dims=(ts.width==lw||(fi.block&&ts.width==((lw+3)&~3u)))&&
+                        (ts.height==lh||(fi.block&&ts.height==((lh+3)&~3u)));
+    const bool low=low_dims&&ts.last_level+1==uint32_t(info.full_mips)-1&&ts.base==info.low_base;
+    const bool high=ts.width==info.full_w&&ts.height==info.full_h&&ts.last_level+1==info.full_mips&&ts.base==info.hi_base;
+    const auto source=mip_source(low,high,info.low_base,info.hi_base,info.low_bytes,info.hi_bytes,sf.total_size,sf.mips[0].size);
+    if(source==MipSource::invalid||(!info.from_callback&&source==MipSource::high_only))return;
+    const uint64_t primary=(source==MipSource::high_only||source==MipSource::split_chain)?sf.mips[0].size:sf.total_size;
+    uint64_t secondary=0;
+    if(source==MipSource::split_chain){
+        tiling::Surface low_sf;
+        if(!info.low_words[0]||!split_2d_surface(info.low_words.data(),low_sf)||
+           info.low_layout.base!=info.low_base||info.low_layout.dfmt!=ts.dfmt||
+           info.low_layout.nfmt!=ts.nfmt||low_sf.levels!=uint32_t(info.full_mips)-1)return;
+        secondary=low_sf.total_size;
+        if(info.low_bytes&&secondary>info.low_bytes)return;
+    }
+    constexpr uint64_t budget=256ull<<20;
+    if(!primary||primary>budget||secondary>budget-primary)return;
+    auto snapshot=std::make_shared<OwnedTexture>();
+    snapshot->info=info;snapshot->size=primary+secondary;
+    // Reserve budget before allocation/copy. Unpinned sources are pruned
+    // by the renderer; pinned sources are never evicted to make room.
+    {
+        std::lock_guard lk(source_m);
+        if(captured_source_bytes+snapshot->size>budget){++captured_source_budget_misses;return;}
+        captured_source_bytes+=snapshot->size;
+    }
+    auto copy=[&](uint64_t base,uint64_t size){
+        MappingSpans spans;
+        if(!base||!size||!guest_capture_read_spans(base,size,spans))return false;
+        OwnedTexture::Range range;range.base=base;range.bytes.resize(size);
+        if(!guest_copy_current_spans(base,size,spans,range.bytes.data())||
+           opt.res_current(obj)!=res||!guest_matches_current_spans(base,size,spans,range.bytes.data()))return false;
+        snapshot->ranges.push_back(std::move(range));return true;
+    };
+    const bool ok=copy(ts.base,primary)&&(!secondary||copy(info.low_base,secondary))&&opt.res_current(obj)==res;
+    std::lock_guard lk(source_m);
+    if(ok){
+        auto& entry=captured_sources[key];
+        if(!entry.owned&&!ImageLifetime<Image>::resolve(entry.ready)){
+            entry.owned=std::move(snapshot);++captured_source_count;return;
+        }
+    }
+    captured_source_bytes-=snapshot->size;
+}
 void Renderer::load_split_texture(const LoadJob& j){
     if(!opt.res_current||opt.res_current(j.obj)!=j.res)return;
     const auto ts=fmt::decode_tsharp(j.t);
@@ -7291,6 +7443,9 @@ void fill_late(const LateCb& l, uint64_t src, uint32_t size) {
         while (cur < want && !h.compare_exchange_weak(cur, want)) {}
     }
 }
+void capture_texture_source(const uint32_t* tsharp,uint64_t res,uint64_t obj){
+    if(g)g->capture_owned_texture(tsharp,res,obj);
+}
 void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj) {
     if (!g || !res || !g->load_on) return;
     Renderer::LoadJob j{1,{},0,0,res,obj};
@@ -7731,6 +7886,15 @@ void print_stats() {
             (unsigned long long)g->top_only_uploads);
         log("native renderer: allocation-verified full high chains uploaded %llu",(unsigned long long)g->contiguous_high_uploads);
         g->contiguous_high_uploads=0;
+        {
+            std::lock_guard lk(g->source_m);
+            log("native renderer: owned texture sources %.1f MiB, %llu captured, %llu old-epoch uploads, %llu budget rejects",
+                double(g->captured_source_bytes)/1048576.0,
+                (unsigned long long)g->captured_source_count.exchange(0),
+                (unsigned long long)g->captured_source_replays,
+                (unsigned long long)g->captured_source_budget_misses.exchange(0));
+        }
+        g->captured_source_replays=0;
         g->texture_view_mismatches=g->top_only_uploads=0;
         g->split_layout_guesses=g->expired_texture_epochs=0;
         log("native renderer: texture epoch cohort splits %llu, conflicting versions in one draw %llu",

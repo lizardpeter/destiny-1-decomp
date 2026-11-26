@@ -46,6 +46,6 @@ public:
     TextureLeaseSet& operator=(const TextureLeaseSet&)=delete;
     ~TextureLeaseSet(){for(auto id:ids_)registry_.unpin(id);}
     // One reference per distinct epoch per list, not per draw or binding.
-    void pin(uint64_t id){if(id&&ids_.insert(id).second)registry_.pin(id);}
+    bool pin(uint64_t id){if(!id||!ids_.insert(id).second)return false;registry_.pin(id);return true;}
 };
 } // namespace d1::ng

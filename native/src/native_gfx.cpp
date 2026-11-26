@@ -344,7 +344,7 @@ ng::Draw* capture(uint64_t dev, uint32_t engine_prim, uint64_t caller = 0) {
                     d->tex_mask[s] |= uint16_t(1u << i);
                     d->tex_res[s][i]=after;
                     d->tex_obj[s][i]=t;
-                    if(leases)leases->pin(after);
+                    if(leases&&leases->pin(after))ng::capture_texture_source(d->tex[s][i],after,t);
                 }
             }
             if (const uint64_t p = field<uint64_t>(dev, (s ? 0x2278 : 0x22F8) + i * 8); p >= 0x10000) {
@@ -719,7 +719,14 @@ D1_SYSV void h_pool_free(uint32_t value) {
     const auto root=[] {return nr::eb<uint64_t>(0x1a238b8);};
     // No-op release is not a lifetime event.
     if(!ng::pool::occupied(root(),pool))return;
-    const bool retiring=registry&&registry->begin_pool_retire(pool);
+    bool retiring=false;
+    {
+        // Do not free a pool while a command-list capture is copying a
+        // source version. Release the gate before original callbacks,
+        // which can themselves publish texture changes.
+        auto gate=ng::texture_leases().retire();
+        retiring=registry&&registry->begin_pool_retire(pool);
+    }
     static const bool native=[]{
         const char* v=std::getenv("D1_PC_NATIVE_POOL_DESTROY");
         return !v||std::atoi(v)!=0;
@@ -737,7 +744,10 @@ D1_SYSV void h_pool_free(uint32_t value) {
               reinterpret_cast<ReleaseTag>(nr::g_base+0xaf8f0)(tag);
           });
     }else o_pool_free(value);
-    if(retiring)registry->end_pool_retire(pool);
+    if(retiring){
+        auto gate=ng::texture_leases().retire();
+        registry->end_pool_retire(pool);
+    }
 }
 uint64_t tex_base(const uint32_t* t) { return (uint64_t(t[0]) | uint64_t(t[1] & 0xFF) << 32) << 8; }
 // Both switch dispatchers and their leaves define AL, not full RAX.

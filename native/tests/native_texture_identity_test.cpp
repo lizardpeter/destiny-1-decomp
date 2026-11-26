@@ -6,6 +6,15 @@
 using namespace d1::ng;
 static void check(bool x){if(!x)std::abort();}
 int main(){
+    {
+        uint32_t a[8]{1,0xabc00007,0x1234,0x90230000,0x55,6,7,8};
+        uint32_t b[8];for(unsigned j=0;j<8;++j)b[j]=a[j];
+        b[1]|=0x12300;b[3]|=0x00001234;
+        check(texture_source_key(a,1)==texture_source_key(b,1));
+        check(!(texture_source_key(a,1)==texture_source_key(b,2)));
+        ++b[0];check(!(texture_source_key(a,1)==texture_source_key(b,1)));
+    }
+
     uint32_t high[8]={0x200,0x12300000,127|(63u<<14),(9u<<28)|(14u<<20)|(1u<<25)|(7u<<16)|0x688,127u<<13,0,0,0};
     uint32_t low[8]={0x100,0x12300000,63|(31u<<14),(9u<<28)|(9u<<20)|(6u<<16)|0x688,63u<<13,0,0,0};
     check(texture_identity_words(high)==texture_identity_words(low));
