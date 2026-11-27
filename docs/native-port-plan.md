@@ -85,6 +85,24 @@ history and the texture leases are unreachable for engine textures and get delet
 targets and CPU-written dynamic textures still go through them. Vertex and index buffers (types 4 and 6)
 move to the same per-object ownership after that.
 
+## Piece 4 moved up: the frame-rate unlock causes the shaking
+
+The reported shaking (orbit planet, trees, sky jumping sideways, on both an Intel Arc and an RTX 5090)
+is not the renderer. With `fps` above 30, `game_time_hook` in `native/src/hooks.cpp` rewrites the game's
+tick rate every frame to match that frame's duration (`1/elapsed`, clamped to 30..1000, written to the
+time-control period and to the game-time globals at `026bc880` +4/+8). The simulation was authored for a
+fixed 30 Hz tick, so anything moved over time is computed with one frame's tick and shown with another's.
+
+Confirmed on the owner's laptop: `D1_FPS=30` with `D1_TICK_RATE_FORCE=30` (a constant 30 Hz tick, as on
+the console) removed the shaking, and game time matched real time (9.97 s per 10 s, against 8.9 s with
+the variable tick). It never appeared in headless runs because at about one frame per second the rate is
+always clamped to 30.
+
+The fix is piece 4, not another timing patch: keep the simulation on its authored tick and present
+more often by reconstructing the frame scheduler (`00594460`, `00593970`, `00591710`, `00591d40`). The
+per-frame rewrite of the tick rate is removed when that lands. Until then, `fps = 30` is the correct
+setting.
+
 ## Acceptance for each piece
 
 1. Builds on Windows and Linux in CI.
