@@ -1406,6 +1406,7 @@ struct Renderer {
     uint64_t native_stage_reuse=0,inline_run_draws=0,inline_runs=0;
     uint64_t native_view_cache_hits=0,native_view_cache_misses=0;
     uint64_t t_pre_shader_ident=0,t_pre_shader_mask=0;
+    uint64_t ex_t[9]{};  // execute(): begin, copies, pre-pass, clears, parallel runs, inline draws, end+readbacks, other, submit
     uint64_t t_pre_writes=0,t_pre_views=0,t_pre_geometry=0,t_run_resolve=0,t_run_feedback=0,
              t_run_worker_wall=0,t_run_worker_wait=0;
     uint64_t native_geometry_bindings=0;
@@ -5928,6 +5929,8 @@ void Renderer::run_inline(Draw* const* run,size_t n){
 }
 
 void Renderer::execute(const std::vector<Draw*>& draws) {
+    uint64_t tx=now_ns();
+    auto lap=[&](int b){const uint64_t n=now_ns();ex_t[b]+=n-tx;tx=n;};
     if (up_rec.cur != UINT32_MAX && !tr) {  // uploads for lists recorded on engine threads go first
         tr = &up_rec;
         submit();
@@ -5943,6 +5946,7 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
         log("native renderer: no available native submission slot");
         std::_Exit(1);
     }
+    lap(0);
     rc().q_on = false;
     for (Draw* d : draws) rc().q_on |= d->kind == Draw::ZPass;
     if (rc().q_on) {
@@ -5970,8 +5974,10 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
         if (memory_write(draws[i])) {
             size_t end = i + 1;
             while (end < draws.size() && memory_write(draws[end])) ++end;
+            lap(7);
             end_pass();
             run_copies(draws.data() + i, end - i, true);
+            lap(1);
             i = end;
             continue;
         }
@@ -6001,12 +6007,14 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
         }
         // Any preceding inline rendering must finish before preparation
         // records texture or geometry transfer commands.
+        lap(7);
         end_pass();
         pre_pass(draws.data()+i,end-i);
+        lap(2);
         for (; i < end; ++i) {
         Draw* d = draws[i];
         switch (d->kind) {
-        case Draw::Clear: clear(*d); break;
+        case Draw::Clear: lap(7); clear(*d); lap(3); break;
         case Draw::ZPass: zpass(d->index_addr); break;
         case Draw::PredOn: predicate(d->index_addr, d->count & 1); break;
         case Draw::PredOff: rc().pred_cur = -1; break;
@@ -6022,8 +6030,10 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
                 };
                 while (j < end && plain(draws[j])) ++j;
             }
+            lap(7);
             if (j - i >= rec_min_run) {
                 run_parallel(draws.data() + i, j - i);
+                lap(4);
                 i = j - 1;
             } else {
                 // Short runs with only registered sampled resources have no
@@ -6047,12 +6057,14 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
                 }
                 if(k-i>1){run_inline(draws.data()+i,k-i);i=k-1;}
                 else draw(*d);
+                lap(5);
             }
             break;
         }
         }
         }
     }
+    lap(7);
     end_pass();
     rc().pred_cur = -1;
     if (rc().q_on) store_query_predicates();
@@ -6076,7 +6088,9 @@ void Renderer::execute(const std::vector<Draw*>& draws) {
                 (unsigned long long)(rc().submit_no - frame_first_submit), draws.size(), subs[rc().cur].readbacks.size(),
                 subs[rc().cur].zrecs.size());
     }
+    lap(6);
     submit();
+    lap(8);
     if ((rb_sync != bool(debug_toggles() & 2)) && has_rb && !inflight.empty()) wait_serial(subs[inflight.back()].serial);
 }
 
@@ -8226,6 +8240,13 @@ void print_stats() {
         log("native renderer: CPU detail ms/frame: pre-pass = writes %.2f + targets %.2f + material preparation %.2f (shader identity %.2f, shader slot masks %.2f) + geometry preparation %.2f; feedback %.2f, run binding resolution %.2f, worker wall %.2f (wait %.2f)",
             g->t_pre_writes/fi/1e6,double(s.t_tgt)/fi/1e6,g->t_pre_views/fi/1e6,g->t_pre_shader_ident/fi/1e6,g->t_pre_shader_mask/fi/1e6,g->t_pre_geometry/fi/1e6,
             g->t_run_feedback/fi/1e6,g->t_run_resolve/fi/1e6,g->t_run_worker_wall/fi/1e6,g->t_run_worker_wait/fi/1e6);
+    }
+    {
+        const double fi = double(std::max<uint64_t>(1, s.frames - s.t_frames));
+        auto ms=[&](int k){return double(g->ex_t[k])/fi/1e6;};
+        log("native renderer: queue thread ms/frame: begin %.2f, resource writes %.2f, pre-pass %.2f, clears %.2f, parallel runs %.2f, inline draws %.2f, end of submission %.2f, between steps %.2f, submit %.2f (total %.2f)",
+            ms(0),ms(1),ms(2),ms(3),ms(4),ms(5),ms(6),ms(7),ms(8),ms(0)+ms(1)+ms(2)+ms(3)+ms(4)+ms(5)+ms(6)+ms(7)+ms(8));
+        std::fill(std::begin(g->ex_t),std::end(g->ex_t),0);
     }
     g->t_pre_shader_ident=g->t_pre_shader_mask=0;
     g->t_pre_writes=g->t_pre_views=g->t_pre_geometry=g->t_run_feedback=g->t_run_resolve=g->t_run_worker_wall=g->t_run_worker_wait=0;
