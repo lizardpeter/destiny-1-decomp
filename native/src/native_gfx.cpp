@@ -2638,11 +2638,16 @@ void native_device_execute_submit(NativeSubmission* batch) {
         nr::g_frame_executed = true;
         draws.clear();
     };
-    auto complete = [&](bool eop) {
-        // Flush only at an actual completion boundary. A label must not wait
-        // for unrelated later lists, nor become visible before prior GPU work.
+    // One engine submission becomes one native submission. Its completion labels and end-of-pipe
+    // events are written once all of its work has finished on the GPU: never before the work that
+    // precedes them, and never split into a Vulkan submission per label (the console engine issues
+    // about 166 of them per frame; each Vulkan submission costs a driver call and a fence).
+    unsigned eops = 0;
+    auto complete = [&](bool eop) { eops += eop; };
+    auto finish = [&] {
         flush_draws();
-        ng::after_gpu([pending = std::move(labels), eop]() mutable {
+        if (labels.empty() && !eops) return;
+        ng::after_gpu([pending = std::move(labels), eops]() mutable {
             for (auto& label : pending) {
                 auto& bytes = label.bytes;
                 if (label.timestamp && bytes.size() >= 8) {
@@ -2661,9 +2666,10 @@ void native_device_execute_submit(NativeSubmission* batch) {
                             (unsigned long long)label.addr);
                 }
             }
-            if (eop) gnm_signal_eop();
+            for (unsigned k = 0; k < eops; ++k) gnm_signal_eop();
         });
         labels.clear();
+        eops = 0;
     };
 
     for (nd::List* l : lists) {
@@ -2689,7 +2695,7 @@ void native_device_execute_submit(NativeSubmission* batch) {
         }
         if (l->eop) complete(true);
     }
-    flush_draws();
+    finish();
     nd::g_lists_run += lists.size();
     for (nd::List* l : lists) nd::free_list(l);
 }

@@ -41,6 +41,20 @@ per-draw pipeline, geometry, descriptor and command work. Measured on an Intel A
 patrol, about 9,300 draws: pre-pass 6-7 ms, commands 7-8 ms, submit 2.4 ms per frame; the queue thread
 spends about 20 ms per frame, which is what limits the frame rate.
 
+### Submissions
+
+The engine marks completion with end-of-pipe labels (`00f80c90`/`00f80d70`), about 166 per frame in the
+world. The renderer used to end a Vulkan submission at every label, so each frame cost about 166
+`vkQueueSubmit` calls, fences and command-buffer begin/end pairs. Now one engine submission call becomes one
+Vulkan submission: the labels it contains are collected and written, with their end-of-pipe signals, once
+the GPU has finished that whole submission. A label still never becomes visible before the work in front
+of it, and the engine cannot wait on a label in the middle of its own submission call, so nothing waits
+longer than before.
+
+Measured, Earth patrol on lavapipe: 158 submissions per frame before, 28 after; frames identical. The
+remaining 28 are separate engine submission calls and splits at CPU-side memory writes; they go to one
+per frame when lists are recorded on the engine threads (step 3).
+
 ### The console library calls in the device layer
 
 The device layer (`007dc180`-`007e5600`) calls about 80 functions of the statically linked Gnm library
@@ -97,9 +111,13 @@ them, because the draw is recorded with the state the setters already resolved.
 1. ~~Setters stop producing console commands~~: already the case (see above).
 2. Native per-thread state: blend, depth, stencil and polygon-offset presets converted once from the
    engine's tables into Vulkan pipeline state; shaders and render targets resolved at set time.
-3. Draws recorded at the call site into per-thread secondary command buffers; the `Draw` record, the
-   pre-pass and list-time translation are deleted. This is the step that removes the queue thread's
-   per-frame cost.
+3. Draws recorded on the engine threads, in two stages:
+   1. Each command list is recorded into its own secondary command buffers by the engine thread that
+      built it, when the list is closed. The DMA and data writes inside lists are applied in issue order
+      so a list recorded early reads the right bytes. The queue thread only gathers the recorded lists
+      and submits them, once per frame.
+   2. Recording moves to the draw call itself; the `Draw` record, the pre-pass and list-time
+      translation are deleted. This is the step that removes the remaining per-draw translation cost.
 4. Barriers from the engine's own flush, decompress and render-target calls.
 5. The helpers above that draw through the library (`007e2cb0`, `007e0040`) recorded natively, if
    anything they draw turns out to be missing.
