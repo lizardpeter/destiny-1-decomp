@@ -20,21 +20,20 @@ Already intercepted (`native/src/native_gfx.cpp`):
 | Gnm library calls made by engine code | `00f7feb0` alloc, `00f8b500` set constant buffers, `00f8f3a0` DMA, `00f809f0`/`00f80a80`/`00f80ae0` predication and occlusion, `00f80c90`/`00f80d70` end-of-pipe labels | Intercepted at the library entry |
 | GPU resources | resource callbacks, `007d4480` | Native ownership (piece 1) |
 
-Still the original console code:
+The setters (render targets, viewport, blend/depth/stencil presets, primitive setup, shaders,
+textures, samplers, vertex layout) still run their original bodies, but every Gnm library call that would
+write the console command buffer is already a no-op (`kNoops` in `nd::install`), and the library calls whose
+effects the renderer needs are intercepted. So no console GPU command is produced; the setters only
+update `D`, and the capture reads `D`. What remains PS4-shaped is the *form* of that state: GCN register
+words, T#/V# descriptors and GCN shader binaries, which the renderer decodes per draw.
 
-| Setter | Address |
-|---|---|
-| Render targets | `007dfd10`, `007e0240`, `007e0430` |
-| Viewport, scissor, depth bounds | `007de370`, `007dfac0`, `007de710` |
-| Blend, depth, polygon offset, stencil presets | `007de4a0`, `007de590`, `007de640`, `007e0de0`/`007e0f70`/`007e0f90` |
-| Primitive setup, primitive restart | `007de860`, `007e2a80` |
-| Shaders | `007de800` (VS), `007de7b0` (PS) |
-| Textures, samplers | `007def20`, `007de8c0`, `007df250`/`007df310`/`007e1110`, `007df420`-`007df5c0`, `007e1510` |
-| Vertex layout | `007deb70` |
-| Barriers the engine asks for | `007e03a0` flush and wait, `007e2000` decompress |
-
-Each of these stores the new state in `D` (the capture reads it from there) and also writes GPU
-registers through the Gnm library into the console command buffer, which nothing reads any more.
+Two engine helpers draw through the library directly instead of through the captured draw calls, so
+their draws are dropped with the no-op'd library calls: `007e2cb0` (a full-screen pass, called about ten
+times per frame from `007eaf00`, which works on the dynamic-texture slots, and from `007e6420`, a
+frame-level pass that also calls `007e5590` present-prepare) and `007e0040` (texture copy, from the
+dynamic-texture code at `00818ae0`/`00818ca0`). The renderer already reads CPU-written dynamic textures
+directly (`h_unlock` at `00818fa0`), which may make these copies redundant; whether anything visible is
+missing has not been established. To check.
 
 The renderer then turns each captured `Draw` (GCN register encodings, T# and V# descriptors, GCN
 shader binaries) into Vulkan when the list is recorded: a serial pre-pass on the queue thread, then
@@ -42,7 +41,7 @@ per-draw pipeline, geometry, descriptor and command work. Measured on an Intel A
 patrol, about 9,300 draws: pre-pass 6-7 ms, commands 7-8 ms, submit 2.4 ms per frame; the queue thread
 spends about 20 ms per frame, which is what limits the frame rate.
 
-### The console command layer the setters call
+### The console library calls in the device layer
 
 The device layer (`007dc180`-`007e5600`) calls about 80 functions of the statically linked Gnm library
 (`00f7d010`-`00f8f0e0`). Two kinds:
@@ -56,8 +55,7 @@ The device layer (`007dc180`-`007e5600`) calls about 80 functions of the statica
   `00f8b410`, constant buffers `00f8b500`, render targets `00f8f0e0` / `00f7eec0`, draw packets
   `00f7f1e0` / `00f7f260` / `00f7f320`, pre-draw commit `00f8df60` / `00f8e880`, and so on.
 
-Step 1 keeps the register builders (they are the engine's state) and removes every context call, so the
-device layer stops producing console GPU commands. Step 2 replaces the register words themselves with
+The context calls are already no-ops. Step 2 replaces the register words themselves with
 native state built once from the engine's preset tables (`015d16c4` blend, `015d2394` depth,
 `015d2424` polygon offset, `015d1cd0`/`015d1d70` stencil).
 
@@ -79,13 +77,15 @@ native state built once from the engine's preset tables (`015d16c4` blend, `015d
 
 ## Order
 
-1. Setters keep only engine state (table above). Measured by engine-thread CPU per frame.
-2. Native per-thread state: presets, shaders and render targets resolved at set time.
+1. ~~Setters stop producing console commands~~: already the case (see above).
+2. Native per-thread state: blend, depth, stencil and polygon-offset presets converted once from the
+   engine's tables into Vulkan pipeline state; shaders and render targets resolved at set time.
 3. Draws recorded at the call site into per-thread secondary command buffers; the `Draw` record, the
-   pre-pass and list-time translation are deleted.
+   pre-pass and list-time translation are deleted. This is the step that removes the queue thread's
+   per-frame cost.
 4. Barriers from the engine's own flush, decompress and render-target calls.
-5. Gnm library entry points still called by engine code (constant buffers, DMA, labels, predication)
-   become native calls into the same context.
+5. The helpers above that draw through the library (`007e2cb0`, `007e0040`) recorded natively, if
+   anything they draw turns out to be missing.
 
 Each step: built in CI, the game run into orbit and Earth patrol with frames compared, CPU per frame
 measured, and the replaced path deleted.
