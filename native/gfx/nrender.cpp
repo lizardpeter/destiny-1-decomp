@@ -346,56 +346,13 @@ struct Image {
     bool sampled = false;
     uint64_t tv_version = ~0ull, tv_size = 0, tv_frame = 0;
     uint64_t last_frame = 0; // st.frames when last used (frame-based eviction horizon)
-    uint64_t res_val = 0, res_obj = 0, content = 0;
-    uint64_t low_base = 0;   // guest base address of low-mip chain (levels 1..levels-1)
-    uint64_t hi_base = 0;    // guest base address of streamed hi-mip (level 0)
-    uint64_t low_size = 0, hi_size = 0; // independent source footprints
+    uint64_t content = 0;
     bool overlaps_source(uint64_t a, uint64_t e) const {
-        auto overlap = [a,e](uint64_t b, uint64_t n) { return n && a < b + n && e > b; };
-        return overlap(src_addr, src_size) || (low_loaded && overlap(low_base, low_size)) ||
-               (hi_loaded && overlap(hi_base, hi_size));
+        return src_size && a < src_addr + src_size && e > src_addr;
     }
-    bool low_loaded = false;
-    bool hi_loaded = false;
     bool stale = false;
     uint64_t last_write_submit = 0;
     uint64_t target_revision=1, snapshot_revision=0;
-    uint64_t descriptor_epoch[2] = {};
-    uint32_t resident_descriptor[2][8] = {};
-    // A relocation with verified identical bytes can reuse the GPU image
-    // without discarding the immediately preceding captured descriptors.
-    struct Alias {uint64_t epoch=0;uint32_t words[8]{};};
-    std::vector<Alias> aliases;
-    bool matches_epoch(const uint32_t* t,uint64_t res)const{
-        if(stale||!res)return false;
-        auto matches=[&](const uint32_t* p){
-            return p[0]==t[0]&&(p[1]&255)==(t[1]&255)&&
-                   texture_source_layout_equal(p,t);
-        };
-        if(res_val==res){
-            for(unsigned i=0;i<2;++i)
-                if(descriptor_epoch[i]==res&&matches(resident_descriptor[i])&&
-                   (!(low_size||hi_size)||(low_loaded&&(i==0||hi_loaded))))return true;
-        }
-        if(low_size||hi_size)return false;
-        for(const auto& a:aliases)if(a.epoch==res&&matches(a.words))return true;
-        return false;
-    }
-    void remember_relocation(){
-        if(!res_val||!descriptor_epoch[0]||low_size||hi_size)return;
-        auto gate=texture_leases().retire();
-        // Keep every alias still referenced by an unconsumed list. Retain
-        // a small recent working set for otherwise unpinned relocations.
-        if(aliases.size()>=4)
-            std::erase_if(aliases,[](const Alias& a){return !texture_leases().pinned(a.epoch);});
-        Alias a{};a.epoch=res_val;std::memcpy(a.words,resident_descriptor[0],32);
-        aliases.push_back(a);
-    }
-    bool captured() const {
-        if(texture_leases().pinned(res_val))return true;
-        for(const auto& a:aliases)if(texture_leases().pinned(a.epoch))return true;
-        return false;
-    }
 };
 
 struct Shader {
@@ -602,11 +559,6 @@ struct Renderer {
     std::unordered_map<uint64_t, Image*> target_by_base;            // newest target at an address
     std::vector<std::unique_ptr<Image>> retired;                    // replaced targets (still referenced)
     std::unordered_map<TextureKey, std::unique_ptr<Image>, TextureKeyHash> textures;
-    std::unordered_map<TextureKey,std::vector<std::unique_ptr<Image>>,TextureKeyHash> texture_history;
-    uint64_t texture_history_bytes=0,texture_history_hits=0,texture_history_drops=0;
-    Image* historical_texture(const TextureKey& key,const uint32_t* t,uint64_t res);
-    void archive_texture(const TextureKey& key,std::unique_ptr<Image> img);
-    void trim_texture_history(bool all=false);
     std::unordered_map<uint64_t, SamplerEntry> samplers;
     std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders;
     std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> pipelines;
@@ -839,41 +791,24 @@ struct Renderer {
     uint64_t recopy_n[3] = {}, recopy_changed[3] = {};  // constants, vertices, indices
     Recorder up_rec;  // uploads and target set-up for lists recorded on engine threads
     Recorder* pre_for = nullptr;  // the list whose textures pre_pass is preparing (in the upload slot)
-    // the loader thread: engine resources prepared when the engine binds or moves them
+    // the loader thread: engine shaders prepared when the engine binds them (textures and
+    // buffers have their own native paths: native_texture_*, native_buffer_*)
     struct LoadJob {
         uint8_t kind; uint32_t t[8]; uint64_t base,size,res,obj; MappingSpans mapping;
-        uint32_t low[8]{};
-        uint64_t low_base=0,low_size=0;
-        MappingSpans low_mapping;
-    }; // 0 buffer, 1 contiguous texture, 2 VS, 3 PS, 4 split 2D texture
-    struct PreparedMipRange {
-        uint64_t base=0,source_size=0;
-        uint32_t levels=0,dst=0;
-        tiling::Surface surface{};
-        MappingSpans mapping;
-        std::vector<uint8_t> tiled,linear;
-    };
+    }; // 2 VS, 3 PS
     std::mutex load_m;
     std::condition_variable load_cv;
-    std::deque<LoadJob> load_q,texture_q; // independent FIFO for latency-sensitive texture ingestion
+    std::deque<LoadJob> load_q;
     std::unordered_set<uint64_t> load_pending; // speculative work only; first use remains authoritative
     static uint64_t load_key(const LoadJob& j) {
         uint64_t h=mix(mix(mix(j.kind,j.res),j.obj),mix(j.base,j.size));
         for(const auto& span:j.mapping)h=mix(mix(mix(h,span.base),span.size),span.identity);
-        if(j.kind==1||j.kind==4)h=mix(h,hash_bytes(j.t,sizeof j.t));
-        if(j.kind==4){
-            h=mix(mix(h,j.low_base),j.low_size);
-            h=mix(h,hash_bytes(j.low,sizeof j.low));
-            for(const auto& span:j.low_mapping)h=mix(mix(mix(h,span.base),span.size),span.identity);
-        }
         return h;
     }
     std::thread loader;
     bool load_on = false;
     std::atomic<uint64_t> ld_tex{0}, ld_moves{0}, ld_buf{0}, ld_stale{0}, ld_skipped{0}, ld_dropped{0}, ld_ns{0};
     void start_loader();
-    void load_texture(const LoadJob& j);
-    void load_split_texture(const LoadJob& j);
 
     // Native textures (docs/native-port-plan.md, piece 1). One GPU image per engine texture
     // object (resource types 1-3), owned for as long as the engine's resource identity lasts.
@@ -903,7 +838,7 @@ struct Renderer {
     bool ntex_on = false;
     std::atomic<uint64_t> ntex_gen{1};  // bumped whenever any texture's image or resident mips change
     std::atomic<uint64_t> ntex_events{0}, ntex_uploads{0}, ntex_drops{0}, ntex_created{0}, ntex_retired{0},
-        ntex_rejected{0}, ntex_unready{0}, ntex_unowned{0}, ntex_lookups{0}, ntex_misses{0}, ntex_gens{0}, ntex_bytes{0}, ntex_ns{0}, ntex_snapshot_ns{0};
+        ntex_rejected{0}, ntex_unready{0}, ntex_unowned{0}, ntex_unowned_draws{0}, ntex_lookups{0}, ntex_misses{0}, ntex_gens{0}, ntex_bytes{0}, ntex_ns{0}, ntex_snapshot_ns{0};
     void native_texture_event(uint64_t obj, uint64_t res, bool moved);
     void native_texture_load(NativeTextureJob& j);
     void native_texture_sweep();
@@ -937,13 +872,12 @@ struct Renderer {
         {
             std::lock_guard lk(load_m);
             if (!load_pending.insert(load_key(j)).second) return;
-            if(load_q.size()+texture_q.size()>=20000){
-                auto& drop=load_q.empty()?texture_q:load_q;
-                load_pending.erase(load_key(drop.front()));
-                drop.pop_front();
+            if(load_q.size()>=20000){
+                load_pending.erase(load_key(load_q.front()));
+                load_q.pop_front();
                 ++ld_dropped;
             }
-            (j.kind==1||j.kind==4?texture_q:load_q).push_back(j);
+            load_q.push_back(j);
         }
         load_cv.notify_one();
     }
@@ -1017,12 +951,7 @@ struct Renderer {
         bool changed = false;
         for (auto& [key, img] : textures) {
             if (!img || img->stale) continue;
-            if (overlaps(img->src_addr, img->src_size) ||
-                (img->low_loaded && overlaps(img->low_base, img->low_size)) ||
-                (img->hi_loaded && overlaps(img->hi_base, img->hi_size))) {
-                if(img->res_val&&img->res_obj&&opt.res_current&&opt.res_current(img->res_obj)!=img->res_val)
-                    continue; // old native GPU version is immutable
-                invalidate_source(img.get());
+            if (overlaps(img->src_addr, img->src_size)) {
                 img->stale = true;
                 ++dma_stale;
                 changed = true;
@@ -1041,7 +970,7 @@ struct Renderer {
                 if (told++ < 40)
                     log("native renderer: copy-queue write %#llx +%llu into texture %#llx %ux%u fmt %d (%s)", (unsigned long long)dst,
                         (unsigned long long)n, (unsigned long long)img->src_addr, img->w, img->h, int(img->format),
-                        img->res_val ? "engine resource" : "dynamic");
+                        "dynamic");
             }
     }
     uint64_t dma_tex_hits = 0, feedback_draws = 0, readback_stale = 0, cpu_stale = 0;
@@ -1079,12 +1008,7 @@ struct Renderer {
         bool changed = false;
         for (auto& [key, img] : textures) {
             if (!img || img->stale) continue;
-            if (!overlaps(img->src_addr, img->src_size) &&
-                !(img->low_loaded && overlaps(img->low_base, img->low_size)) &&
-                !(img->hi_loaded && overlaps(img->hi_base, img->hi_size))) continue;
-            if(img->res_val&&img->res_obj&&opt.res_current&&opt.res_current(img->res_obj)!=img->res_val)
-                continue;
-            invalidate_source(img.get());
+            if (!overlaps(img->src_addr, img->src_size)) continue;
             img->stale = true;
             ++cpu_stale;
             changed = true;
@@ -1092,7 +1016,7 @@ struct Renderer {
             if (std::getenv("D1_NG_LOG_DYN") && told++ < 30)
                 log("native renderer: CPU write into texture %#llx %ux%u fmt %d (%s): copied again",
                     (unsigned long long)img->src_addr, img->w, img->h, int(img->format),
-                    img->res_val ? "engine resource" : "dynamic");
+                    "dynamic");
         }
         if (changed) ++views_gen;
     }
@@ -1209,109 +1133,10 @@ struct Renderer {
     std::unordered_map<uint64_t, Image*> stencil_by_base;  // separate stencil planes of depth targets (DB_STENCIL_*_BASE)
     std::unordered_map<uint64_t, std::vector<Image*>> images_by_base;  // every render target image per address
     Image* target_for(const fmt::TSharp& ts);
-    struct StreamMipInfo {
-        uint64_t obj = 0, low_base = 0, hi_base = 0, epoch=0;
-        uint64_t low_bytes=0,hi_bytes=0;
-        uint16_t full_w = 0, full_h = 0, full_d = 1;
-        uint8_t full_mips = 1, has_hi = 0;
-        bool from_callback = false;
-        bool valid = true;
-        fmt::TSharp low_layout{};
-        std::array<uint32_t,8> low_words{};
-    };
-    struct StreamHistory {
-        std::vector<StreamMipInfo> entries;
-        const StreamMipInfo* find(uint64_t epoch)const{
-            for(auto it=entries.rbegin();it!=entries.rend();++it)
-                if(it->epoch==epoch)return &*it;
-            return nullptr;
-        }
-        // Caller holds mip_m and either capture or publication gate.
-        void publish(const StreamMipInfo& info){
-            for(auto& entry:entries)if(entry.epoch==info.epoch){
-                if(!entry.from_callback||info.from_callback)entry=info;
-                return;
-            }
-            if(entries.size()>=4){
-                uint64_t newest=0;
-                for(const auto& entry:entries)newest=std::max(newest,entry.epoch);
-                std::erase_if(entries,[&](const auto& entry){
-                    return entry.epoch!=newest&&!texture_leases().pinned(entry.epoch);
-                });
-            }
-            entries.push_back(info);
-        }
-    };
-    std::mutex mip_m;
-    std::unordered_map<uint32_t, StreamHistory> stream_mips;
-    // CPU source ownership is separate from the renderer lock and the
-    // lifetime of the original streaming pool. Capture never takes m.
-    struct OwnedTexture {
-        StreamMipInfo info{};
-        struct Range {uint64_t base=0;std::vector<uint8_t> bytes;};
-        std::vector<Range> ranges;
-        uint64_t size=0;
-    };
-    struct CapturedSource {
-        ImageLifetime<Image>::Token ready;
-        std::shared_ptr<const OwnedTexture> owned;
-    };
-    std::mutex source_m;
-    std::unordered_map<TextureSourceKey,CapturedSource,TextureSourceKeyHash> captured_sources;
-    uint64_t captured_source_bytes=0;
-    std::atomic<uint64_t> captured_source_count{0},captured_source_budget_misses{0};
-    uint64_t captured_source_replays=0;
-    std::atomic<bool> source_prune_requested{false};
-    void capture_owned_texture(const uint32_t* words,uint64_t res,uint64_t obj);
-    std::shared_ptr<const OwnedTexture> find_owned_texture(const uint32_t* words,uint64_t res){
-        std::lock_guard lk(source_m);
-        const auto it=captured_sources.find(texture_source_key(words,res));
-        return it==captured_sources.end()?nullptr:it->second.owned;
-    }
-    void source_ready(const uint32_t* words,uint64_t res,Image* img){
-        const auto type=words[3]>>28;
-        if(!res||!img||type<8||type>9||!img->matches_epoch(words,res))return;
-        std::lock_guard lk(source_m);
-        captured_sources[texture_source_key(words,res)].ready=img->lifetime.token(img);
-    }
-    void invalidate_source(Image* img){
-        if(!img->res_val)return;
-        img->lifetime.retire();
-        std::lock_guard lk(source_m);
-        for(unsigned slot=0;slot<2;++slot){
-            const auto epoch=img->descriptor_epoch[slot];
-            if(!epoch)continue;
-            const auto it=captured_sources.find(texture_source_key(img->resident_descriptor[slot],epoch));
-            if(it==captured_sources.end())continue;
-            if(it->second.owned){captured_source_bytes-=it->second.owned->size;it->second.owned.reset();}
-            it->second.ready.reset();
-        }
-    }
-    void prune_sources(){
-        std::lock_guard lk(source_m);
-        for(auto it=captured_sources.begin();it!=captured_sources.end();){
-            // Only owned CPU bytes require a lease check. A live GPU token
-            // is retained anyway; an empty entry has no bytes to protect.
-            // Avoid taking the registry mutex for every resident texture.
-            if(it->second.owned){
-                if(texture_leases().pinned(it->first.epoch)){++it;continue;}
-                captured_source_bytes-=it->second.owned->size;
-                it->second.owned.reset();
-            }
-            auto* ready=ImageLifetime<Image>::resolve(it->second.ready);
-            if(!ready||!ready->matches_epoch(it->first.words.data(),it->first.epoch))
-                it=captured_sources.erase(it);
-            else ++it;
-        }
-    }
-    StreamMipInfo get_stream_info(uint64_t res, uint64_t obj, const fmt::TSharp& ts, const uint32_t* words);
-    ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res = 0, Image* prepared_image=nullptr);
+    ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim);
     const ViewHandle* existing_view(Image* img, VkImageViewType type, VkComponentMapping comp, uint32_t base_level);
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
-    Image* upload_texture(const uint32_t* t, uint64_t res = 0, uint64_t obj = 0,
-                          const uint8_t* prepared = nullptr, uint64_t prepared_size = 0,
-                          uint64_t prepared_source_size = 0, uint64_t prepared_hash = 0,
-                          const std::vector<PreparedMipRange>* split_prepared=nullptr);
+    Image* upload_texture(const uint32_t* t);
     void resolve_draw_resources(Draw* const* draws, size_t count);
     struct DiskPipeSpec {
         uint64_t vs_hash = 0, ps_hash = 0;
@@ -2656,97 +2481,20 @@ Image* Renderer::depth_target(const uint32_t* d, bool bind) {
     return img;
 }
 
-Renderer::StreamMipInfo Renderer::get_stream_info(uint64_t res,uint64_t obj,const fmt::TSharp& ts,const uint32_t* words){
-    StreamMipInfo info{};
-    info.full_w=uint16_t(ts.width);info.full_h=uint16_t(ts.height);
-    info.full_d=uint16_t(ts.type==10?ts.depth:1);
-    info.full_mips=uint8_t(std::min(ts.last_level+1,tiling::kMaxMips));
-    if(!res)return info;
-    const uint32_t rid=uint32_t(res>>32);
-    {
-        std::lock_guard lk(mip_m);
-        auto it=stream_mips.find(rid);
-        if(it!=stream_mips.end()){
-            if(const auto* cached=it->second.find(res))return *cached;
-        }
-    }
-    // A draw captured an old epoch. Never attach today's mutable tag
-    // dimensions or mip addresses to that draw. The source descriptor
-    // transaction is excluded while recovering live tag fields.
-    auto capture_gate=texture_leases().capture();
-    if(!obj||!opt.res_current||opt.res_current(obj)!=res){
-        info.valid=false;return info;
-    }
-    if(guest_region_extent(obj)<0x44){info.valid=false;return info;}
-    const uint16_t tw=*reinterpret_cast<const uint16_t*>(obj+0x28);
-    const uint16_t th=*reinterpret_cast<const uint16_t*>(obj+0x2a);
-    const uint16_t td=*reinterpret_cast<const uint16_t*>(obj+0x2c);
-    const uint8_t tm=*reinterpret_cast<const uint8_t*>(obj+0x31);
-    const uint8_t thi=*reinterpret_cast<const uint8_t*>(obj+0x34);
-    if(opt.res_current(obj)!=res){info.valid=false;return info;}
-    if(tw&&th&&tw<=16384&&th<=16384&&tm>=ts.last_level+1&&tm<=tiling::kMaxMips){
-        info.obj=obj;info.epoch=res;
-        info.full_w=tw;info.full_h=th;info.full_d=ts.type==10?std::max<uint16_t>(1,td):1;
-        info.full_mips=tm;info.has_hi=thi;
-        if(thi&&tm>1){
-            if(ts.last_level+1==uint32_t(tm)-1){info.low_base=ts.base;info.low_layout=ts;
-                std::memcpy(info.low_words.data(),words,32);}
-            else if(ts.last_level+1==tm)info.hi_base=ts.base;
-        }else info.low_base=ts.base;
-        std::lock_guard lk(mip_m);
-        auto& history=stream_mips[rid];
-        if(const auto* cached=history.find(res);cached&&cached->from_callback)return *cached;
-        history.publish(info);
-    }else if(thi){
-        // Invalid authored split metadata does not imply contiguous storage.
-        // Avoid treating the isolated top mip as a complete mip allocation.
-        info.valid=false;
-    }
-    return info;
-}
 
-Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
-                                const uint8_t* prepared, uint64_t prepared_size,
-                                uint64_t prepared_source_size, uint64_t prepared_hash,
-                                const std::vector<PreparedMipRange>* split_prepared) {
+// A texture that is no engine resource: memory the CPU writes (the dynamic-texture slots, UI and
+// font pages) or a render target sampled through a T# whose surface the renderer has no image
+// for. Engine textures never come here; they are owned by their engine object (native_texture_*).
+// The image is keyed by its descriptor and reloaded when its memory changes.
+Image* Renderer::upload_texture(const uint32_t* t) {
     const uint64_t t_in = now_ns();
     struct LoadTimer {
         Renderer* r;
         uint64_t t0;
         ~LoadTimer() { r->st.t_tex_load += now_ns() - t0; }
     };
-    const auto key = tex_key(t, res);
+    const auto key = tex_key(t, 0);
     ++st.tex_checks;
-    // Registered image ownership is already established by the exact epoch
-    // and successfully uploaded descriptor. No tile-layout calculation,
-    // mutable tag read or host mapping lock is needed on this hot path.
-    if(res){
-        auto cached=textures.find(key);
-        if(cached!=textures.end()&&cached->second){
-            Image* img=cached->second.get();
-            // The cached bytes depend on the source layout, not view-only
-            // swizzle, minimum LOD or base mip selection.
-            if(img->res_val==res&&img->matches_epoch(t,res)){
-                img->last_used=rc().submit_no;img->last_frame=st.frames;
-                ++resident_descriptor_hits;++st.res_hits;
-                st.t_tex_hit+=now_ns()-t_in;
-                return img;
-            }
-        }
-    }
-    if(res){
-        if(auto* old=historical_texture(key,t,res)){
-            old->last_used=rc().submit_no;old->last_frame=st.frames;
-            ++texture_history_hits;++st.res_hits;
-            st.t_tex_hit+=now_ns()-t_in;
-            return old;
-        }
-    }
-    // Existing exact old-epoch GPU images can still be used above. Do not
-    // reload an old captured descriptor from a recycled host allocation.
-    const bool expired=res&&obj&&opt.res_current&&opt.res_current(obj)!=res;
-    const auto owned=expired&&!prepared&&!split_prepared?find_owned_texture(t,res):nullptr;
-    if(expired&&!owned){++expired_texture_epochs;return nullptr;}
     const auto ts = fmt::decode_tsharp(t);
     const auto fi = fmt::data_format(ts.dfmt);
     const VkFormat f = fmt::vk_format(ts.dfmt, ts.nfmt);
@@ -2754,10 +2502,6 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     const bool is3d = ts.type == 10, cube = ts.type == 11;
     uint32_t layers = (ts.type == 13 || ts.type == 12 || cube) ? ts.last_array + 1 : 1;
     if (cube) layers = std::max(6u, layers - layers % 6);
-
-    const StreamMipInfo smi=owned?owned->info:
-        (!is3d&&ts.type!=12&&ts.type!=13)?get_stream_info(res,obj,ts,t):StreamMipInfo{};
-    if(!smi.valid){++expired_texture_epochs;return nullptr;}
     tiling::Surface sf;
     sf.tile_mode=ts.tiling;sf.bpp=fi.bpp;sf.block=fi.block;sf.pow2=ts.pow2;
     sf.width=ts.width;sf.height=ts.height;sf.pitch=ts.pitch;
@@ -2766,160 +2510,28 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     sf.levels=std::min(ts.last_level+1,tiling::kMaxMips);
     tiling::layout(sf);
     if(opt.compare_layout&&!rc().lr)opt.compare_layout(t,sf);
-    const bool split_resource=res!=0&&!is3d&&ts.type!=12&&ts.type!=13&&smi.has_hi&&smi.full_mips>1;
-    MipSource source=MipSource::invalid;
-    if(split_resource){
-        const uint32_t lw=smi.full_w<4?1u:uint32_t(smi.full_w>>1);
-        const uint32_t lh=std::max(1u,uint32_t(smi.full_h>>1));
-        const bool low_dims=(ts.width==lw||(fi.block&&ts.width==((lw+3)&~3u)))&&
-                            (ts.height==lh||(fi.block&&ts.height==((lh+3)&~3u)));
-        const bool low_desc=low_dims&&ts.last_level+1==smi.full_mips-1&&ts.base==smi.low_base;
-        const bool high_desc=ts.width==smi.full_w&&ts.height==smi.full_h&&
-                             ts.last_level+1==smi.full_mips&&ts.base==smi.hi_base;
-        source=mip_source(low_desc,high_desc,smi.low_base,smi.hi_base,smi.low_bytes,smi.hi_bytes,
-                          sf.total_size,sf.mips[0].size);
-        if(source==MipSource::invalid||(!smi.from_callback&&source==MipSource::high_only)){
-            ++split_descriptor_rejects;
-            static unsigned reports=0;
-            if(reports++<64)log("ng mip reject: res=%u epoch=%u T#=%#llx %ux%u levels=%u low=%#llx/%llu high=%#llx/%llu layout=%llu top=%llu",
-                uint32_t(res>>32),uint32_t(res),(unsigned long long)ts.base,ts.width,ts.height,ts.last_level+1,
-                (unsigned long long)smi.low_base,(unsigned long long)smi.low_bytes,
-                (unsigned long long)smi.hi_base,(unsigned long long)smi.hi_bytes,
-                (unsigned long long)sf.total_size,(unsigned long long)sf.mips[0].size);
-            return nullptr;
-        }
-    }
-    const bool contiguous_high=split_resource&&source==MipSource::contiguous_high;
-    const bool top_only=split_resource&&source==MipSource::high_only;
-    const bool streamed=split_resource&&!top_only&&!contiguous_high;
-    if(prepared&&(!res||streamed||top_only))return nullptr;
-    if(split_prepared&&(!split_resource||prepared||contiguous_high))return nullptr;
-    const uint32_t full_w=streamed?smi.full_w:ts.width;
-    const uint32_t full_h=streamed?smi.full_h:ts.height;
-    const uint32_t full_d=streamed?smi.full_d:(is3d?ts.depth:1);
-    const uint32_t full_levels=top_only?1u:streamed?smi.full_mips:sf.levels;
-    const bool cur_is_low=streamed&&source==MipSource::low_chain;
-    const auto matches_shape=[&](const Image* img){
-        return img->format==f&&img->w==full_w&&img->h==full_h&&img->d==full_d&&
-               img->layers==layers&&img->levels==full_levels&&img->cube==cube&&img->is3d==is3d;
-    };
-    const uint64_t cur_bytes=(source==MipSource::split_chain||top_only)?sf.mips[0].size:sf.total_size;
-    if(prepared ? prepared_source_size!=cur_bytes : (!owned&&!guest_readable_range(ts.base,cur_bytes))){
+    const uint32_t full_w=ts.width, full_h=ts.height, full_d=is3d?ts.depth:1, full_levels=sf.levels;
+    const uint64_t cur_bytes=sf.total_size;
+    if(!guest_readable_range(ts.base,cur_bytes)){
         ++texture_range_rejects;
         return nullptr;
     }
 
-    // The tiled source must remain owned while detiling. A mapped range
-    // can be recycled or rewritten by the streaming threads after a
-    // coverage check, even if its virtual address did not change.
-    static thread_local std::vector<uint8_t> primary_source,secondary_source;
-    MappingSpans primary_spans,secondary_spans;
-    const uint8_t* primary_data=nullptr;
-    const uint8_t* secondary_data=nullptr;
-    bool primary_ready=false;
-    const auto current_epoch=[&]{return owned||!res||!obj||!opt.res_current||opt.res_current(obj)==res;};
-    auto capture_source=[&](uint64_t base,uint64_t bytes,std::vector<uint8_t>& dst,MappingSpans& spans,const uint8_t*& data){
-        if(!bytes||bytes>(512ull<<20)||!current_epoch())return false;
-        if(owned){
-            for(const auto& range:owned->ranges)if(range.base==base&&range.bytes.size()==bytes){
-                // The shared snapshot remains alive throughout upload_texture.
-                // Detile directly from it instead of copying the entire mip chain again.
-                data=range.bytes.data();return true;
-            }
-            return false;
-        }
-        if(!guest_capture_read_spans(base,bytes,spans))return false;
-        dst.resize(bytes);
-        data=dst.data();
-        return guest_copy_current_spans(base,bytes,spans,dst.data())&&current_epoch();
-    };
-    auto primary=[&]{
-        if(!primary_ready)primary_ready=capture_source(ts.base,cur_bytes,primary_source,primary_spans,primary_data);
-        return primary_ready;
-    };
     std::unique_ptr<Image> prev;
     auto it = textures.find(key);
-    // Replaying a retired epoch must never evict or replace the current
-    // resident version. Both can be sampled by independently captured lists.
-    const bool historical_replay=expired&&bool(owned);
-    bool found = !historical_replay&&it != textures.end();
+    bool found = it != textures.end();
     if (found && !it->second) { textures.erase(it); found = false; }
-    if (found && it->second && it->second->stale) {
+    if (found && it->second->stale) {
         prev = std::move(it->second);
         prev->stale = false;
-        // A write event invalidates contents, not just the cache entry. Do not let
-        // the same-address streamed-mip shortcut silently reuse the dirty bytes.
-        prev->low_loaded = prev->hi_loaded = false;
-        prev->descriptor_epoch[0]=prev->descriptor_epoch[1]=0;
-        prev->aliases.clear();
         textures.erase(it), found = false; ++views_gen;
         ++st.tex_reloads;
     }
     if (found) {
         Image* img = it->second.get();
-        if (!img) return nullptr;
         img->last_used = rc().submit_no;
         img->last_frame = st.frames;
-        if (res && img->res_val) {
-            const unsigned layout_slot=streamed&&!cur_is_low?1:0;
-            const bool same_layout=img->descriptor_epoch[layout_slot]&&
-                texture_source_layout_equal(img->resident_descriptor[layout_slot],t);
-            const bool have_want = matches_shape(img)&&same_layout&&(streamed
-                ? (img->res_val == res && (cur_is_low ? (img->low_loaded && img->low_base == ts.base)
-                              : (img->hi_loaded && img->hi_base == ts.base && img->low_loaded && img->low_base == smi.low_base)))
-                : (img->res_val == res && img->src_addr == ts.base));
-            if (have_want) {
-                const unsigned slot=streamed&&!cur_is_low?1:0;
-                std::memcpy(img->resident_descriptor[slot],t,32);
-                img->descriptor_epoch[slot]=res;
-                img->res_val = res;
-                ++st.res_hits;
-                source_ready(t,res,img);
-                st.t_tex_hit += now_ns() - t_in;
-                return img;
-            }
-            if ((!split_resource||contiguous_high) && matches_shape(img)&&same_layout&&img->src_size == cur_bytes &&
-                (prepared ? prepared_hash==img->content :
-                 (primary()&&hash_bytes(primary_data,cur_bytes)==img->content&&
-                  (owned||guest_matches_current_spans(ts.base,cur_bytes,primary_spans,primary_data))&&current_epoch()))) {
-                img->remember_relocation();
-                img->res_val = res, img->src_addr = ts.base;
-                std::memcpy(img->resident_descriptor[0],t,32);
-                img->descriptor_epoch[0]=res;img->descriptor_epoch[1]=0;
-                ++views_gen;
-                ++st.res_moves;
-                source_ready(t,res,img);
-                if(owned)++captured_source_replays;
-                st.t_tex_hit += now_ns() - t_in;
-                return img;
-            }
-            ++st.res_changed;
-            if(img->res_val!=res){
-                // Preserve the old contents for already captured draws.
-                // A distinct image is required when the bytes changed.
-                archive_texture(key,std::move(it->second));
-                textures.erase(it);found=false;++views_gen;++st.tex_reloads;
-            }else{
-            if (streamed && !matches_shape(img)) {
-                // Epoch changes may represent writes at unchanged addresses. Until
-                // per-mip content identities are proven, refresh conservatively.
-                img->low_loaded = img->hi_loaded = false;
-                img->descriptor_epoch[0]=img->descriptor_epoch[1]=0;
-            }
-            if(streamed&&!same_layout){
-                if(cur_is_low)img->low_loaded=false;
-                else img->hi_loaded=false;
-                img->descriptor_epoch[layout_slot]=0;
-            }
-            prev = std::move(it->second);
-            textures.erase(it), found = false; ++views_gen;
-            ++st.tex_reloads;
-            }
-        }
-    }
-    if (found) {
-        Image* img = it->second.get();
-        if (!res && st.unreg_tex.size() < 100000) st.unreg_tex[TextureKeyHash{}(key)] = uint64_t(img->w) * img->h * std::max(1u, img->bpp / 8);
+        if (st.unreg_tex.size() < 100000) st.unreg_tex[TextureKeyHash{}(key)] = uint64_t(img->w) * img->h * std::max(1u, img->bpp / 8);
         if (img->checked == rc().submit_no || !img->src_size || (!opt.version && !dynamic_copy)) {
             st.t_tex_hit += now_ns() - t_in;
             return img;
@@ -2937,89 +2549,41 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
     }
 
     LoadTimer load_timer{this, t_in};
-    if (!res && st.unreg_tex.size() < 100000) st.unreg_tex[TextureKeyHash{}(key)] = uint64_t(ts.width) * ts.height;
+    if (st.unreg_tex.size() < 100000) st.unreg_tex[TextureKeyHash{}(key)] = uint64_t(ts.width) * ts.height;
     tsharp_bases.insert(ts.base);
+
+    // The tiled source is copied first: the memory can be rewritten while it is detiled.
+    static thread_local std::vector<uint8_t> source;
+    MappingSpans spans;
+    if (cur_bytes > (512ull << 20) || !guest_capture_read_spans(ts.base, cur_bytes, spans)) { ++texture_range_rejects; return nullptr; }
+    source.resize(cur_bytes);
+    if (!guest_copy_current_spans(ts.base, cur_bytes, spans, source.data())) { ++texture_range_rejects; return nullptr; }
 
     std::unique_ptr<Image> img;
     if (prev && prev->format == f && prev->w == full_w && prev->h == full_h && prev->d == full_d &&
         prev->layers == layers && prev->levels == full_levels && prev->cube == cube && prev->is3d == is3d) {
         img = std::move(prev);
         img->lifetime.retire(); // reused storage no longer proves prior contents
-        img->aliases.clear();
         img->torn = 0;
         ++st.tex_inplace;
     } else {
         const uint64_t tm = now_ns();
         img = make_image(f, full_w, full_h, full_d, layers, full_levels, cube, is3d, false, false);
         st.t_mkimg += now_ns() - tm;
-        static const bool log_stream = std::getenv("D1_NG_LOG_STREAM") != nullptr;
-        if (log_stream && streamed && img) {
-            log("ng stream [CREATE res=%u img=%p]: allocated persistent VkImage %ux%u (%u mips) for streamed texture",
-                uint32_t(res >> 32), (void*)img->image, full_w, full_h, full_levels);
-        }
     }
     if (!img) {
         if (prev) bury(std::move(prev));
         return nullptr;
     }
 
-    auto upload_range = [&](const tiling::Surface& s_src, uint64_t base_addr, uint32_t src_lv_begin, uint32_t src_lv_count, uint32_t dst_lv_begin) -> bool {
-        if (!src_lv_count || src_lv_begin >= s_src.levels || src_lv_count > s_src.levels - src_lv_begin ||
-            dst_lv_begin >= full_levels || src_lv_count > full_levels - dst_lv_begin) return false;
-        const auto& last=s_src.mips[src_lv_begin+src_lv_count-1];
-        const uint64_t needed=last.offset+last.size;
-        if(!base_addr||!needed||(prepared&&prepared_source_size<needed)){
-            ++texture_range_rejects;return false;
-        }
-        const uint8_t* tiled=nullptr;
-        const MappingSpans* spans=nullptr;
-        uint64_t captured=needed;
-        const PreparedMipRange* split=nullptr;
-        if(split_prepared){
-            for(const auto& range:*split_prepared){
-                const auto& a=range.surface;
-                if(range.base==base_addr&&range.source_size==needed&&range.levels==src_lv_count&&
-                   range.dst==dst_lv_begin&&src_lv_begin==0&&
-                   a.width==s_src.width&&a.height==s_src.height&&a.pitch==s_src.pitch&&
-                   a.tile_mode==s_src.tile_mode&&a.pow2==s_src.pow2&&a.block==s_src.block&&
-                   a.bpp==s_src.bpp&&a.depth==s_src.depth&&a.layers==s_src.layers&&
-                   a.stored_layers==s_src.stored_layers&&a.samples==s_src.samples&&a.levels==s_src.levels){
-                    split=&range;break;
-                }
-            }
-            if(!split)return false;
-        }
-        if(!prepared&&!split){
-            if(base_addr==ts.base&&needed<=cur_bytes){
-                if(!primary()){++texture_range_rejects;return false;}
-                tiled=primary_data;spans=&primary_spans;captured=cur_bytes;
-            }else{
-                if(!capture_source(base_addr,needed,secondary_source,secondary_spans,secondary_data)){
-                    ++texture_range_rejects;return false;
-                }
-                tiled=secondary_data;spans=&secondary_spans;
-            }
-        }
+    bool ok = false;
+    {
         uint64_t total = 0;
-        std::vector<uint64_t> sizes(src_lv_count), level_off(src_lv_count);
-        // The engine rounds the compressed low descriptor to a block boundary.
-        // At deeper levels its linear block rows may be wider than the authored
-        // Vulkan mip. Detile into a sized CPU temporary, then copy only valid rows.
-        bool crop = false;
-        const uint32_t block = fi.block ? 4 : 1, bytes = fi.bpp / 8;
-        auto elems = [block](uint32_t n) { return (n + block - 1) / block; };
-        for (uint32_t k = 0; k < src_lv_count; ++k) {
-            const uint32_t sl = src_lv_begin + k, dl = dst_lv_begin + k;
-            const uint32_t sw = elems(std::max(1u, s_src.width >> sl)), sh = elems(std::max(1u, s_src.height >> sl));
-            const uint32_t dw = elems(std::max(1u, full_w >> dl)), dh = elems(std::max(1u, full_h >> dl));
-            if (sw < dw || sh < dh) return false;
-            crop |= sw != dw || sh != dh;
-        }
-        for (uint32_t k = 0; k < src_lv_count; ++k) {
-            const uint32_t dst_lv = dst_lv_begin + k;
-            const uint32_t mw = std::max(1u, full_w >> dst_lv), mh = std::max(1u, full_h >> dst_lv);
+        std::vector<uint64_t> sizes(full_levels), level_off(full_levels);
+        for (uint32_t k = 0; k < full_levels; ++k) {
+            const uint32_t mw = std::max(1u, full_w >> k), mh = std::max(1u, full_h >> k);
             const uint32_t ew = fi.block ? (mw + 3) / 4 : mw, eh = fi.block ? (mh + 3) / 4 : mh;
-            sizes[k] = uint64_t(ew) * eh * (fi.bpp / 8) * std::max(1u, is3d ? std::max(1u, full_d >> dst_lv) : layers);
+            sizes[k] = uint64_t(ew) * eh * (fi.bpp / 8) * std::max(1u, is3d ? std::max(1u, full_d >> k) : layers);
             level_off[k] = total;
             total += (sizes[k] + 15) & ~15ull;
         }
@@ -3029,217 +2593,55 @@ Image* Renderer::upload_texture(const uint32_t* t, uint64_t res, uint64_t obj,
         const bool own = base_off == UINT64_MAX;
         if (!own) sb = ring, sb.map = ring.map + base_off;
         else sb = make_buffer(std::max<uint64_t>(total, 16), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true), base_off = 0;
-        if (!sb.map) return false;
-
-        const uint64_t tf0 = now_ns();
-        const bool use_prepared = !streamed && prepared && prepared_size == total &&
-                                  src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count == full_levels;
-        if((prepared&&(!use_prepared||crop))||(split&&split->linear.size()!=total)) {
-            if(own)free_buffer(sb);
-            return false; // do not silently fall back to guest memory
-        }
-        const uint32_t missing = (!split && !use_prepared && src_lv_begin == 0 && dst_lv_begin == 0 && src_lv_count > 1) ? first_missing_mip(ts, fi, s_src, is3d,tiled) : src_lv_count;
-        const uint64_t td = now_ns();
-        st.t_fill += td - tf0;
-        if(split){
-            std::memcpy(sb.map,split->linear.data(),total);
-        }else if (crop) {
-            static thread_local std::vector<uint8_t> cropped_source;
-            for (uint32_t k = 0; k < src_lv_count; ++k) {
-                const uint32_t sl = src_lv_begin + k, dl = dst_lv_begin + k;
-                const uint32_t sw = elems(std::max(1u, s_src.width >> sl)), sh = elems(std::max(1u, s_src.height >> sl));
-                const uint32_t dw = elems(std::max(1u, full_w >> dl)), dh = elems(std::max(1u, full_h >> dl));
-                const uint32_t slices = is3d ? std::max(1u, full_d >> dl) : layers;
-                cropped_source.resize(uint64_t(sw) * sh * slices * bytes);
-                tiling::detile(s_src,sl,tiled,cropped_source.data());
-                for (uint32_t z = 0; z < slices; ++z)
-                    for (uint32_t y = 0; y < dh; ++y)
-                        std::memcpy(sb.map + level_off[k] + (uint64_t(z) * dh + y) * dw * bytes,
-                                    cropped_source.data() + (uint64_t(z) * sh + y) * sw * bytes, uint64_t(dw) * bytes);
+        if (sb.map) {
+            const uint64_t td = now_ns();
+            const uint32_t missing = full_levels > 1 ? first_missing_mip(ts, fi, sf, is3d, source.data()) : full_levels;
+            if (missing < full_levels) {
+                static thread_local std::vector<uint8_t> scratch;
+                scratch.resize(total);
+                for (uint32_t k = 0; k < missing; ++k) tiling::detile(sf, k, source.data(), scratch.data() + level_off[k]);
+                fill_missing_mips(missing, scratch.data(), level_off, sizes, ts, fi, sf, is3d);
+                std::memcpy(sb.map, scratch.data(), total);
+            } else {
+                for (uint32_t k = 0; k < full_levels; ++k) tiling::detile(sf, k, source.data(), sb.map + level_off[k]);
             }
             st.t_detile += now_ns() - td;
-        } else if (use_prepared) {
-            std::memcpy(sb.map, prepared, total);
-        } else if (missing < src_lv_count) {
-            static thread_local std::vector<uint8_t> scratch;
-            scratch.resize(total);
-            for (uint32_t k = 0; k < missing; ++k)
-                tiling::detile(s_src,src_lv_begin+k,tiled,scratch.data()+level_off[k]);
-            const uint64_t tf = now_ns();
-            st.t_detile += tf - td;
-            fill_missing_mips(missing, scratch.data(), level_off, sizes, ts, fi, s_src, is3d);
-            std::memcpy(sb.map, scratch.data(), total);
-            st.t_fill += now_ns() - tf;
-        } else {
-            for (uint32_t k = 0; k < src_lv_count; ++k)
-                tiling::detile(s_src,src_lv_begin+k,tiled,sb.map+level_off[k]);
-            st.t_detile += now_ns() - td;
-        }
-        if(!current_epoch()||(!owned&&(split?
-           !guest_matches_current_spans(base_addr,needed,split->mapping,split->tiled.data()):
-           (!prepared&&(!spans||!guest_matches_current_spans(base_addr,captured,*spans,tiled)))))){
-            if(own)free_buffer(sb);
-            ++st.tex_torn;
-            return false;
-        }
-        std::vector<VkBufferImageCopy> regions(src_lv_count);
-        for (uint32_t k = 0; k < src_lv_count; ++k) {
-            const uint32_t dst_lv = dst_lv_begin + k;
-            VkBufferImageCopy& r = regions[k];
-            r.bufferOffset = base_off + level_off[k];
-            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, dst_lv, 0, is3d ? 1u : layers};
-            r.imageExtent = {std::max(1u, full_w >> dst_lv), std::max(1u, full_h >> dst_lv),
-                             is3d ? std::max(1u, full_d >> dst_lv) : 1u};
-        }
-        before_upload(img.get());
-        vkCmdCopyBufferToImage(rc().cmd, sb.buf, img->image, VK_IMAGE_LAYOUT_GENERAL, src_lv_count, regions.data());
-        if (own) subs[rc().cur].staging.push_back(sb);
-        st.bytes_tex += total;
-        return true;
-    };
-
-    bool ok = false;
-    if (streamed) {
-        if (cur_is_low) {
-            if (!img->low_loaded || img->low_base != ts.base) {
-                const uint32_t n_low = full_levels - 1;
-                ok = sf.levels == n_low && upload_range(sf, ts.base, 0, n_low, 1);
-                if (ok) {
-                    img->low_loaded = true;
-                    img->low_base = ts.base;
-                    img->low_size = sf.total_size;
-                    static const bool log_stream = std::getenv("D1_NG_LOG_STREAM") != nullptr;
-                    if (log_stream) {
-                        log("ng stream [IN-PLACE LOW MIPS res=%u img=%p]: filled mips [1..%u] from %#llx (frame %llu)",
-                            uint32_t(res >> 32), (void*)img->image, full_levels - 1, (unsigned long long)ts.base, (unsigned long long)st.frames);
-                    }
-                }
-            } else {
-                ok = true;
+            std::vector<VkBufferImageCopy> regions(full_levels);
+            for (uint32_t k = 0; k < full_levels; ++k) {
+                VkBufferImageCopy& r = regions[k];
+                r.bufferOffset = base_off + level_off[k];
+                r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, k, 0, is3d ? 1u : layers};
+                r.imageExtent = {std::max(1u, full_w >> k), std::max(1u, full_h >> k), is3d ? std::max(1u, full_d >> k) : 1u};
             }
-        } else {
-            if ((!img->low_loaded || img->low_base != smi.low_base) && smi.low_base && smi.low_base != ts.base) {
-                img->low_loaded = false;
-                tiling::Surface sf_low = sf;
-                sf_low.width = std::max(1u, full_w >> 1);
-                sf_low.height = std::max(1u, full_h >> 1);
-                if (fi.block) {
-                    sf_low.width = (sf_low.width + 3) & ~3u;
-                    sf_low.height = (sf_low.height + 3) & ~3u;
-                }
-                sf_low.pitch = sf_low.width;
-                sf_low.depth = is3d ? std::max(1u, full_d >> 1) : 1;
-                sf_low.levels = full_levels - 1;
-                // A small mip chain may use a different physical tile mode
-                // and pitch from the high descriptor. Prefer its actual
-                // captured layout over a guess derived from mip zero.
-                const auto& low=smi.low_layout;
-                if(low.base==smi.low_base&&low.dfmt==ts.dfmt&&low.nfmt==ts.nfmt&&
-                   low.last_level+1==sf_low.levels){
-                    sf_low.width=low.width;sf_low.height=low.height;
-                    sf_low.pitch=low.pitch;sf_low.tile_mode=low.tiling;sf_low.pow2=low.pow2;
-                }else ++split_layout_guesses;
-                tiling::layout(sf_low);
-                if (owned||guest_readable_range(smi.low_base,sf_low.total_size)) {
-                    if (upload_range(sf_low, smi.low_base, 0, full_levels - 1, 1)) {
-                        img->low_loaded = true;
-                        img->low_base = smi.low_base;
-                        img->low_size = sf_low.total_size;
-                        // This upload independently populated the low chain.
-                        // Publish its captured descriptor too, not just mip 0.
-                        if(smi.low_words[0] && low.base==smi.low_base &&
-                           low.dfmt==ts.dfmt && low.nfmt==ts.nfmt &&
-                           low.last_level+1==sf_low.levels){
-                            std::memcpy(img->resident_descriptor[0],smi.low_words.data(),32);
-                            img->descriptor_epoch[0]=res;
-                        }
-                    }
-                }
-            }
-            if (!img->hi_loaded || img->hi_base != ts.base) {
-                // The high allocation contains mip 0 only; a mapped region's extent
-                // is not the resource allocation size. Never read the low chain here.
-                ok = img->low_loaded && img->low_base == smi.low_base && upload_range(sf, ts.base, 0, 1, 0);
-                if (ok) {
-                    img->hi_loaded = true;
-                    img->hi_base = ts.base;
-                    img->hi_size = sf.mips[0].size;
-                    static const bool log_stream = std::getenv("D1_NG_LOG_STREAM") != nullptr;
-                    if (log_stream) {
-                        log("ng stream [IN-PLACE HI MIP 0 res=%u img=%p]: filled mip [0] from %#llx into existing VkImage (frame %llu)",
-                            uint32_t(res >> 32), (void*)img->image, (unsigned long long)ts.base, (unsigned long long)st.frames);
-                    }
-                }
-            } else {
-                ok = true;
-            }
-            ok = ok && img->low_loaded && img->hi_loaded && img->low_base == smi.low_base;
+            before_upload(img.get());
+            vkCmdCopyBufferToImage(rc().cmd, sb.buf, img->image, VK_IMAGE_LAYOUT_GENERAL, full_levels, regions.data());
+            if (own) subs[rc().cur].staging.push_back(sb);
+            st.bytes_tex += total;
+            ok = true;
         }
-        img->res_val = res;
-        img->res_obj = smi.obj ? smi.obj : obj;
-        img->src_addr = ts.base, img->src_size = cur_bytes, img->version = ~0ull;
-    } else {
-        ok = upload_range(sf, ts.base, 0, full_levels, 0);
-        // A reused image may previously have been streamed. Do not carry a
-        // split allocation's address/size metadata into a contiguous upload.
-        img->low_base = img->hi_base = img->low_size = img->hi_size = 0;
-        img->low_loaded = img->hi_loaded = ok;
-        if (ok && res) {
-            img->res_val = res, img->res_obj = smi.obj ? smi.obj : obj;
-            img->src_addr=ts.base;img->src_size=cur_bytes;img->version=~0ull;
-            img->content=prepared?prepared_hash:split_prepared?
-                hash_bytes(split_prepared->front().tiled.data(),cur_bytes):hash_bytes(primary_data,cur_bytes);
-            if(top_only)++top_only_uploads;
-            if(contiguous_high)++contiguous_high_uploads;
-        } else if (ok && (opt.watch || dynamic_copy)) {
-            const uint64_t tw = now_ns();
-            img->version = mem_watch(ts.base, sf.total_size);
-            if(dynamic_copy)img->content=hash_bytes(primary_data,sf.total_size);
-            st.t_watch += now_ns() - tw;
-            if (img->version != ~0ull) img->src_addr = ts.base, img->src_size = sf.total_size, img->checked = rc().submit_no;
-
-        }
+    }
+    if (ok && (opt.watch || dynamic_copy)) {
+        const uint64_t tw = now_ns();
+        img->version = mem_watch(ts.base, sf.total_size);
+        if (dynamic_copy) img->content = hash_bytes(source.data(), sf.total_size);
+        st.t_watch += now_ns() - tw;
+        if (img->version != ~0ull) img->src_addr = ts.base, img->src_size = sf.total_size, img->checked = rc().submit_no;
     }
 
     if (prev) bury(std::move(prev));
     if (!ok) {
         ++texture_upload_failures;
-        // A failed high-level upgrade must not destroy the independently
-        // valid low chain. Keep only a matching, already uploaded low chain;
-        // high descriptors still fail closed until mip 0 is actually ready.
-        if(streamed && img->low_loaded && img->low_base==smi.low_base){
-            img->hi_loaded=false;
-            img->last_used=rc().submit_no;
-            img->last_frame=st.frames;
-            if(img->descriptor_epoch[0]==res&&img->resident_descriptor[0][0])
-                source_ready(img->resident_descriptor[0],res,img.get());
-            if(historical_replay)archive_texture(key,std::move(img));
-            else textures[key]=std::move(img);
-            ++split_partial_kept;
-        }else{
-            bury(std::move(img));
-            if(!historical_replay)textures.erase(key);
-        }
+        bury(std::move(img));
+        textures.erase(key);
         ++views_gen;
         return nullptr;
     }
     Image* out = img.get();
-    if(res){
-        const unsigned slot=streamed&&!cur_is_low?1:0;
-        std::memcpy(out->resident_descriptor[slot],t,32);
-        out->descriptor_epoch[slot]=res;
-        if(!streamed)out->descriptor_epoch[1]=0;
-    }
     out->last_used = rc().submit_no;
     out->last_frame = st.frames;
     ++st.textures;
-    source_ready(t,res,out);
-    if(streamed&&!cur_is_low&&out->low_loaded&&out->descriptor_epoch[0]==res&&out->resident_descriptor[0][0])
-        source_ready(out->resident_descriptor[0],res,out);
-    if(historical_replay)archive_texture(key,std::move(img));
-    else textures[key]=std::move(img);
+    textures[key] = std::move(img);
     ++views_gen;
-    if(owned)++captured_source_replays;
     return out;
 }
 
@@ -3551,13 +2953,12 @@ thread_local Renderer::GeoHit Renderer::geo_hit_out;
 thread_local Renderer::Recorder* Renderer::tr = nullptr;
 
 void Renderer::evict_geo() {
-    auto gate=texture_leases().retire();
     const uint64_t horizon = 3000, now = submit_seq.load();
     if (now < horizon) return;
     for (GeoShard& sh : geo_shards) {
         std::lock_guard lk(sh.m);
         for (auto it = sh.map.begin(); it != sh.map.end();) {
-            if (it->second.last_used + horizon < now && (!it->second.res||!texture_leases().pinned(it->second.res))) {
+            if (it->second.last_used + horizon < now) {
                 if (it->second.valid) geo_free_later(it->second.block, it->second.off, it->second.size);
                 it = sh.map.erase(it);
             } else {
@@ -3567,92 +2968,13 @@ void Renderer::evict_geo() {
     }
 }
 
-// Textures unused for a while are dropped (re-uploaded if the game uses them again): the
-// game streams, and an address range can hold many textures over a session. The image is
-// destroyed once the submissions that may still read it have completed.
-Image* Renderer::historical_texture(const TextureKey& key,const uint32_t* t,uint64_t res){
-    auto cur=textures.find(key);
-    if(cur!=textures.end()&&cur->second&&cur->second->res_val!=res&&
-       cur->second->matches_epoch(t,res))return cur->second.get();
-    auto it=texture_history.find(key);
-    if(it!=texture_history.end())
-        for(auto& img:it->second)if(img->matches_epoch(t,res))return img.get();
-    return nullptr;
-}
-void Renderer::archive_texture(const TextureKey& key,std::unique_ptr<Image> img){
-    if(!img)return;
-    constexpr uint64_t budget=256ull<<20;
-    if(img->stale||!img->res_val){
-        bury(std::move(img));return;
-    }
-    auto& list=texture_history[key];
-    {
-        auto gate=texture_leases().retire();
-        if(list.size()>=3){
-            auto it=std::find_if(list.begin(),list.end(),[](const auto& old){return !old->captured();});
-            if(it!=list.end()){
-                texture_history_bytes-=(*it)->mem.size;
-                bury(std::move(*it));list.erase(it);
-                ++texture_history_drops;++views_gen;
-            }
-        }
-    }
-    texture_history_bytes+=img->mem.size;
-    img->last_frame=st.frames;
-    list.push_back(std::move(img));
-    if(texture_history_bytes>budget)trim_texture_history();
-}
-void Renderer::trim_texture_history(bool all){
-    constexpr uint64_t budget=256ull<<20;
-    auto gate=texture_leases().retire();
-    for(auto it=texture_history.begin();it!=texture_history.end();){
-        auto& list=it->second;
-        for(auto p=list.begin();p!=list.end();){
-            if(all||(((*p)->last_frame+120<st.frames||texture_history_bytes>budget)&&!(*p)->captured())){
-                texture_history_bytes-=(*p)->mem.size;
-                bury(std::move(*p));p=list.erase(p);
-                ++texture_history_drops;++views_gen;
-            }else ++p;
-        }
-        if(list.empty())it=texture_history.erase(it);else ++it;
-    }
-}
 void Renderer::evict_textures() {
-    trim_texture_history();
-    {
-        auto gate=texture_leases().retire();
-        prune_sources();
-    }
-    // Reclaim native stream metadata independently from GPU images. Keep
-    // every pending command-list lease, plus recent metadata for live assets.
-    {
-        auto gate=texture_leases().retire();
-        std::lock_guard lk(mip_m);
-        for(auto it=stream_mips.begin();it!=stream_mips.end();){
-            auto& entries=it->second.entries;
-            std::erase_if(entries,[&](const StreamMipInfo& entry){
-                if(texture_leases().pinned(entry.epoch))return false;
-                return !entry.obj||!opt.res_current||
-                       uint32_t(opt.res_current(entry.obj)>>32)!=it->first;
-            });
-            if(entries.empty())it=stream_mips.erase(it);else ++it;
-        }
-    }
-    // Use frame count (st.frames), NOT submit_seq (which increments ~28 times per frame).
-    // Registered engine textures stay alive in their single persistent VkImage for as long as
-    // their handle in the engine's resource registry still resolves to them.
+    // Non-engine textures (CPU-written memory) not drawn for a while (frames, not submissions).
     const uint64_t horizon = 1800, now = st.frames;
     if (now < horizon) return;
-    auto gate=texture_leases().retire();
     std::vector<TextureKey> drop;
-    for (auto& [k, img] : textures) {
-        // Most resident textures are recent. Filter them before consulting
-        // the original registry or acquiring the lease mutex under the gate.
-        if(!img||img->last_frame+horizon>=now)continue;
-        const bool still_registered = img->res_val && img->res_obj && opt.res_current &&
-                                      (opt.res_current(img->res_obj) >> 32) == (img->res_val >> 32);
-        if (!still_registered && !img->captured()) drop.push_back(k);
-    }
+    for (auto& [k, img] : textures)
+        if (img && img->last_frame + horizon < now) drop.push_back(k);
     for (const auto& k : drop) {
         auto it = textures.find(k);
         bury(std::move(it->second));  // (freed once every recording that may use it has completed)
@@ -3685,14 +3007,16 @@ Image* Renderer::target_for(const fmt::TSharp& ts) {
 }
 
 thread_local Image* tv_texture = nullptr;  // (texture_view: the uploaded texture it returned a view of, if any)
-ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res, Image* prepared_image) {
+// The view of a texture that is no engine resource: a depth target's stencil plane, a render
+// target (by the surface the T# describes), or CPU-written memory (upload_texture).
+ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim) {
     tv_texture = nullptr;
     const auto vt = view_type(dim);
     if (!t) return {dummy_views[int(dim) * 3], 0, uint8_t(dim), 0, true};
     const auto ts = fmt::decode_tsharp(t);
     VkComponentMapping comp{swz(ts.dst_sel & 7), swz(ts.dst_sel >> 3 & 7), swz(ts.dst_sel >> 6 & 7),
                             swz(ts.dst_sel >> 9 & 7)};
-    if (!res) if (auto sit = stencil_by_base.find(ts.base); sit != stencil_by_base.end() && sit->second->stencil) {
+    if (auto sit = stencil_by_base.find(ts.base); sit != stencil_by_base.end() && sit->second->stencil) {
         sit->second->sampled = true;
         sampled_bases.insert(ts.base);
         static std::unordered_set<uint64_t> told;
@@ -3701,7 +3025,7 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
                 (unsigned long long)sit->second->base);
         return view(sit->second, VK_IMAGE_VIEW_TYPE_2D, {}, 0, true, true);
     }
-    if (!res) if (Image* img = target_for(ts)) {
+    if (Image* img = target_for(ts)) {
         img->sampled = true;
         sampled_bases.insert(ts.base);
         if (img->depth) return view(img, VK_IMAGE_VIEW_TYPE_2D, {}, 0, true);
@@ -3713,54 +3037,14 @@ ViewHandle Renderer::texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t r
         }
         return view(img, img->is3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, comp, 0, false);
     }
-    Image* img=prepared_image;
-    if(!res||!img||!img->matches_epoch(t,res)){
-        auto it=textures.find(tex_key(t,res));
-        img=it!=textures.end()?it->second.get():nullptr;
-        if(res&&(!img||!img->matches_epoch(t,res))){
-            auto* exact=historical_texture(tex_key(t,res),t,res);
-            if(img&&!exact)++texture_view_mismatches;
-            img=exact;
-        }
-    }
+    const auto it = textures.find(tex_key(t, 0));
+    Image* img = it != textures.end() ? it->second.get() : nullptr;
     const uint8_t fallback_kind = ts.nfmt == 4 ? 1u : ts.nfmt == 5 ? 2u : 0u;
-    const ViewHandle fallback{dummy_views[int(dim) * 3 + fallback_kind], 0, uint8_t(dim), fallback_kind, fallback_kind == 0};
-    if(!img||img->stale)return fallback;
-    // A split texture has one native image, but each captured descriptor has its
-    // own mip origin. A later low/high bind must not change an earlier draw.
-    uint32_t origin = 0;
-    if (img->low_size || img->hi_size) {
-        const bool low = ts.last_level + 1 == img->levels - 1;
-        const bool high = ts.last_level + 1 == img->levels;
-        if (low && img->low_loaded && ts.base == img->low_base) origin = 1;
-        else if (!(high && img->hi_loaded && img->low_loaded && ts.base == img->hi_base))
-            return fallback;
-    }
+    if (!img || img->stale) return {dummy_views[int(dim) * 3 + fallback_kind], 0, uint8_t(dim), fallback_kind, fallback_kind == 0};
     img->last_used = rc().submit_no;
     img->last_frame = st.frames;
     tv_texture = img;
-    const uint32_t first = std::min(origin + std::max(ts.base_level, (ts.min_lod + 255) >> 8),
-                                    img->levels ? img->levels - 1 : 0);
-    static const bool log_stream = std::getenv("D1_NG_LOG_STREAM") != nullptr;
-    if (log_stream && res && img->levels > 1 && (img->low_size || img->hi_size)) {
-        // Report real split-resource transitions throughout gameplay. The old
-        // frame-1200 cutoff ended long before the world loaded in test 33.
-        static std::unordered_map<uint32_t, uint64_t> last;
-        static uint32_t messages = 0;
-        const uint32_t rid = uint32_t(res >> 32);
-        const uint64_t state = mix(mix(mix(res, uint64_t(img->image)), ts.base),
-                                   uint64_t(first) | uint64_t(origin) << 32);
-        auto it = last.find(rid);
-        if (messages < 1024 && (it == last.end() || it->second != state)) {
-            last[rid] = state;
-            ++messages;
-            log("ng stream [BIND res=%u epoch=%u img=%p]: frame %llu view [%u..%u] resident=%u low=%#llx/%llu hi=%#llx/%llu T#=%#llx",
-                rid, uint32_t(res), (void*)img->image, (unsigned long long)st.frames,
-                first, img->levels - 1, origin, (unsigned long long)img->low_base,
-                (unsigned long long)img->low_size, (unsigned long long)img->hi_base,
-                (unsigned long long)img->hi_size, (unsigned long long)ts.base);
-        }
-    }
+    const uint32_t first = std::min(std::max(ts.base_level, (ts.min_lod + 255) >> 8), img->levels ? img->levels - 1 : 0);
     return view(img, vt, comp, first, false);
 }
 
@@ -5022,6 +4306,17 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
                     tsig |= uint64_t(dk & 0xF) << (slot * 4);
                     continue;
                 }
+                if (tres) {  // an engine texture the native table does not own: never drawn from guest memory
+                    const uint8_t kind = fmt::decode_tsharp(T).nfmt == 4 ? 1u : fmt::decode_tsharp(T).nfmt == 5 ? 2u : 0u;
+                    const ViewHandle nv{dummy_views[int(dim) * 3 + kind], 0, uint8_t(dim), kind, kind == 0};
+                    const uint8_t dk = uint8_t((nv.dim & 3) | ((nv.kind & 3) << 2));
+                    dr.tex_view[s][slot] = nv.id;
+                    dr.tex_dk[s][slot] = dk;
+                    if (nv.filterable) fmask |= bit;
+                    tsig |= uint64_t(dk & 0xF) << (slot * 4);
+                    ++ntex_unowned_draws;
+                    continue;
+                }
                 const uint64_t key = (hash_bytes(T, 32) ^ tres * 0xC2B2AE3D27D4EB4Full) ^
                                      (uint64_t(dim) + 1) * 0x9E3779B97F4A7C15ull;
                 TvEntry& e = tvc[key & 4095];
@@ -5032,10 +4327,10 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
                     vh = e.vh;
                     if (e.tex) e.tex->last_used = sub_no, e.tex->last_frame = st.frames;
                 } else {
-                    vh = texture_view(T, dim, tres);
+                    vh = texture_view(T, dim);
                     Image* tex = tv_texture;
-                    if (!tres) if (Image* ri = target_for(fmt::decode_tsharp(T)))
-                        vh = texture_view(T, ri->is3d ? gcn::TexDim::Tex3D : gcn::TexDim::Tex2D, tres), tex = nullptr;
+                    if (Image* ri = target_for(fmt::decode_tsharp(T)))
+                        vh = texture_view(T, ri->is3d ? gcn::TexDim::Tex3D : gcn::TexDim::Tex2D), tex = nullptr;
                     e = {key, gen, dependency, vh, tex,tres,{}};
                     std::memcpy(e.words,T,32);
                 }
@@ -5616,7 +4911,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         reload_all = false;
         for (auto& [k, img] : textures)
             bury(std::move(img));
-        textures.clear();trim_texture_history(true);++views_gen;
+        textures.clear();++views_gen;
         log("native renderer: dropped every texture (D1_NG_SNAP_RELOAD)");
     }
     // resources first (copies cannot run inside a render pass): targets, then textures
@@ -5642,14 +4937,6 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     // assets have no target dependencies. Each image owns a lifetime token
     // invalidated before retirement; unrelated uploads do not flush the cache.
     // Source epoch and every view word must still match.
-    struct NativeView {
-        const Renderer* owner=nullptr;
-        uint64_t key=0,res=0;
-        uint32_t words[8]{};
-        ImageLifetime<Image>::Token lifetime;
-        ViewHandle view{};
-    };
-    static thread_local std::vector<NativeView> native_views(1u<<16);
     // A submission can contain several resource-write boundaries. A descriptor
     // seen before one of them must be checked again in the next segment.
     static thread_local uint64_t preparation_epoch = 0;
@@ -5721,49 +5008,19 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                         use_native(s,i,vh);
                         continue;
                     }
-                    NativeView* cache=nullptr;
-                    if(res&&!rc().lr){
-                        const size_t home=k&(native_views.size()-4);
-                        cache=&native_views[home+((k>>16)&3)];
-                        for(size_t probe=0;probe<4;++probe){
-                            auto& entry=native_views[home+probe];
-                            auto* img=ImageLifetime<Image>::resolve(entry.lifetime);
-                            if(!img)cache=&entry;
-                            if(entry.owner==this&&entry.key==k&&entry.res==res&&
-                               img&&entry.view.id&&std::memcmp(entry.words,t,32)==0&&img->matches_epoch(t,res)){
-                                img->last_used=rc().submit_no;img->last_frame=st.frames;
-                                vacant->native=entry.view;vacant->resolved=true;
-                                use_native(s,i,entry.view);++native_view_cache_hits;
-                                break;
-                            }
-                        }
-                        if(vacant->resolved)continue;
-                        ++native_view_cache_misses;
+                    // An engine texture is owned by its object (native_texture_view above); one
+                    // the native table does not own is not drawn from guest memory either.
+                    if(res){
+                        ++ntex_unowned_draws;
+                        continue;
                     }
                     const uint64_t b = fmt::decode_tsharp(t).base;
-                    const bool possible_target=!d->tex_res[s][i]&&target_bases.count(b)!=0;
+                    const bool possible_target=target_bases.count(b)!=0;
                     if(possible_target)tsharp_bases.insert(b);
                     // Preparing a later attachment must not publish it as
                     // the owner of memory sampled by an earlier draw.
                     const bool is_target=possible_target&&(target_by_base.count(b)||stencil_by_base.count(b));
-                    if(!is_target||!target_current(b)){
-                        auto* image=upload_texture(t,res,d->tex_obj[s][i]);
-                        // Registered assets do not alias transient attachments.
-                        // Resolve their native sampled handle once in this
-                        // ordered preparation segment; recording uses it directly.
-                        if(res&&!rc().lr){
-                            vacant->native=texture_view(t,slot_dim(t),res,image);
-                            vacant->resolved=true;
-                            use_native(s,i,vacant->native);
-                            auto* resident=tv_texture;
-                            if(cache&&resident&&vacant->native.id&&resident->matches_epoch(t,res)){
-                                cache->owner=this;cache->key=k;cache->res=res;
-                                std::memcpy(cache->words,t,32);
-                                cache->lifetime=resident->lifetime.token(resident);
-                                cache->view=vacant->native;
-                            }
-                        }
-                    }
+                    if(!is_target||!target_current(b))upload_texture(t);
                 }
         }
         prior=d;
@@ -6022,23 +5279,15 @@ void Renderer::start_loader() {
     load_on=opt.res_current!=nullptr;
     if (!load_on) return;
     loader = std::thread([this] {
-        unsigned consecutive_textures=0;
         for (;;) {
             LoadJob j;
             {
                 std::unique_lock lk(load_m);
-                load_cv.wait(lk,[&]{return !load_q.empty()||!texture_q.empty();});
-                // Texture streaming must not sit behind thousands of vertex
-                // buffer jobs. Bound the preference so shaders/buffers progress.
-                const bool texture=!texture_q.empty()&&(load_q.empty()||consecutive_textures<3);
-                auto& queue=texture?texture_q:load_q;
-                j=std::move(queue.front());queue.pop_front();
-                consecutive_textures=texture?std::min(3u,consecutive_textures+1):0;
+                load_cv.wait(lk,[&]{return !load_q.empty();});
+                j=std::move(load_q.front());load_q.pop_front();
             }
             const uint64_t t0 = now_ns();
             if (opt.res_current(j.obj) != j.res) ++ld_stale;
-            else if (j.kind == 1) load_texture(j);
-            else if (j.kind == 4) load_split_texture(j);
             else load_shader(j);
             ld_ns += now_ns() - t0;
             {
@@ -6082,110 +5331,6 @@ void Renderer::start_loader() {
 }
 
 
-void Renderer::load_texture(const LoadJob& j) {
-    const uint32_t* t = j.t;
-    const auto key=tex_key(t,j.res);
-    // The foreground can resolve a queued job before the loader starts.
-    // Check exact residency before decoding the layout or touching source memory.
-    {
-        std::lock_guard lk(m);
-        auto it=textures.find(key);
-        if(it!=textures.end()&&it->second&&it->second->matches_epoch(t,j.res)){
-            ++ld_skipped;return;
-        }
-    }
-    const auto ts = fmt::decode_tsharp(t);
-    const auto fi = fmt::data_format(ts.dfmt);
-    const VkFormat f = fmt::vk_format(ts.dfmt, ts.nfmt);
-    if (f == VK_FORMAT_UNDEFINED || !fi.bpp || fi.bpp == 96 || !ts.base || ts.width > 16384 || ts.height > 16384) return;
-    if (opt.res_current && opt.res_current(j.obj) != j.res) { ++ld_stale; return; }
-    StreamMipInfo smi{};
-    if(ts.type!=10&&ts.type!=12&&ts.type!=13){
-        smi=get_stream_info(j.res,j.obj,ts,t);
-        if(!smi.valid)return;
-    }
-    tiling::Surface sf;
-    sf.tile_mode = ts.tiling, sf.bpp = fi.bpp, sf.block = fi.block, sf.pow2 = ts.pow2;
-    sf.width = ts.width, sf.height = ts.height, sf.pitch = ts.pitch;
-    const bool is3d = ts.type == 10, cube = ts.type == 11;
-    sf.depth = is3d ? ts.depth : 1;
-    sf.layers = (ts.type == 13 || ts.type == 12 || cube) ? ts.last_array + 1 : 1;
-    if (cube) sf.layers = std::max(6u, sf.layers - sf.layers % 6);
-    sf.stored_layers=cube?ts.depth*6u:(ts.type==12||ts.type==13)?ts.depth:1u;
-    sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
-    tiling::layout(sf);
-    if(smi.has_hi&&smi.full_mips>1&&
-       !(smi.from_callback&&ts.base==smi.hi_base&&ts.width==smi.full_w&&ts.height==smi.full_h&&
-         ts.last_level+1==smi.full_mips&&smi.hi_bytes>=sf.total_size))return;
-    if(j.mapping.empty()||j.size!=sf.total_size||!sf.total_size||sf.total_size>(128ull<<20))return;
-    // Own a complete tiled snapshot before detiling; the loader may be
-    // delayed past the original package's mapping lifetime.
-    static thread_local std::vector<uint8_t> source;
-    source.resize(sf.total_size);
-    if(!guest_copy_current_spans(ts.base,sf.total_size,j.mapping,source.data())||
-       opt.res_current(j.obj)!=j.res){++ld_stale;return;}
-    const uint64_t content = hash_bytes(source.data(),sf.total_size);
-    {
-        std::lock_guard lk(m);
-        if(opt.res_current(j.obj)!=j.res){++ld_stale;return;}
-        auto it = textures.find(key);
-        if (it != textures.end() && it->second && !it->second->stale) {
-            Image* img = it->second.get();
-            const bool same_layout=img->descriptor_epoch[0]&&
-                texture_source_layout_equal(img->resident_descriptor[0],t)&&
-                !img->low_size&&!img->hi_size;
-            if(img->matches_epoch(t,j.res)){++ld_skipped;return;}
-            if(same_layout&&img->content==content&&img->src_size==sf.total_size){
-                // Only the relocation branch publishes here. New uploads
-                // validate once after detiling, at their actual publication.
-                if(!guest_matches_current_spans(ts.base,sf.total_size,j.mapping,source.data())||
-                   opt.res_current(j.obj)!=j.res){++ld_stale;return;}
-                img->remember_relocation();
-                img->res_val=j.res;img->res_obj=j.obj;img->src_addr=ts.base;
-                std::memcpy(img->resident_descriptor[0],t,32);
-                img->descriptor_epoch[0]=j.res;img->descriptor_epoch[1]=0;
-                ++views_gen; // invalidate cached misses and old descriptor epochs
-                ++ld_moves;
-                source_ready(t,j.res,img);
-                return;
-            }
-        }
-    }
-    // Detile outside Renderer::m so engine recording threads never block on background detiling
-    std::vector<uint64_t> sizes(sf.levels), level_off(sf.levels);
-    uint64_t total = 0;
-    for (uint32_t lv = 0; lv < sf.levels; ++lv) {
-        const uint32_t mw = std::max(1u, ts.width >> lv), mh = std::max(1u, ts.height >> lv);
-        const uint32_t ew = fi.block ? (mw + 3) / 4 : mw, eh = fi.block ? (mh + 3) / 4 : mh;
-        sizes[lv] = uint64_t(ew) * eh * (fi.bpp / 8) * std::max(1u, is3d ? std::max(1u, sf.depth >> lv) : sf.layers);
-        level_off[lv] = total;
-        total += (sizes[lv] + 15) & ~15ull;
-    }
-    static thread_local std::vector<uint8_t> scratch;
-    if(total>(128ull<<20))return; // speculative loader stays bounded
-    scratch.resize(total);
-    const uint32_t missing = first_missing_mip(ts, fi, sf, is3d,source.data());
-    for (uint32_t lv = 0; lv < std::min(missing, sf.levels); ++lv)
-        tiling::detile(sf, lv, source.data(), scratch.data() + level_off[lv]);
-    if (missing < sf.levels) fill_missing_mips(missing, scratch.data(), level_off, sizes, ts, fi, sf, is3d);
-    if(opt.res_current(j.obj)!=j.res){++ld_stale;return;}
-    std::lock_guard lk(m);
-    // A foreground draw may have completed the upload during detiling.
-    if(auto it=textures.find(key);it!=textures.end()&&it->second&&it->second->matches_epoch(t,j.res)){
-        ++ld_skipped;return;
-    }
-    // Validate before allocating a command slot for a job that may be stale.
-    if(opt.res_current(j.obj)!=j.res||!guest_matches_current_spans(ts.base,sf.total_size,j.mapping,source.data())||
-       opt.res_current(j.obj)!=j.res){++ld_stale;return;}
-    Recorder* const prev_tr = tr;
-    struct Restore { Recorder* p; ~Restore() { tr = p; } } restore{prev_tr};
-    tr = &up_rec;
-    up_rec.lr = true;
-    up_rec.submit_no = submit_seq.load();
-    begin_record();
-    if (up_rec.cur == UINT32_MAX) return;
-    if (upload_texture(t,j.res,j.obj,scratch.data(),total,sf.total_size,content)) ++ld_tex;
-}
 
 // ---- Native textures -----------------------------------------------------------------------
 // The tiled layout a texture descriptor describes: every level, array slice and cube face.
@@ -6633,207 +5778,6 @@ void Renderer::native_buffer_sweep() {
     }
 }
 
-// Exact source geometry for ordinary 1D/2D split textures. Cube and
-// volume variants remain on the existing ordered path until separately tested.
-static bool split_2d_surface(const uint32_t* words,tiling::Surface& sf){
-    const auto d=fmt::decode_tsharp(words);
-    const auto fi=fmt::data_format(d.dfmt);
-    if(d.type<8||d.type>9||!d.base||!fi.bpp||fi.bpp%8||fi.bpp==96||
-       d.width>16384||d.height>16384)return false;
-    sf.tile_mode=d.tiling;sf.bpp=fi.bpp;sf.block=fi.block;sf.pow2=d.pow2;
-    sf.width=d.width;sf.height=d.height;sf.pitch=d.pitch;
-    sf.depth=sf.layers=sf.stored_layers=1;
-    sf.levels=std::min(d.last_level+1,tiling::kMaxMips);
-    tiling::layout(sf);return true;
-}
-// Called from the engine capture thread with a shared publication gate.
-// Ordinary and split 1D/2D assets with an exact published descriptor are eligible.
-// The first list that references an unprepared epoch retains its actual
-// source bytes. Later lists share the same snapshot or ready GPU token.
-void Renderer::capture_owned_texture(const uint32_t* words,uint64_t res,uint64_t obj){
-    if(!res||!obj||!opt.res_current||(words[3]>>28)<8||(words[3]>>28)>9)return;
-    const auto key=texture_source_key(words,res);
-    // The shared capture gate prevents cache retirement while an epoch is
-    // being pinned. Cache only weak image identity, never snapshot bytes.
-    // A retired or rewritten image invalidates all copies of its token.
-    struct ReadyEntry {const Renderer* owner=nullptr;TextureSourceKey key{};ImageLifetime<Image>::Token token;};
-    static thread_local std::array<ReadyEntry,1024> ready_cache{};
-    auto& fast=ready_cache[TextureSourceKeyHash{}(key)&(ready_cache.size()-1)];
-    if(fast.owner==this&&fast.key==key&&ImageLifetime<Image>::resolve(fast.token))return;
-    {
-        std::lock_guard lk(source_m);
-        const auto it=captured_sources.find(key);
-        if(it!=captured_sources.end()){
-            if(ImageLifetime<Image>::resolve(it->second.ready)){
-                fast={this,key,it->second.ready};return;
-            }
-            if(it->second.owned)return;
-        }
-    }
-    if(opt.res_current(obj)!=res||guest_region_extent(obj)<0x44)return;
-    const auto ts=fmt::decode_tsharp(words);
-    tiling::Surface sf;
-    if(!split_2d_surface(words,sf))return;
-    StreamMipInfo info{};
-    const auto authored_mips=*reinterpret_cast<const uint8_t*>(obj+0x31);
-    const bool has_high=*reinterpret_cast<const uint8_t*>(obj+0x34)!=0;
-    const bool split=has_high&&authored_mips>1;
-    uint64_t primary=sf.total_size,secondary=0;
-    if(!split){
-        // The ordinary registered path consumes the complete descriptor
-        // footprint. Preserve it just like the assembled split chain; an
-        // unprepared ordinary texture can expire before submission too.
-        if(has_high&&(authored_mips!=1||sf.levels!=1))return;
-        info.obj=obj;info.epoch=res;
-        info.full_w=uint16_t(ts.width);info.full_h=uint16_t(ts.height);
-        info.full_mips=uint8_t(sf.levels);info.low_base=ts.base;
-    }else{
-        bool have=false;
-        {
-            std::lock_guard lk(mip_m);
-            const auto it=stream_mips.find(uint32_t(res>>32));
-            if(it!=stream_mips.end())if(const auto* entry=it->second.find(res)){info=*entry;have=true;}
-        }
-        if(!have){
-            // Initial low-res bind may not invoke 7D4480. The captured
-            // descriptor and authored mip count establish the low chain;
-            // a full-resolution descriptor without callback bounds does not.
-            info.obj=obj;info.epoch=res;info.has_hi=1;
-            info.full_w=*reinterpret_cast<const uint16_t*>(obj+0x28);
-            info.full_h=*reinterpret_cast<const uint16_t*>(obj+0x2a);
-            info.full_d=1;info.full_mips=authored_mips;
-            if(ts.last_level+1!=uint32_t(info.full_mips)-1)return;
-            info.low_base=ts.base;info.low_layout=ts;std::memcpy(info.low_words.data(),words,32);
-        }
-        if(!info.valid||!info.has_hi||info.full_mips<2)return;
-        const auto fi=fmt::data_format(ts.dfmt);
-        const uint32_t lw=info.full_w<4?1u:uint32_t(info.full_w>>1),lh=std::max(1u,uint32_t(info.full_h>>1));
-        const bool low_dims=(ts.width==lw||(fi.block&&ts.width==((lw+3)&~3u)))&&
-                            (ts.height==lh||(fi.block&&ts.height==((lh+3)&~3u)));
-        const bool low=low_dims&&ts.last_level+1==uint32_t(info.full_mips)-1&&ts.base==info.low_base;
-        const bool high=ts.width==info.full_w&&ts.height==info.full_h&&ts.last_level+1==info.full_mips&&ts.base==info.hi_base;
-        const auto source=mip_source(low,high,info.low_base,info.hi_base,info.low_bytes,info.hi_bytes,sf.total_size,sf.mips[0].size);
-        if(source==MipSource::invalid||(!info.from_callback&&source==MipSource::high_only))return;
-        primary=(source==MipSource::high_only||source==MipSource::split_chain)?sf.mips[0].size:sf.total_size;
-        if(source==MipSource::split_chain){
-            tiling::Surface low_sf;
-            if(!info.low_words[0]||!split_2d_surface(info.low_words.data(),low_sf)||
-               info.low_layout.base!=info.low_base||info.low_layout.dfmt!=ts.dfmt||
-               info.low_layout.nfmt!=ts.nfmt||low_sf.levels!=uint32_t(info.full_mips)-1)return;
-            secondary=low_sf.total_size;
-            if(info.low_bytes&&secondary>info.low_bytes)return;
-        }
-    }
-    constexpr uint64_t budget=256ull<<20;
-    if(!primary||primary>budget||secondary>budget-primary)return;
-    auto snapshot=std::make_shared<OwnedTexture>();
-    snapshot->info=info;snapshot->size=primary+secondary;
-    // Reserve budget before allocation/copy. Unpinned sources are pruned
-    // by the renderer; pinned sources are never evicted to make room.
-    {
-        std::lock_guard lk(source_m);
-        if(captured_source_bytes+snapshot->size>budget){
-            ++captured_source_budget_misses;
-            source_prune_requested.store(true,std::memory_order_relaxed);
-            return;
-        }
-        captured_source_bytes+=snapshot->size;
-    }
-    auto copy=[&](uint64_t base,uint64_t size){
-        MappingSpans spans;
-        if(!base||!size||!guest_capture_read_spans(base,size,spans))return false;
-        OwnedTexture::Range range;range.base=base;range.bytes.resize(size);
-        if(!guest_copy_current_spans(base,size,spans,range.bytes.data())||
-           opt.res_current(obj)!=res||!guest_matches_current_spans(base,size,spans,range.bytes.data()))return false;
-        snapshot->ranges.push_back(std::move(range));return true;
-    };
-    const bool ok=copy(ts.base,primary)&&(!secondary||copy(info.low_base,secondary))&&opt.res_current(obj)==res;
-    std::lock_guard lk(source_m);
-    if(ok){
-        auto& entry=captured_sources[key];
-        if(!entry.owned&&!ImageLifetime<Image>::resolve(entry.ready)){
-            entry.owned=std::move(snapshot);++captured_source_count;return;
-        }
-    }
-    captured_source_bytes-=snapshot->size;
-}
-void Renderer::load_split_texture(const LoadJob& j){
-    if(!opt.res_current||opt.res_current(j.obj)!=j.res)return;
-    const auto ts=fmt::decode_tsharp(j.t);
-    const auto info=get_stream_info(j.res,j.obj,ts,j.t);
-    if(!info.valid||!info.from_callback||!info.has_hi||info.full_mips<2)return;
-    const bool high=ts.last_level+1==info.full_mips;
-    const auto key=tex_key(j.t,j.res);
-    {
-        std::lock_guard lk(m);
-        auto it=textures.find(key);
-        if(it!=textures.end()&&it->second&&it->second->matches_epoch(j.t,j.res)){
-            ++ld_skipped;return;
-        }
-    }
-    std::vector<PreparedMipRange> ranges;
-    uint64_t prepared_bytes=0;
-    auto prepare=[&](const uint32_t* words,uint64_t base,uint64_t size,const MappingSpans& mapping,
-                     uint32_t levels,uint32_t dst){
-        const auto d=fmt::decode_tsharp(words);
-        PreparedMipRange range;
-        auto& sf=range.surface;
-        if(!split_2d_surface(words,sf)||d.base!=base||mapping.empty()||!size||
-           size>(128ull<<20)||d.dfmt!=ts.dfmt||d.nfmt!=ts.nfmt||!levels||
-           levels>sf.levels||dst+levels>info.full_mips||
-           sf.mips[levels-1].offset+sf.mips[levels-1].size!=size)return false;
-        range.base=base;range.source_size=size;range.levels=levels;range.dst=dst;
-        range.mapping=mapping;
-        if(prepared_bytes+size>(128ull<<20))return false;
-        range.tiled.resize(size);
-        if(!guest_copy_current_spans(base,size,mapping,range.tiled.data())||opt.res_current(j.obj)!=j.res)return false;
-        const uint32_t block=sf.block?4:1,bytes=sf.bpp/8;
-        const auto elems=[&](uint32_t n){return (n+block-1)/block;};
-        static thread_local std::vector<uint8_t> scratch;
-        for(uint32_t lv=0;lv<levels;++lv){
-            const auto sw=elems(std::max(1u,d.width>>lv)),sh=elems(std::max(1u,d.height>>lv));
-            const auto dw=elems(std::max(1u,uint32_t(info.full_w)>>(dst+lv)));
-            const auto dh=elems(std::max(1u,uint32_t(info.full_h)>>(dst+lv)));
-            if(sw<dw||sh<dh)return false;
-            const uint64_t src_bytes=uint64_t(sw)*sh*bytes;
-            const uint64_t padded=(uint64_t(dw)*dh*bytes+15)&~15ull;
-            if(src_bytes>(128ull<<20)||prepared_bytes+size+range.linear.size()+padded>(128ull<<20))return false;
-            const size_t off=range.linear.size();range.linear.resize(off+padded);
-            if(sw==dw&&sh==dh)tiling::detile(sf,lv,range.tiled.data(),range.linear.data()+off);
-            else{
-                scratch.resize(src_bytes);tiling::detile(sf,lv,range.tiled.data(),scratch.data());
-                for(uint32_t y=0;y<dh;++y)
-                    std::memcpy(range.linear.data()+off+uint64_t(y)*dw*bytes,
-                        scratch.data()+uint64_t(y)*sw*bytes,uint64_t(dw)*bytes);
-            }
-        }
-        prepared_bytes+=range.tiled.size()+range.linear.size();
-        ranges.push_back(std::move(range));return true;
-    };
-    if(high){
-        if(ts.base!=info.hi_base||j.low_base!=info.low_base||
-           (info.low_base&&!prepare(j.low,j.low_base,j.low_size,j.low_mapping,info.full_mips-1,1))||
-           !prepare(j.t,j.base,j.size,j.mapping,1,0))return;
-    }else if(ts.base!=info.low_base||ts.last_level+1!=info.full_mips-1||
-              !prepare(j.t,j.base,j.size,j.mapping,info.full_mips-1,1))return;
-    // Native linear data is now owned by this job, independent of tag pointers.
-    // Validate mapping/content identity before publishing it to the GPU.
-    std::lock_guard lk(m);
-    if(auto it=textures.find(key);it!=textures.end()&&it->second&&it->second->matches_epoch(j.t,j.res)){
-        ++ld_skipped;return;
-    }
-    if(opt.res_current(j.obj)!=j.res){++ld_stale;return;}
-    for(const auto& range:ranges)
-        if(!guest_matches_current_spans(range.base,range.source_size,range.mapping,range.tiled.data())){
-            ++ld_stale;return;
-        }
-    Recorder* const previous=tr;
-    struct Restore {Recorder* p;~Restore(){tr=p;}} restore{previous};
-    tr=&up_rec;up_rec.lr=true;
-    if(up_rec.cur==UINT32_MAX)up_rec.submit_no=submit_seq.load(),begin_record();
-    if(up_rec.cur==UINT32_MAX)return;
-    if(upload_texture(j.t,j.res,j.obj,nullptr,0,0,0,&ranges))++ld_tex;
-}
 
 void Renderer::load_shader(const LoadJob& j) {
     if (j.base < 0x10000) return;
@@ -7021,7 +5965,7 @@ void Renderer::submit_recorded(const std::vector<uint32_t>& handles) {
             if (up_rec.cur == UINT32_MAX) up_rec.submit_no = submit_seq.load(), begin_record();
             if (up_rec.cur != UINT32_MAX) {
                 img->stale = true;
-                upload_texture(u.t, 0);
+                upload_texture(u.t);
             }
             tr = prev_tr;
         }
@@ -7750,14 +6694,7 @@ void Renderer::end_frame() {
         frame_ends.pop_front();
     }
     retire_completed();
-    const bool source_pressure=source_prune_requested.exchange(false,std::memory_order_relaxed);
     if (st.frames % 120 == 0) evict_textures(), evict_geo();
-    else if(source_pressure){
-        // Reclaim unpinned source snapshots at the next frame boundary,
-        // rather than losing new texture epochs for another 120 frames.
-        auto gate=texture_leases().retire();
-        prune_sources();
-    }
     // Use elapsed wall time, not frame count: a 30-frame interval was only 250 ms
     // at 120 FPS. Never serialize concurrently with loader pipeline construction.
     const uint64_t now = now_ns();
@@ -8147,7 +7084,7 @@ void describe_owner(uint64_t a, char* out, size_t n) {
         if (img && a >= img->src_addr && a < img->src_addr + img->src_size) {
             std::snprintf(out, n, "texture %ux%u fmt %d levels %u at %#llx (+%#llx), %s", img->w, img->h, int(img->format), img->levels,
                           (unsigned long long)img->src_addr, (unsigned long long)(a - img->src_addr),
-                          img->res_val ? "engine resource" : "write-tracked");
+                          "write-tracked");
             return;
         }
     for (auto& [k, up] : g->targets)
@@ -8347,24 +7284,11 @@ void print_stats() {
             (unsigned long long)g->top_only_uploads);
         log("native renderer: allocation-verified full high chains uploaded %llu",(unsigned long long)g->contiguous_high_uploads);
         g->contiguous_high_uploads=0;
-        {
-            std::lock_guard lk(g->source_m);
-            log("native renderer: owned texture sources %.1f MiB, %llu captured, %llu old-epoch uploads, %llu budget rejects",
-                double(g->captured_source_bytes)/1048576.0,
-                (unsigned long long)g->captured_source_count.exchange(0),
-                (unsigned long long)g->captured_source_replays,
-                (unsigned long long)g->captured_source_budget_misses.exchange(0));
-        }
-        g->captured_source_replays=0;
         g->texture_view_mismatches=g->top_only_uploads=0;
         g->split_layout_guesses=g->expired_texture_epochs=0;
         log("native renderer: texture epoch cohort splits %llu, conflicting versions in one draw %llu",
             (unsigned long long)g->texture_cohort_splits,(unsigned long long)g->texture_draw_epoch_conflicts);
         g->texture_cohort_splits=g->texture_draw_epoch_conflicts=0;
-        log("native renderer: retained texture history %.1f MiB, %llu old-epoch hits, %llu versions dropped",
-            double(g->texture_history_bytes)/1048576.0,(unsigned long long)g->texture_history_hits,
-            (unsigned long long)g->texture_history_drops);
-        g->texture_history_hits=g->texture_history_drops=0;
         log("native renderer: unused bound texture slots avoided %llu",(unsigned long long)g->unused_texture_slots);
         g->unused_texture_slots=0;
         {
@@ -8390,7 +7314,7 @@ void print_stats() {
         size_t q;
         {
             std::lock_guard lk(g->load_m);
-            q = g->load_q.size()+g->texture_q.size();
+            q = g->load_q.size();
         }
         log("native renderer: loader: %llu textures and %llu buffers uploaded ahead of use, %llu moves kept, %llu already done, "
             "%llu dropped as changed again, %llu over the queue limit | %.1f ms of loader time, %zu queued",

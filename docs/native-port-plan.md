@@ -102,9 +102,17 @@ Measured, against main `ccae578`, lavapipe:
 The first-use case still exists: a draw whose buffer the loader has not reached yet uploads it into
 the submission it is in, ahead of its draws.
 
-Still to do in piece 1: the address-based branches of `upload_texture`, `texture_view`, the stream
-history and the texture leases are unreachable for engine textures and get deleted next; render
-targets and CPU-written dynamic textures still go through them.
+The address-based texture path that engine textures used before is deleted: the speculative
+texture loader jobs, the split low/high-mip stream bookkeeping and its history, retained old
+texture versions, owned source snapshots, and the engine-resource branches of `upload_texture` and
+`texture_view` (about 1,200 lines). An engine texture the native table does not own is drawn with
+a placeholder, never read from guest memory (none in Earth patrol or orbit).
+
+Still to do in piece 1: what remains on the address path is memory that is no engine resource:
+render targets (resolved by surface, see [draw-interface.md](draw-interface.md)) and textures the
+CPU writes (the dynamic-texture slots). Both get native ownership next. The lease registry now only
+provides the lock that keeps a draw from copying a texture descriptor the engine is rewriting; its
+pinning is unused and goes with it.
 
 ## Piece 4 moved up: the frame-rate unlock causes the shaking
 
