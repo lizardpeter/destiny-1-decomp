@@ -907,8 +907,9 @@ struct Renderer {
     std::condition_variable ntex_cv;
     std::deque<NativeTextureJob> ntex_q;
     bool ntex_on = false;
+    std::atomic<uint64_t> ntex_gen{1};  // bumped whenever any texture's image or resident mips change
     std::atomic<uint64_t> ntex_events{0}, ntex_uploads{0}, ntex_drops{0}, ntex_created{0}, ntex_retired{0},
-        ntex_rejected{0}, ntex_unready{0}, ntex_unowned{0}, ntex_bytes{0}, ntex_ns{0}, ntex_snapshot_ns{0};
+        ntex_rejected{0}, ntex_unready{0}, ntex_unowned{0}, ntex_lookups{0}, ntex_misses{0}, ntex_gens{0}, ntex_bytes{0}, ntex_ns{0}, ntex_snapshot_ns{0};
     void native_texture_event(uint64_t obj, uint64_t res, bool moved);
     void native_texture_load(NativeTextureJob& j);
     void native_texture_sweep();
@@ -5764,13 +5765,6 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                     const uint32_t i = __builtin_ctz(mask);
                     const uint32_t* t = d->tex[s][i];
                     const uint64_t res=d->tex_res[s][i];
-                    {
-                        ViewHandle vh;
-                        if(native_texture_view(d->tex_obj[s][i],res,t,slot_dim(t),vh)){
-                            use_native(s,i,vh);
-                            continue;
-                        }
-                    }
                     const uint64_t k=hash_bytes(t,32)^res;
                     const size_t home=k&(seen.size()-1);
                     Seen* vacant=nullptr;
@@ -5786,6 +5780,12 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                     if(already){if(already->resolved)use_native(s,i,already->native);continue;}
                     if(!vacant)vacant=&seen[home];
                     *vacant={k,epoch,res,t,{},false};
+                    // Engine textures: resolved once per descriptor per segment through the native table.
+                    if(ViewHandle vh;native_texture_view(d->tex_obj[s][i],res,t,slot_dim(t),vh)){
+                        vacant->native=vh;vacant->resolved=true;
+                        use_native(s,i,vh);
+                        continue;
+                    }
                     NativeView* cache=nullptr;
                     if(res&&!rc().lr){
                         const size_t home=k&(native_views.size()-4);
@@ -6308,10 +6308,11 @@ void Renderer::native_texture_event(uint64_t obj, uint64_t res, bool moved) {
     }
     const bool full = !j.streamed || (ts.width == j.full_w && ts.height == j.full_h);
     const uint32_t id = uint32_t(res >> 32);
-    bool copy = true;
+    bool copy = true, known = false;
     {
         std::shared_lock lk(ntex_mu);
         const auto it = ntex.find(obj);
+        known = it != ntex.end();
         if (it != ntex.end() && it->second.id == id && it->second.top != 0xff) {
             if (moved) return;
             if (!full && it->second.top <= 1) copy = false;
@@ -6330,12 +6331,13 @@ void Renderer::native_texture_event(uint64_t obj, uint64_t res, bool moved) {
         }
     }
     ntex_snapshot_ns += now_ns() - t0;
-    {
+    if (!known) {
         // Announce the object now: from here on its draws resolve only through this table,
         // even before the loader has uploaded anything.
         std::unique_lock lk(ntex_mu);
         auto& e = ntex[obj];
         if (!e.img) e.id = id;
+        ++ntex_gen;
     }
     {
         std::lock_guard lk(ntex_qm);
@@ -6354,6 +6356,7 @@ void Renderer::native_texture_load(NativeTextureJob& j) {
         if (it != ntex.end() && it->second.id == id && it->second.top != 0xff) {
             it->second.top = std::max<uint8_t>(it->second.top, 1);
             ++ntex_drops;
+            ++ntex_gen;
         }
         return;
     }
@@ -6472,6 +6475,7 @@ void Renderer::native_texture_load(NativeTextureJob& j) {
             ++ntex_created;
         }
         e.top = uint8_t(dst0);
+        ++ntex_gen;
     }
     if (old) { bury(std::move(old)); ++ntex_retired; }
     ++ntex_uploads;
@@ -6490,6 +6494,7 @@ void Renderer::native_texture_sweep() {
         bury(std::move(it->second.img));
         ++ntex_retired;
         it = ntex.erase(it);
+        ++ntex_gen;
     }
 }
 
@@ -6501,12 +6506,29 @@ bool Renderer::native_texture_view(uint64_t obj, uint64_t res, const uint32_t* t
     const auto ts = fmt::decode_tsharp(t);
     VkComponentMapping comp{swz(ts.dst_sel & 7), swz(ts.dst_sel >> 3 & 7), swz(ts.dst_sel >> 6 & 7),
                             swz(ts.dst_sel >> 9 & 7)};
+    // A per-thread cache of resolved views: valid until any texture's image or mips change.
+    struct CacheEntry { const Renderer* owner; uint64_t obj, res, gen; uint32_t words[8]; uint8_t dim; ViewHandle vh; bool owned; };
+    static thread_local std::vector<CacheEntry> cache(1u << 14);
+    ++ntex_lookups;
+    const uint64_t gen = ntex_gen.load(std::memory_order_acquire);
+    auto& ce = cache[(mix(obj, res) ^ hash_bytes(t, 32) ^ uint64_t(dim)) & (cache.size() - 1)];
+    if (ce.owner == this && ce.gen == gen && ce.obj == obj && ce.res == res && ce.dim == uint8_t(dim) &&
+        std::memcmp(ce.words, t, 32) == 0) {
+        if (!ce.owned) return false;
+        out = ce.vh;
+        return true;
+    }
+    ++ntex_misses;
+    auto remember = [&](bool owned, const ViewHandle& vh) {
+        ce.owner = this; ce.obj = obj; ce.res = res; ce.gen = gen; ce.dim = uint8_t(dim); ce.owned = owned; ce.vh = vh;
+        std::memcpy(ce.words, t, 32);
+    };
     Image* img = nullptr;
     uint32_t first = 0;
     {
         std::shared_lock r(ntex_mu);
         const auto it = ntex.find(obj);
-        if (it == ntex.end()) { ++ntex_unowned; return false; }  // not an engine texture (types 1-3)
+        if (it == ntex.end()) { ++ntex_unowned; remember(false, {}); return false; }  // not an engine texture
         if (!it->second.img || it->second.top == 0xff || it->second.id != uint32_t(res >> 32)) {
             const uint8_t kind = ts.nfmt == 4 ? 1u : ts.nfmt == 5 ? 2u : 0u;
             out = {dummy_views[int(dim) * 3 + kind], 0, uint8_t(dim), kind, kind == 0};
@@ -6518,7 +6540,7 @@ bool Renderer::native_texture_view(uint64_t obj, uint64_t res, const uint32_t* t
         first = (low ? 1u : 0u) + std::max(ts.base_level, (ts.min_lod + 255) >> 8);
         first = std::min(std::max<uint32_t>(first, it->second.top), img->levels - 1);
         // Existing views are only read here; they are created under the exclusive lock.
-        if (const ViewHandle* vh = existing_view(img, view_type(dim), comp, first)) { out = *vh; return true; }
+        if (const ViewHandle* vh = existing_view(img, view_type(dim), comp, first)) { out = *vh; remember(true, out); return true; }
     }
     std::unique_lock w(ntex_mu);
     const auto it = ntex.find(obj);
@@ -6528,6 +6550,7 @@ bool Renderer::native_texture_view(uint64_t obj, uint64_t res, const uint32_t* t
         return true;
     }
     out = view(img, view_type(dim), comp, first, false);
+    remember(true, out);
     return true;
 }
 
@@ -8126,9 +8149,13 @@ void print_stats() {
     log("native renderer: persistent native material views: %llu hits, %llu misses",
         (unsigned long long)g->native_view_cache_hits,(unsigned long long)g->native_view_cache_misses);
     g->native_view_cache_hits=g->native_view_cache_misses=0;
-    log("native renderer: CPU detail ms/frame: writes %.2f, material preparation %.2f, geometry preparation %.2f, feedback %.2f, run binding resolution %.2f, worker wall %.2f (wait %.2f)",
-        g->t_pre_writes/fr/1e6,g->t_pre_views/fr/1e6,g->t_pre_geometry/fr/1e6,
-        g->t_run_feedback/fr/1e6,g->t_run_resolve/fr/1e6,g->t_run_worker_wall/fr/1e6,g->t_run_worker_wait/fr/1e6);
+    {
+        // Same interval as "CPU per frame" (these counters reset with it), not the whole run.
+        const double fi = double(std::max<uint64_t>(1, s.frames - s.t_frames));
+        log("native renderer: CPU detail ms/frame: pre-pass = writes %.2f + targets %.2f + material preparation %.2f + geometry preparation %.2f; feedback %.2f, run binding resolution %.2f, worker wall %.2f (wait %.2f)",
+            g->t_pre_writes/fi/1e6,double(s.t_tgt)/fi/1e6,g->t_pre_views/fi/1e6,g->t_pre_geometry/fi/1e6,
+            g->t_run_feedback/fi/1e6,g->t_run_resolve/fi/1e6,g->t_run_worker_wall/fi/1e6,g->t_run_worker_wait/fi/1e6);
+    }
     g->t_pre_writes=g->t_pre_views=g->t_pre_geometry=g->t_run_feedback=g->t_run_resolve=g->t_run_worker_wall=g->t_run_worker_wait=0;
     log("native renderer: %llu prepared native geometry bindings consumed without recording-thread resource lookup",(unsigned long long)g->native_geometry_bindings);
     g->native_geometry_bindings=0;
@@ -8199,13 +8226,16 @@ void print_stats() {
                 for (const auto& [o, e] : g->ntex) live += e.img != nullptr;
             }
             log("native renderer: native textures: %zu live, %llu events, %llu uploads (%.1f MiB), %llu top mips dropped, "
-                "%llu images created, %llu retired, %llu rejected, %llu draws before first upload, %llu registered textures not owned | loader %.1f ms, "
+                "%llu images created, %llu retired, %llu rejected, %llu draws before first upload, %llu registered textures not owned, "
+                "%llu view lookups (%llu resolved, %llu table changes) | loader %.1f ms, "
                 "engine-thread copies %.1f ms",
                 live, (unsigned long long)g->ntex_events.exchange(0), (unsigned long long)g->ntex_uploads.exchange(0),
                 double(g->ntex_bytes.exchange(0)) / 1048576.0, (unsigned long long)g->ntex_drops.exchange(0),
                 (unsigned long long)g->ntex_created.exchange(0), (unsigned long long)g->ntex_retired.exchange(0),
                 (unsigned long long)g->ntex_rejected.exchange(0), (unsigned long long)g->ntex_unready.exchange(0),
                 (unsigned long long)g->ntex_unowned.exchange(0),
+                (unsigned long long)g->ntex_lookups.exchange(0), (unsigned long long)g->ntex_misses.exchange(0),
+                (unsigned long long)(g->ntex_gen.load() - g->ntex_gens.exchange(g->ntex_gen.load())),
                 double(g->ntex_ns.exchange(0)) / 1e6, double(g->ntex_snapshot_ns.exchange(0)) / 1e6);
         }
         log("native renderer: texture failures since last report: %llu mapped range, %llu split descriptor, %llu upload, %llu valid low chains retained",
