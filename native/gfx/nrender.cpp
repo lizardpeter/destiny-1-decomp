@@ -1403,6 +1403,7 @@ struct Renderer {
     uint64_t par_runs = 0, par_draws = 0;
     uint64_t native_stage_reuse=0,inline_run_draws=0,inline_runs=0;
     uint64_t native_view_cache_hits=0,native_view_cache_misses=0;
+    uint64_t t_pre_shader_ident=0,t_pre_shader_mask=0;
     uint64_t t_pre_writes=0,t_pre_views=0,t_pre_geometry=0,t_run_resolve=0,t_run_feedback=0,
              t_run_worker_wall=0,t_run_worker_wait=0;
     uint64_t native_geometry_bindings=0;
@@ -5729,10 +5730,13 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     for (size_t di = 0; di < count; ++di) {
         Draw* d = draws[di];
         if(d->kind!=Draw::Indexed&&d->kind!=Draw::Auto)continue;
+        const uint64_t t_ident=now_ns();
         d->shader_res[0]=d->vs&&opt.res_current?opt.res_current(uint64_t(d->vs)):0;
         d->shader_res[1]=d->ps&&opt.res_current?opt.res_current(uint64_t(d->ps)):0;
+        const uint64_t t_mask=now_ns();
         d->active_tex_mask[0]=d->tex_mask[0]&shader_slots(shader_tex_mask64(d->vs,true,d->shader_res[0]));
         d->active_tex_mask[1]=d->tex_mask[1]&shader_slots(shader_tex_mask64(d->ps,false,d->shader_res[1]));
+        t_pre_shader_ident+=t_mask-t_ident;t_pre_shader_mask+=now_ns()-t_mask;
         d->native_tex_ready[0]=d->native_tex_ready[1]=0;
         d->native_geo_mask=0;
         d->tex_filter_mask[0]=d->tex_filter_mask[1]=0;
@@ -8152,10 +8156,11 @@ void print_stats() {
     {
         // Same interval as "CPU per frame" (these counters reset with it), not the whole run.
         const double fi = double(std::max<uint64_t>(1, s.frames - s.t_frames));
-        log("native renderer: CPU detail ms/frame: pre-pass = writes %.2f + targets %.2f + material preparation %.2f + geometry preparation %.2f; feedback %.2f, run binding resolution %.2f, worker wall %.2f (wait %.2f)",
-            g->t_pre_writes/fi/1e6,double(s.t_tgt)/fi/1e6,g->t_pre_views/fi/1e6,g->t_pre_geometry/fi/1e6,
+        log("native renderer: CPU detail ms/frame: pre-pass = writes %.2f + targets %.2f + material preparation %.2f (shader identity %.2f, shader slot masks %.2f) + geometry preparation %.2f; feedback %.2f, run binding resolution %.2f, worker wall %.2f (wait %.2f)",
+            g->t_pre_writes/fi/1e6,double(s.t_tgt)/fi/1e6,g->t_pre_views/fi/1e6,g->t_pre_shader_ident/fi/1e6,g->t_pre_shader_mask/fi/1e6,g->t_pre_geometry/fi/1e6,
             g->t_run_feedback/fi/1e6,g->t_run_resolve/fi/1e6,g->t_run_worker_wall/fi/1e6,g->t_run_worker_wait/fi/1e6);
     }
+    g->t_pre_shader_ident=g->t_pre_shader_mask=0;
     g->t_pre_writes=g->t_pre_views=g->t_pre_geometry=g->t_run_feedback=g->t_run_resolve=g->t_run_worker_wall=g->t_run_worker_wait=0;
     log("native renderer: %llu prepared native geometry bindings consumed without recording-thread resource lookup",(unsigned long long)g->native_geometry_bindings);
     g->native_geometry_bindings=0;

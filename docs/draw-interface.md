@@ -59,6 +59,23 @@ The context calls are already no-ops. Step 2 replaces the register words themsel
 native state built once from the engine's preset tables (`015d16c4` blend, `015d2394` depth,
 `015d2424` polygon offset, `015d1cd0`/`015d1d70` stencil).
 
+### Measured: where the serial pre-pass goes
+
+Earth patrol, lavapipe, about 7,900 draws per frame (`CPU detail` line in the renderer statistics):
+
+| Part | ms per frame |
+|---|---|
+| Render-target resolution | 0.9-2.7 |
+| Material preparation | 9-39 |
+| of which shader identity lookups (2 per draw) | 1.6-3.8 |
+| of which shader texture-slot masks (2 per draw) | 1.5-2.6 |
+| of which per-slot texture descriptor hashing, segment cache probes and view resolution | the rest |
+| Geometry preparation | 4.6-8.7 |
+
+All of it is the renderer re-deriving, once per draw and on one thread, what the engine already decided
+when it called a setter. Tuning these loops would be another patch on the translator; step 3 removes
+them, because the draw is recorded with the state the setters already resolved.
+
 ## Target
 
 - **Setters keep only the engine's own state.** Each one updates exactly the `D` fields its original
