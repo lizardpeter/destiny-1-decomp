@@ -90,6 +90,27 @@ All of it is the renderer re-deriving, once per draw and on one thread, what the
 when it called a setter. Tuning these loops would be another patch on the translator; step 3 removes
 them, because the draw is recorded with the state the setters already resolved.
 
+### Render targets: identified by surface, not by draw order
+
+Measured in Earth patrol: about 37% of all texture reads in a frame (about 26,000) sample the game's own
+render targets, through about 110 engine objects over about 60 addresses. None of them are engine
+resources. The engine itself names a target by its surface: the render-target table at `026f2398`
+(entries of `0xe0` bytes: a Gnm render target at `+0xa0`, its T# at `+0xcc`; `0081b130` builds a
+target set from entry ids, `0081c5a0` binds it through `007dfd10`) hands out T# copies, and the sampling
+code keeps those copies in its own structures. Most target sets are built on the stack per call.
+
+The renderer used to give a T# the image drawn into its address most recently. That answer depends on
+the order lists reach the renderer, which rules out recording lists on the engine threads. Now a T#
+gets the image whose surface it describes: same address, size and format. 99.7% of sampled targets
+match exactly one image that way; depth (sampled through a colour format) matches by size. The rare
+rest, a T# whose size matches no target at its address (34x34 over an 80x45 target in the
+dynamic-texture slots, likely drawn by one of the dropped helper draws above), still gets the
+address's current target.
+
+Still order-dependent, to be replaced before lists are recorded on engine threads: targets the CPU
+rewrites (`target_current`), feedback copies of attachments a pass samples, occlusion queries and
+predication, and GPU results read back into guest memory.
+
 ## Target
 
 - **Setters keep only the engine's own state.** Each one updates exactly the `D` fields its original
