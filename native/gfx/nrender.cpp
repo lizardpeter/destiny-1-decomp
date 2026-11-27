@@ -3397,14 +3397,21 @@ Buffer* Renderer::geometry_staging(uint64_t bytes, StagingSpan& span) {
     return &sb.geo_staging.back();
 }
 
+// Prepared geometry belongs to the engine object, not to one of its events. A resource identity is
+// (object id << 32 | event count): binding a new resource into an object gives a new object id;
+// moves and re-points only bump the count and leave the bytes as they were (measured in Earth
+// patrol: about 20,000 buffer moves, none with changed contents). So the prepared copy survives
+// moves instead of being copied and uploaded again, with draws missing it in the meantime.
+static inline uint64_t geo_owner(uint64_t res) { return res & ~0xFFFFFFFFull; }
+
 void Renderer::capture_geometry(const Draw::Res& res,bool cpu_required){
     if(!res.id||!res.object||res.base<0x10000||!res.size||res.size>=(64ull<<20))return;
-    const GeometryKey resident_key{res.id,0,res.size,0,0};
+    const GeometryKey resident_key{geo_owner(res.id),0,res.size,0,0};
     auto& sh=geo_shards[(uint64_t(GeometryKeyHash{}(resident_key))*0x9E3779B97F4A7C15ull)>>58];
     if(!cpu_required){
         std::lock_guard lk(sh.m);
         const auto i=sh.map.find(resident_key);
-        if(i!=sh.map.end()&&i->second.valid&&i->second.res==res.id)return;
+        if(i!=sh.map.end()&&i->second.valid&&geo_owner(i->second.res)==geo_owner(res.id))return;
     }
     const GeometryKey key{res.id,res.base,res.size,0,0};
     ++geometry_source_requests;
@@ -3424,12 +3431,12 @@ void Renderer::capture_geometry(const Draw::Res& res,bool cpu_required){
 bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot, uint64_t object, const MappingSpans* mapping,GeoHit* prepared) {
     if (!res.id || res.base < 0x10000 || !res.size || res.size >= (64ull << 20) ||
         rc().cur == UINT32_MAX || (rc().lr&&!snapshot)) return false;
-    const GeometryKey key{res.id, 0, res.size, 0, 0};
+    const GeometryKey key{geo_owner(res.id), 0, res.size, 0, 0};
     GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
     std::unique_lock lk(sh.m);
     GeoEntry& e = sh.map[key];
     e.last_used = submit_seq.load(std::memory_order_relaxed);
-    if(e.valid&&e.res==res.id){
+    if(e.valid&&geo_owner(e.res)==geo_owner(res.id)){
         __atomic_fetch_add(&st.geo_res_hits,1,__ATOMIC_RELAXED);
         if(prepared)*prepared={geo_blocks[size_t(e.block)].buf.buf,e.off,e.size,e.vfirst,e.vlast};
         return false;
@@ -6161,11 +6168,11 @@ void Renderer::load_buffer(const LoadJob& j) {
     if (j.base < 0x10000 || !j.size || j.size >= (64ull << 20) || j.mapping.empty()) return;
     if(!opt.res_current||opt.res_current(j.obj)!=j.res){++ld_stale;return;}
     {
-        const GeometryKey key{j.res,0,j.size,0,0};
+        const GeometryKey key{geo_owner(j.res),0,j.size,0,0};
         auto& sh=geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
         std::lock_guard lk(sh.m);
         const auto it=sh.map.find(key);
-        if(it!=sh.map.end()&&it->second.valid&&it->second.res==j.res){++ld_skipped;return;}
+        if(it!=sh.map.end()&&it->second.valid&&geo_owner(it->second.res)==geo_owner(j.res)){++ld_skipped;return;}
     }
     // The loader and first draw share the same immutable source claim.
     // Only the first claimant copies from the original allocation; the
@@ -6628,11 +6635,11 @@ void Renderer::resolve_material(Draw* d) {
 
 bool Renderer::lookup_local_geometry(const Draw::Res& r, Draw::NativeGeometry& out) {
     if (!r.id || r.base < 0x10000 || !r.size || r.size >= (64ull << 20)) return false;
-    const GeometryKey key{r.id, 0, r.size, 0, 0};
+    const GeometryKey key{geo_owner(r.id), 0, r.size, 0, 0};
     GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key)) * 0x9E3779B97F4A7C15ull) >> 58];
     std::lock_guard lk(sh.m);
     const auto it = sh.map.find(key);
-    if (it == sh.map.end() || !it->second.valid || it->second.res != r.id) return false;
+    if (it == sh.map.end() || !it->second.valid || geo_owner(it->second.res) != geo_owner(r.id)) return false;
     it->second.last_used = submit_seq.load(std::memory_order_relaxed);
     __atomic_fetch_add(&st.geo_res_hits, 1, __ATOMIC_RELAXED);
     out = {uint64_t(geo_blocks[size_t(it->second.block)].buf.buf), it->second.off};
