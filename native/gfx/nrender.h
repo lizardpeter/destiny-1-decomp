@@ -44,6 +44,7 @@ struct Draw {
     uint16_t tex_mask[kStages] = {}, smp_mask[kStages] = {};
     uint16_t active_tex_mask[kStages] = {}; // published translator mask, intersected with captured bindings
     uint16_t native_tex_ready[kStages] = {}; // registered resident views resolved during resource preparation
+    uint32_t geo_captured = 0;             // native_geo slots (bit 16: index buffer) resolved at capture
     bool material_ready = false;           // shader identity, slot masks and engine texture views resolved at capture
     const uint32_t* T(int s, uint32_t i) const { return (tex_mask[s] >> (i & 15) & 1) ? tex[s][i & 15] : nullptr; }
     const uint32_t* S(int s, uint32_t i) const { return (smp_mask[s] >> (i & 15) & 1) ? smp[s][i & 15] : nullptr; }

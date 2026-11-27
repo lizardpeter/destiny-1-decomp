@@ -915,6 +915,7 @@ struct Renderer {
     void native_texture_sweep();
     bool native_texture_view(uint64_t obj, uint64_t res, const uint32_t* t, gcn::TexDim dim, ViewHandle& out);
     void resolve_material(Draw* d);
+    bool lookup_local_geometry(const Draw::Res& r, Draw::NativeGeometry& out);
     void load_buffer(const LoadJob& j);
     void load_shader(const LoadJob& j);
     void prefetch(const LoadJob& j) {
@@ -5731,7 +5732,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     for (size_t di = 0; di < count; ++di) {
         Draw* d = draws[di];
         if(d->kind!=Draw::Indexed&&d->kind!=Draw::Auto)continue;
-        d->native_geo_mask=0;
+        d->native_geo_mask=d->geo_captured;
         if(!d->material_ready){
             const uint64_t t_ident=now_ns();
             d->shader_res[0]=d->vs&&opt.res_current?opt.res_current(uint64_t(d->vs)):0;
@@ -5862,12 +5863,18 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                 d.native_geo[slot]=native;d.native_geo_mask|=1u<<slot;
             }
         };
+        auto live_vertex_slots=[](const Draw& d){
+            uint32_t m=0;
+            for(unsigned slot=0;slot<16;++slot)if(d.vres[slot].id&&d.vres[slot].size)m|=1u<<slot;
+            return m;
+        };
         const Draw* prev=nullptr;
         for(size_t di=0;di<count;++di){
             Draw& d=*draws[di];
             if(d.kind!=Draw::Indexed&&d.kind!=Draw::Auto)continue;
-            d.native_geo_mask=0;
-            if(d.kind==Draw::Indexed){
+            d.native_geo_mask=d.geo_captured;
+            if(d.geo_captured==((d.kind==Draw::Indexed?1u<<16:0u)|(d.inline_vertices.empty()?live_vertex_slots(d):0u))){prev=&d;continue;}
+            if(d.kind==Draw::Indexed&&!(d.geo_captured>>16&1)){
                 if(prev&&prev->kind==Draw::Indexed&&std::memcmp(&d.ires,&prev->ires,sizeof d.ires)==0){
                     if(prev->native_geo_mask&(1u<<16)){
                         d.native_geo[16]=prev->native_geo[16];d.native_geo_mask|=1u<<16;
@@ -5881,7 +5888,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                         const unsigned slot=__builtin_ctz(m);d.native_geo[slot]=prev->native_geo[slot];
                     }
                     d.native_geo_mask|=mask;
-                }else for(unsigned slot=0;slot<16;++slot)prepare(d,slot,d.vres[slot]);
+                }else for(unsigned slot=0;slot<16;++slot)if(!(d.geo_captured>>slot&1))prepare(d,slot,d.vres[slot]);
             }
             prev=&d;
         }
@@ -6587,6 +6594,32 @@ void Renderer::resolve_material(Draw* d) {
             if (vh.filterable) d->tex_filter_mask[s] |= bit;
         }
     d->material_ready = true;
+    // Engine vertex and index buffers already prepared on the GPU: bind them directly. Buffers not
+    // prepared yet are left to the recording pass, which uploads them.
+    d->native_geo_mask = d->geo_captured = 0;
+    auto take = [&](unsigned slot, const Draw::Res& r) {
+        if (Draw::NativeGeometry g; lookup_local_geometry(r, g)) {
+            d->native_geo[slot] = g;
+            d->native_geo_mask |= 1u << slot;
+            d->geo_captured |= 1u << slot;
+        }
+    };
+    if (d->kind == Draw::Indexed) take(16, d->ires);
+    if (d->inline_vertices.empty())
+        for (unsigned slot = 0; slot < 16; ++slot) take(slot, d->vres[slot]);
+}
+
+bool Renderer::lookup_local_geometry(const Draw::Res& r, Draw::NativeGeometry& out) {
+    if (!r.id || r.base < 0x10000 || !r.size || r.size >= (64ull << 20)) return false;
+    const GeometryKey key{r.id, 0, r.size, 0, 0};
+    GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key)) * 0x9E3779B97F4A7C15ull) >> 58];
+    std::lock_guard lk(sh.m);
+    const auto it = sh.map.find(key);
+    if (it == sh.map.end() || !it->second.valid || it->second.res != r.id) return false;
+    it->second.last_used = submit_seq.load(std::memory_order_relaxed);
+    __atomic_fetch_add(&st.geo_res_hits, 1, __ATOMIC_RELAXED);
+    out = {uint64_t(geo_blocks[size_t(it->second.block)].buf.buf), it->second.off};
+    return true;
 }
 
 // Exact source geometry for ordinary 1D/2D split textures. Cube and
