@@ -258,7 +258,7 @@ void prefetch(uint32_t type, uint64_t o) {
         return;
     }
     if (type >= 1 && type <= 3) {
-        ng::prefetch_texture(reinterpret_cast<const uint32_t*>(o), res, o);
+        ng::native_texture_event(o, res, false);
     } else if(type==4||type==6) {
         const auto b=type==4?ng::binding::vertex_source(reinterpret_cast<const void*>(o)):
                              ng::binding::index_source(reinterpret_cast<const void*>(o));
@@ -377,7 +377,6 @@ ng::Draw* capture(uint64_t dev,uint32_t engine_prim,uint64_t caller=0,bool captu
                     d->tex_mask[s] |= uint16_t(1u << i);
                     d->tex_res[s][i]=after;
                     d->tex_obj[s][i]=t;
-                    if(leases&&leases->pin_source(d->tex[s][i],after))ng::capture_texture_source(d->tex[s][i],after,t);
                 }
             }
             if (const uint64_t p = field<uint64_t>(dev, (s ? 0x2278 : 0x22F8) + i * 8); p >= 0x10000) {
@@ -831,7 +830,11 @@ bool resource_bind(uint32_t type,uint32_t handle,uint64_t addr,bool repoint,bool
                 // Publish once from the already resolved object. Geometry
                 // creation takes a native byte range directly from this event.
                 if(paired&&texture_transaction.owns_lock())pending_mip_bind=std::move(texture_transaction);
-                else {nr::resreg::touch(obj,true,handle);nr::resreg::prefetch(type,obj);}
+                else {
+                    nr::resreg::touch(obj,true,handle);
+                    if(type>=1&&type<=3)ng::native_texture_event(obj,nr::resreg::get(obj),repoint);
+                    else nr::resreg::prefetch(type,obj);
+                }
             }
             return true;
         }
@@ -1396,23 +1399,6 @@ D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
     // A descriptor and its two source allocations belong to one published
     // generation. Draw capture cannot observe the constructor's partial writes.
     auto transaction=pending_mip_bind.owns_lock()?std::move(pending_mip_bind):ng::texture_leases().retire();
-    alignas(32) uint32_t low_descriptor[8]{};
-    const uint32_t* low=nullptr;
-    const uint64_t before=nr::resreg::object_of(1,handle);
-    if(before&&low_base&&hi_base&&guest_region_extent(before)>=0x44&&field<uint8_t>(before,0x34)){
-        const auto p=ng::binding::mip_plan(reinterpret_cast<const void*>(before),low_base,0);
-        if(!p.volume&&p.levels&&p.levels<=16){
-            std::memcpy(low_descriptor,reinterpret_cast<const void*>(before),32);
-            const auto old=fmt::decode_tsharp(low_descriptor);
-            if(old.width==p.width&&old.height==p.height&&old.last_level+1==p.levels){
-                ng::binding::mip_base(low_descriptor,low_base);low=low_descriptor;
-            }else{
-                using Construct2D=D1_SYSV uint64_t(*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
-                const auto bytes=reinterpret_cast<Construct2D>(nr::g_base+0xF83530)(low_descriptor,p.width,p.height,1,p.levels,p.format,p.tile,p.fragments,uint32_t(p.cube));
-                if(bytes){ng::binding::mip_base(low_descriptor,low_base);low=low_descriptor;}
-            }
-        }
-    }
     {
         const uint64_t obj=nr::resreg::object_of(1,handle);
         if(!obj)return;
@@ -1433,11 +1419,7 @@ D1_SYSV void h_mips(uint32_t handle, uint64_t low_base, uint64_t hi_base) {
         // Do not associate this callback's addresses with a newer epoch
         // published by another resource event between touch and lookup.
         const uint64_t res=nr::resreg::touch(o,true,handle);
-        if (res && ng::active() && nr::resreg::get(o)==res) {
-            ng::notify_texture_mips(reinterpret_cast<const uint32_t*>(o),res,o,low_base,hi_base,low,
-                low_base&&low_base==mip_bounds.low?mip_bounds.low_size:0,
-                hi_base&&hi_base==mip_bounds.high?mip_bounds.high_size:0);
-        }
+        if (res && ng::active() && nr::resreg::get(o)==res) ng::native_texture_event(o,res,false);
     }
 }
 D1_SYSV bool h_resident(uint32_t handle) {

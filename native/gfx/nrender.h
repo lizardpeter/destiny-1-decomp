@@ -115,11 +115,9 @@ bool list_recording();
 bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late);
 void fill_late(const LateCb& l, uint64_t src, uint32_t size);
 void submit_recorded(const std::vector<uint32_t>& handles);
-void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj);
-// Called only with the texture capture gate held, once per list/epoch.
-void capture_texture_source(const uint32_t* tsharp,uint64_t res,uint64_t obj);
-void notify_texture_mips(const uint32_t* tsharp, uint64_t res, uint64_t obj, uint64_t low_base, uint64_t hi_base,
-                         const uint32_t* low_descriptor=nullptr,uint64_t low_bytes=0,uint64_t hi_bytes=0);
+// The engine bound a texture (resource types 1-3), moved its memory, or changed its resident
+// mips; its descriptor at `obj` is current. The renderer owns one image per texture object.
+void native_texture_event(uint64_t obj, uint64_t res, bool moved);
 void prefetch_buffer(uint64_t base, uint64_t size, uint64_t res, uint64_t obj);
 // Exact native geometry source ownership, called under the resource capture gate.
 void capture_geometry_source(const Draw::Res& resource,bool cpu_required=false);

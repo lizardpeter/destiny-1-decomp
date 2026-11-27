@@ -880,6 +880,39 @@ struct Renderer {
     void start_loader();
     void load_texture(const LoadJob& j);
     void load_split_texture(const LoadJob& j);
+
+    // Native textures (docs/native-port-plan.md, piece 1). One GPU image per engine texture
+    // object (resource types 1-3), owned for as long as the engine's resource identity lasts.
+    // The engine's own events drive it: a bind and every resident-mips change hand over the
+    // descriptor the engine just built. The image always has the authored full mip chain; a
+    // streamed texture's sharp top mip is uploaded into it when it arrives, and dropping it only
+    // moves the lowest viewed mip. Nothing is keyed by, or inferred from, a memory address.
+    struct NativeTexture {
+        std::unique_ptr<Image> img;
+        uint32_t id = 0;        // engine resource id (identity >> 32)
+        uint8_t top = 0xff;     // lowest mip with valid contents; 0xff before the first upload
+        bool streamed = false;  // authored with a separately streamed top mip
+    };
+    struct NativeTextureJob {
+        uint64_t obj = 0, res = 0;
+        uint32_t words[8]{};
+        uint16_t full_w = 0, full_h = 0, full_d = 1;
+        uint8_t full_mips = 0;
+        bool streamed = false;
+        std::vector<uint8_t> tiled;  // empty: the top mip was dropped, nothing to upload
+    };
+    std::shared_mutex ntex_mu;  // the table; taken after m when both are needed
+    std::unordered_map<uint64_t, NativeTexture> ntex;  // key: engine texture object
+    std::mutex ntex_qm;
+    std::condition_variable ntex_cv;
+    std::deque<NativeTextureJob> ntex_q;
+    bool ntex_on = false;
+    std::atomic<uint64_t> ntex_events{0}, ntex_uploads{0}, ntex_drops{0}, ntex_created{0}, ntex_retired{0},
+        ntex_rejected{0}, ntex_unready{0}, ntex_unowned{0}, ntex_bytes{0}, ntex_ns{0}, ntex_snapshot_ns{0};
+    void native_texture_event(uint64_t obj, uint64_t res, bool moved);
+    void native_texture_load(NativeTextureJob& j);
+    void native_texture_sweep();
+    bool native_texture_view(uint64_t obj, uint64_t res, const uint32_t* t, gcn::TexDim dim, ViewHandle& out);
     void load_buffer(const LoadJob& j);
     void load_shader(const LoadJob& j);
     void prefetch(const LoadJob& j) {
@@ -1257,6 +1290,7 @@ struct Renderer {
     }
     StreamMipInfo get_stream_info(uint64_t res, uint64_t obj, const fmt::TSharp& ts, const uint32_t* words);
     ViewHandle texture_view(const uint32_t* t, gcn::TexDim dim, uint64_t res = 0, Image* prepared_image=nullptr);
+    const ViewHandle* existing_view(Image* img, VkImageViewType type, VkComponentMapping comp, uint32_t base_level);
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
     Image* upload_texture(const uint32_t* t, uint64_t res = 0, uint64_t obj = 0,
                           const uint8_t* prepared = nullptr, uint64_t prepared_size = 0,
@@ -2277,6 +2311,19 @@ std::unique_ptr<Image> Renderer::make_image(VkFormat f, uint32_t w, uint32_t h, 
     // making views is slow on some drivers
     if (!bc && !is3d) img->att_aspect = b.subresourceRange.aspectMask;
     return img;
+}
+
+// The view view() would return, if it already exists; never creates one.
+const ViewHandle* Renderer::existing_view(Image* img, VkImageViewType type, VkComponentMapping comp, uint32_t base_level) {
+    if (img->is3d) type = VK_IMAGE_VIEW_TYPE_3D;
+    if (type == VK_IMAGE_VIEW_TYPE_CUBE && (!img->cube || img->layers < 6)) type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    if (type == VK_IMAGE_VIEW_TYPE_3D && !img->is3d) type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    const uint64_t key = mix(mix(mix(type, uint64_t(comp.r) | uint64_t(comp.g) << 8 | uint64_t(comp.b) << 16 |
+                                               uint64_t(comp.a) << 24),
+                                 base_level),
+                             uint64_t(false) | uint64_t(false) << 1);
+    const auto it = img->views.find(key);
+    return it != img->views.end() ? &it->second : nullptr;
 }
 
 ViewHandle Renderer::view(Image* img, VkImageViewType type, VkComponentMapping comp, uint32_t base_level,
@@ -5037,6 +5084,14 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
                 const uint32_t* T = dr.tex[s][slot];
                 const gcn::TexDim dim = slot_dim(T);
                 const uint64_t tres = dr.tex_res[s][slot];
+                if (ViewHandle nv; native_texture_view(dr.tex_obj[s][slot], tres, T, dim, nv)) {
+                    const uint8_t dk = uint8_t((nv.dim & 3) | ((nv.kind & 3) << 2));
+                    dr.tex_view[s][slot] = nv.id;
+                    dr.tex_dk[s][slot] = dk;
+                    if (nv.filterable) fmask |= bit;
+                    tsig |= uint64_t(dk & 0xF) << (slot * 4);
+                    continue;
+                }
                 const uint64_t key = (hash_bytes(T, 32) ^ tres * 0xC2B2AE3D27D4EB4Full) ^
                                      (uint64_t(dim) + 1) * 0x9E3779B97F4A7C15ull;
                 TvEntry& e = tvc[key & 4095];
@@ -5709,6 +5764,13 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                     const uint32_t i = __builtin_ctz(mask);
                     const uint32_t* t = d->tex[s][i];
                     const uint64_t res=d->tex_res[s][i];
+                    {
+                        ViewHandle vh;
+                        if(native_texture_view(d->tex_obj[s][i],res,t,slot_dim(t),vh)){
+                            use_native(s,i,vh);
+                            continue;
+                        }
+                    }
                     const uint64_t k=hash_bytes(t,32)^res;
                     const size_t home=k&(seen.size()-1);
                     Seen* vacant=nullptr;
@@ -6041,6 +6103,25 @@ void Renderer::start_loader() {
     });
     loader.detach();
     log("native renderer: engine resources are prepared on the native asset loader when the engine loads or moves them");
+    ntex_on = true;
+    std::thread([this] {
+        uint64_t last_sweep = now_ns();
+        for (;;) {
+            NativeTextureJob j;
+            {
+                std::unique_lock lk(ntex_qm);
+                ntex_cv.wait_for(lk, std::chrono::seconds(1), [&] { return !ntex_q.empty(); });
+                if (!ntex_q.empty()) { j = std::move(ntex_q.front()); ntex_q.pop_front(); }
+            }
+            if (j.obj) {
+                const uint64_t t0 = now_ns();
+                native_texture_load(j);
+                ntex_ns += now_ns() - t0;
+            }
+            if (now_ns() - last_sweep > 2000000000ull) { native_texture_sweep(); last_sweep = now_ns(); }
+        }
+    }).detach();
+    log("native renderer: engine textures are owned by engine object, one image each, built from the engine's bind and mip events");
 }
 
 void Renderer::load_buffer(const LoadJob& j) {
@@ -6183,6 +6264,271 @@ void Renderer::load_texture(const LoadJob& j) {
     begin_record();
     if (up_rec.cur == UINT32_MAX) return;
     if (upload_texture(t,j.res,j.obj,scratch.data(),total,sf.total_size,content)) ++ld_tex;
+}
+
+// ---- Native textures -----------------------------------------------------------------------
+// The tiled layout a texture descriptor describes: every level, array slice and cube face.
+static bool native_texture_surface(const fmt::TSharp& ts, const fmt::FormatInfo& fi, tiling::Surface& sf) {
+    if (!ts.base || !fi.bpp || fi.bpp % 8 || fi.bpp == 96 || ts.width > 16384 || ts.height > 16384) return false;
+    const bool is3d = ts.type == 10, cube = ts.type == 11;
+    sf.tile_mode = ts.tiling; sf.bpp = fi.bpp; sf.block = fi.block; sf.pow2 = ts.pow2;
+    sf.width = ts.width; sf.height = ts.height; sf.pitch = ts.pitch;
+    sf.depth = is3d ? ts.depth : 1;
+    sf.layers = (ts.type == 12 || ts.type == 13 || cube) ? ts.last_array + 1 : 1;
+    if (cube) sf.layers = std::max(6u, sf.layers - sf.layers % 6);
+    sf.stored_layers = cube ? ts.depth * 6u : (ts.type == 12 || ts.type == 13) ? ts.depth : 1u;
+    sf.levels = std::min(ts.last_level + 1, tiling::kMaxMips);
+    tiling::layout(sf);
+    return sf.total_size != 0;
+}
+
+// Engine thread, inside the bind or resident-mips callback, right after the engine wrote the
+// texture's new descriptor: its source bytes are valid now. Copy exactly what the descriptor
+// describes and hand it to the native texture loader. A move keeps the contents, and dropping
+// the top mip keeps mips 1.. as they are, so neither copies anything.
+void Renderer::native_texture_event(uint64_t obj, uint64_t res, bool moved) {
+    if (!ntex_on || obj < 0x10000 || !res || guest_region_extent(obj) < 0x44) return;
+    const uint64_t t0 = now_ns();
+    ++ntex_events;
+    NativeTextureJob j;
+    j.obj = obj; j.res = res;
+    std::memcpy(j.words, reinterpret_cast<const void*>(obj), 32);
+    const auto* tag = reinterpret_cast<const uint8_t*>(obj);
+    std::memcpy(&j.full_w, tag + 0x28, 2);
+    std::memcpy(&j.full_h, tag + 0x2a, 2);
+    std::memcpy(&j.full_d, tag + 0x2c, 2);
+    j.full_mips = tag[0x31];
+    j.streamed = tag[0x34] != 0 && j.full_mips > 1;
+    const auto ts = fmt::decode_tsharp(j.words);
+    const auto fi = fmt::data_format(ts.dfmt);
+    tiling::Surface sf;
+    if (!native_texture_surface(ts, fi, sf) || fmt::vk_format(ts.dfmt, ts.nfmt) == VK_FORMAT_UNDEFINED) {
+        ++ntex_rejected;
+        return;
+    }
+    const bool full = !j.streamed || (ts.width == j.full_w && ts.height == j.full_h);
+    const uint32_t id = uint32_t(res >> 32);
+    bool copy = true;
+    {
+        std::shared_lock lk(ntex_mu);
+        const auto it = ntex.find(obj);
+        if (it != ntex.end() && it->second.id == id && it->second.top != 0xff) {
+            if (moved) return;
+            if (!full && it->second.top <= 1) copy = false;
+        }
+    }
+    if (copy) {
+        MappingSpans spans;
+        if (sf.total_size > (256ull << 20) || !guest_capture_read_spans(ts.base, sf.total_size, spans)) {
+            ++ntex_rejected;
+            return;
+        }
+        j.tiled.resize(sf.total_size);
+        if (!guest_copy_current_spans(ts.base, sf.total_size, spans, j.tiled.data())) {
+            ++ntex_rejected;
+            return;
+        }
+    }
+    ntex_snapshot_ns += now_ns() - t0;
+    {
+        // Announce the object now: from here on its draws resolve only through this table,
+        // even before the loader has uploaded anything.
+        std::unique_lock lk(ntex_mu);
+        auto& e = ntex[obj];
+        if (!e.img) e.id = id;
+    }
+    {
+        std::lock_guard lk(ntex_qm);
+        ntex_q.push_back(std::move(j));
+    }
+    ntex_cv.notify_one();
+}
+
+// Native texture loader thread: detile, create the image the first time, upload.
+void Renderer::native_texture_load(NativeTextureJob& j) {
+    const uint32_t id = uint32_t(j.res >> 32);
+    if (j.tiled.empty()) {
+        std::lock_guard lk(m);
+        std::unique_lock w(ntex_mu);
+        const auto it = ntex.find(j.obj);
+        if (it != ntex.end() && it->second.id == id && it->second.top != 0xff) {
+            it->second.top = std::max<uint8_t>(it->second.top, 1);
+            ++ntex_drops;
+        }
+        return;
+    }
+    const auto ts = fmt::decode_tsharp(j.words);
+    const auto fi = fmt::data_format(ts.dfmt);
+    const VkFormat f = fmt::vk_format(ts.dfmt, ts.nfmt);
+    tiling::Surface sf;
+    if (!native_texture_surface(ts, fi, sf) || j.tiled.size() != sf.total_size) { ++ntex_rejected; return; }
+    const bool is3d = ts.type == 10, cube = ts.type == 11;
+    const bool full = !j.streamed || (ts.width == j.full_w && ts.height == j.full_h);
+    const uint32_t dst0 = full ? 0 : 1;
+    const uint32_t full_w = j.streamed ? j.full_w : ts.width;
+    const uint32_t full_h = j.streamed ? j.full_h : ts.height;
+    const uint32_t full_d = is3d ? (j.streamed ? std::max<uint32_t>(1, j.full_d) : ts.depth) : 1;
+    const uint32_t levels = j.streamed ? j.full_mips : sf.levels;
+    if (!full_w || !full_h || !levels || levels > tiling::kMaxMips || dst0 >= levels) { ++ntex_rejected; return; }
+    const uint32_t n = std::min(sf.levels, levels - dst0);
+
+    // Every level the descriptor describes, linear, at the descriptor's own dimensions.
+    const uint32_t bytes = fi.bpp / 8, block = fi.block ? 4 : 1;
+    auto elems = [block](uint32_t v) { return (v + block - 1) / block; };
+    std::vector<uint64_t> soff(sf.levels), ssize(sf.levels);
+    uint64_t stotal = 0;
+    for (uint32_t lv = 0; lv < sf.levels; ++lv) {
+        const uint32_t slices = is3d ? std::max(1u, sf.depth >> lv) : sf.layers;
+        ssize[lv] = uint64_t(elems(std::max(1u, ts.width >> lv))) * elems(std::max(1u, ts.height >> lv)) * bytes * slices;
+        soff[lv] = stotal;
+        stotal += (ssize[lv] + 15) & ~15ull;
+    }
+    static thread_local std::vector<uint8_t> linear;
+    linear.resize(stotal);
+    const uint32_t missing = first_missing_mip(ts, fi, sf, is3d, j.tiled.data());
+    for (uint32_t lv = 0; lv < std::min(missing, sf.levels); ++lv)
+        tiling::detile(sf, lv, j.tiled.data(), linear.data() + soff[lv]);
+    if (missing < sf.levels) fill_missing_mips(missing, linear.data(), soff, ssize, ts, fi, sf, is3d);
+
+    // Destination levels dst0..dst0+n-1 of the full image. A compressed low descriptor is
+    // rounded up to whole blocks, so a source level can be wider than its destination.
+    std::vector<uint64_t> doff(n);
+    uint64_t dtotal = 0;
+    for (uint32_t k = 0; k < n; ++k) {
+        const uint32_t dl = dst0 + k;
+        const uint32_t sw = elems(std::max(1u, ts.width >> k)), sh = elems(std::max(1u, ts.height >> k));
+        const uint32_t dw = elems(std::max(1u, full_w >> dl)), dh = elems(std::max(1u, full_h >> dl));
+        const uint32_t ss = is3d ? std::max(1u, sf.depth >> k) : sf.layers;
+        const uint32_t ds = is3d ? std::max(1u, full_d >> dl) : sf.layers;
+        if (sw < dw || sh < dh || ss != ds) { ++ntex_rejected; return; }
+        doff[k] = dtotal;
+        dtotal += (uint64_t(dw) * dh * bytes * ds + 15) & ~15ull;
+    }
+
+    // The table lock is held only to look up and to publish; draws resolve views through it.
+    std::lock_guard lk(m);
+    Recorder* const previous = tr;
+    struct Restore { Recorder* p; ~Restore() { tr = p; } } restore{previous};
+    tr = &up_rec;
+    up_rec.lr = true;
+    if (up_rec.cur == UINT32_MAX) up_rec.submit_no = submit_seq.load(), begin_record();
+    if (up_rec.cur == UINT32_MAX) { ++ntex_rejected; return; }
+    Image* target = nullptr;
+    {
+        std::shared_lock r(ntex_mu);
+        const auto it = ntex.find(j.obj);
+        if (it != ntex.end()) {
+            const Image* cur = it->second.img.get();
+            if (cur && it->second.id == id && cur->format == f && cur->w == full_w && cur->h == full_h &&
+                cur->d == full_d && cur->layers == sf.layers && cur->levels == levels && cur->cube == cube &&
+                cur->is3d == is3d)
+                target = it->second.img.get();
+        }
+    }
+    std::unique_ptr<Image> fresh;
+    if (!target) {
+        fresh = make_image(f, full_w, full_h, full_d, sf.layers, levels, cube, is3d, false, false);
+        if (!fresh) { ++ntex_rejected; return; }
+        target = fresh.get();
+    }
+    Buffer sb;
+    const bool prefer_own = (ring_head - ring_oldest) + dtotal > (ring.size / 2);
+    uint64_t base_off = prefer_own ? UINT64_MAX : ring_alloc(std::max<uint64_t>(dtotal, 16), 256);
+    const bool own = base_off == UINT64_MAX;
+    if (!own) sb = ring, sb.map = ring.map + base_off;
+    else sb = make_buffer(std::max<uint64_t>(dtotal, 16), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true), base_off = 0;
+    if (!sb.map) { if (fresh) bury(std::move(fresh)); ++ntex_rejected; return; }
+    std::vector<VkBufferImageCopy> regions(n);
+    for (uint32_t k = 0; k < n; ++k) {
+        const uint32_t dl = dst0 + k;
+        const uint32_t sw = elems(std::max(1u, ts.width >> k)), sh = elems(std::max(1u, ts.height >> k));
+        const uint32_t dw = elems(std::max(1u, full_w >> dl)), dh = elems(std::max(1u, full_h >> dl));
+        const uint32_t slices = is3d ? std::max(1u, full_d >> dl) : sf.layers;
+        const uint8_t* src = linear.data() + soff[k];
+        uint8_t* dst = sb.map + doff[k];
+        if (sw == dw && sh == dh) std::memcpy(dst, src, uint64_t(dw) * dh * bytes * slices);
+        else for (uint32_t z = 0; z < slices; ++z)
+            for (uint32_t y = 0; y < dh; ++y)
+                std::memcpy(dst + (uint64_t(z) * dh + y) * dw * bytes, src + (uint64_t(z) * sh + y) * sw * bytes,
+                            uint64_t(dw) * bytes);
+        VkBufferImageCopy& r = regions[k];
+        r.bufferOffset = base_off + doff[k];
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, dl, 0, is3d ? 1u : sf.layers};
+        r.imageExtent = {std::max(1u, full_w >> dl), std::max(1u, full_h >> dl), is3d ? std::max(1u, full_d >> dl) : 1u};
+    }
+    before_upload(target);
+    vkCmdCopyBufferToImage(rc().cmd, sb.buf, target->image, VK_IMAGE_LAYOUT_GENERAL, n, regions.data());
+    if (own) subs[rc().cur].staging.push_back(sb);
+    flush_uploads();
+    std::unique_ptr<Image> old;
+    {
+        std::unique_lock w(ntex_mu);
+        auto& e = ntex[j.obj];
+        if (fresh) {
+            old = std::move(e.img);
+            e.img = std::move(fresh);
+            e.id = id;
+            e.streamed = j.streamed;
+            ++ntex_created;
+        }
+        e.top = uint8_t(dst0);
+    }
+    if (old) { bury(std::move(old)); ++ntex_retired; }
+    ++ntex_uploads;
+    ntex_bytes += dtotal;
+}
+
+// An engine texture object whose identity is gone (its package was unloaded, or the object now
+// holds another resource) no longer owns its image.
+void Renderer::native_texture_sweep() {
+    if (!opt.res_current) return;
+    std::lock_guard lk(m);
+    std::unique_lock w(ntex_mu);
+    for (auto it = ntex.begin(); it != ntex.end();) {
+        const uint64_t cur = opt.res_current(it->first);
+        if (cur && uint32_t(cur >> 32) == it->second.id) { ++it; continue; }
+        bury(std::move(it->second.img));
+        ++ntex_retired;
+        it = ntex.erase(it);
+    }
+}
+
+// The draw's descriptor is the one the engine had bound when the draw was captured: full
+// size (the top mip is wanted) or the half-size low chain. A top mip that has not arrived yet
+// is shown from mip 1, as the engine itself would before the sharp mip streams in.
+bool Renderer::native_texture_view(uint64_t obj, uint64_t res, const uint32_t* t, gcn::TexDim dim, ViewHandle& out) {
+    if (!ntex_on || !obj || !res) return false;
+    const auto ts = fmt::decode_tsharp(t);
+    VkComponentMapping comp{swz(ts.dst_sel & 7), swz(ts.dst_sel >> 3 & 7), swz(ts.dst_sel >> 6 & 7),
+                            swz(ts.dst_sel >> 9 & 7)};
+    Image* img = nullptr;
+    uint32_t first = 0;
+    {
+        std::shared_lock r(ntex_mu);
+        const auto it = ntex.find(obj);
+        if (it == ntex.end()) { ++ntex_unowned; return false; }  // not an engine texture (types 1-3)
+        if (!it->second.img || it->second.top == 0xff || it->second.id != uint32_t(res >> 32)) {
+            const uint8_t kind = ts.nfmt == 4 ? 1u : ts.nfmt == 5 ? 2u : 0u;
+            out = {dummy_views[int(dim) * 3 + kind], 0, uint8_t(dim), kind, kind == 0};
+            ++ntex_unready;
+            return true;
+        }
+        img = it->second.img.get();
+        const bool low = it->second.streamed && !(ts.width == img->w && ts.height == img->h);
+        first = (low ? 1u : 0u) + std::max(ts.base_level, (ts.min_lod + 255) >> 8);
+        first = std::min(std::max<uint32_t>(first, it->second.top), img->levels - 1);
+        // Existing views are only read here; they are created under the exclusive lock.
+        if (const ViewHandle* vh = existing_view(img, view_type(dim), comp, first)) { out = *vh; return true; }
+    }
+    std::unique_lock w(ntex_mu);
+    const auto it = ntex.find(obj);
+    if (it == ntex.end() || it->second.img.get() != img) {
+        const uint8_t kind = ts.nfmt == 4 ? 1u : ts.nfmt == 5 ? 2u : 0u;
+        out = {dummy_views[int(dim) * 3 + kind], 0, uint8_t(dim), kind, kind == 0};
+        return true;
+    }
+    out = view(img, view_type(dim), comp, first, false);
+    return true;
 }
 
 // Exact source geometry for ordinary 1D/2D split textures. Cube and
@@ -7511,112 +7857,8 @@ void fill_late(const LateCb& l, uint64_t src, uint32_t size) {
         while (cur < want && !h.compare_exchange_weak(cur, want)) {}
     }
 }
-void capture_texture_source(const uint32_t* tsharp,uint64_t res,uint64_t obj){
-    if(g)g->capture_owned_texture(tsharp,res,obj);
-}
-void prefetch_texture(const uint32_t* tsharp, uint64_t res, uint64_t obj) {
-    if (!g || !res || !g->load_on) return;
-    Renderer::LoadJob j{1,{},0,0,res,obj};
-    std::memcpy(j.t,tsharp,32);
-    const auto ts=fmt::decode_tsharp(j.t);
-    const auto fi=fmt::data_format(ts.dfmt);
-    if(!ts.base||!fi.bpp||fi.bpp==96||ts.width>16384||ts.height>16384)return;
-    if(ts.type!=10&&ts.type!=12&&ts.type!=13){
-        // A bind may precede 7D4480: its descriptor can still describe the
-        // low dimensions while its base points at the isolated high mip.
-        // Split textures have no contiguous prefetch path. Do not create
-        // speculative stream metadata as a side effect of rejecting the job.
-        if(!obj||!g->opt.res_current||g->opt.res_current(obj)!=res||guest_region_extent(obj)<0x44)return;
-        const auto has_hi=*reinterpret_cast<const uint8_t*>(obj+0x34);
-        if(g->opt.res_current(obj)!=res||has_hi)return;
-    }
-    tiling::Surface sf;
-    sf.tile_mode=ts.tiling;sf.bpp=fi.bpp;sf.block=fi.block;sf.pow2=ts.pow2;
-    sf.width=ts.width;sf.height=ts.height;sf.pitch=ts.pitch;
-    sf.depth=ts.type==10?ts.depth:1;
-    sf.layers=(ts.type==12||ts.type==13||ts.type==11)?ts.last_array+1:1;
-    if(ts.type==11)sf.layers=std::max(6u,sf.layers-sf.layers%6);
-    sf.stored_layers=ts.type==11?ts.depth*6u:(ts.type==12||ts.type==13)?ts.depth:1u;
-    sf.levels=std::min(ts.last_level+1,tiling::kMaxMips);
-    tiling::layout(sf);
-    j.base=ts.base;j.size=sf.total_size;
-    if(j.size&&j.size<=(128ull<<20)&&guest_capture_read_spans(j.base,j.size,j.mapping))g->prefetch(j);
-}
-void notify_texture_mips(const uint32_t* tsharp,uint64_t res,uint64_t obj,uint64_t low_base,uint64_t hi_base,
-                         const uint32_t* low_descriptor,uint64_t low_bytes,uint64_t hi_bytes){
-    if(!g||!res||!obj||!g->opt.res_current||g->opt.res_current(obj)!=res)return;
-    Renderer::StreamMipInfo info{};
-    info.epoch=res;info.obj=obj;info.low_base=low_base;info.hi_base=hi_base;
-    info.low_bytes=low_bytes;info.hi_bytes=hi_bytes;
-    info.from_callback=true;
-    if(obj>=0x10000&&guest_region_extent(obj)>=0x44){
-        info.full_w=*reinterpret_cast<const uint16_t*>(obj+0x28);
-        info.full_h=*reinterpret_cast<const uint16_t*>(obj+0x2a);
-        info.full_d=std::max<uint16_t>(1,*reinterpret_cast<const uint16_t*>(obj+0x2c));
-        info.full_mips=*reinterpret_cast<const uint8_t*>(obj+0x31);
-        info.has_hi=*reinterpret_cast<const uint8_t*>(obj+0x34);
-    }else info.valid=false;
-    if(low_descriptor&&low_base){
-        const auto low=fmt::decode_tsharp(low_descriptor);
-        if(low.base==low_base){info.low_layout=low;
-            std::memcpy(info.low_words.data(),low_descriptor,32);}
-
-    }else if(tsharp&&!hi_base&&low_base){
-        const auto low=fmt::decode_tsharp(tsharp);
-        if(low.base==low_base){info.low_layout=low;
-            std::memcpy(info.low_words.data(),tsharp,32);}
-
-    }
-    {
-        std::lock_guard lk(g->mip_m);
-        if(g->opt.res_current(obj)!=res)return;
-        auto& history=g->stream_mips[uint32_t(res>>32)];
-        if(!info.low_layout.base&&low_base){
-            // Recover a previously captured physical layout for the same
-            // allocation address, not the current high descriptor's pitch.
-            uint64_t newest=0;
-            for(const auto& prior:history.entries)
-                if(prior.epoch<res&&prior.epoch>newest&&prior.low_layout.base==low_base){
-                    info.low_layout=prior.low_layout;info.low_words=prior.low_words;newest=prior.epoch;
-                }
-        }
-        history.publish(info);
-    }
-    if(!tsharp)return;
-    if(!info.has_hi||info.full_mips<2){prefetch_texture(tsharp,res,obj);return;}
-    if(!g->load_on||!info.valid||(!info.low_base&&!info.hi_base)||g->opt.res_current(obj)!=res)return;
-    Renderer::LoadJob job{4,{},0,0,res,obj};
-    std::memcpy(job.t,tsharp,32);
-    const auto ts=fmt::decode_tsharp(job.t);
-    const bool high=ts.last_level+1==info.full_mips;
-    // A fully sized high allocation is already assembled by the original
-    // relocation copy. No second allocation is needed to read its chain.
-    if(high&&info.hi_bytes&&ts.base==info.hi_base&&ts.width==info.full_w&&ts.height==info.full_h){
-        tiling::Surface full;
-        if(split_2d_surface(job.t,full)&&full.total_size&&full.total_size<=info.hi_bytes){
-            job.kind=1;job.base=ts.base;job.size=full.total_size;
-            if(guest_capture_read_spans(job.base,job.size,job.mapping))g->prefetch(job);
-            return;
-        }
-    }
-    if(high?(ts.base!=info.hi_base||(info.low_base&&!info.low_words[0])):
-             (ts.base!=info.low_base||ts.last_level+1!=info.full_mips-1))return;
-    auto span=[&](const uint32_t* words,uint32_t levels,uint64_t& base,uint64_t& size,MappingSpans& mapping){
-        tiling::Surface sf;
-        const auto d=fmt::decode_tsharp(words);
-        if(!split_2d_surface(words,sf)||d.dfmt!=ts.dfmt||d.nfmt!=ts.nfmt||!levels||levels>sf.levels)return false;
-        base=d.base;size=sf.mips[levels-1].offset+sf.mips[levels-1].size;
-        return size&&size<=(128ull<<20)&&guest_capture_read_spans(base,size,mapping);
-    };
-    if(!span(job.t,high?1:info.full_mips-1,job.base,job.size,job.mapping))return;
-    const auto bytes=high?info.hi_bytes:info.low_bytes;
-    if(bytes&&job.size>bytes)return;
-    if(high&&info.low_base){
-        std::memcpy(job.low,info.low_words.data(),32);
-        if(!span(job.low,info.full_mips-1,job.low_base,job.low_size,job.low_mapping)||
-           (info.low_bytes&&job.low_size>info.low_bytes))return;
-    }
-    if(g->opt.res_current(obj)==res)g->prefetch(job);
+void native_texture_event(uint64_t obj, uint64_t res, bool moved) {
+    if (g) g->native_texture_event(obj, res, moved);
 }
 
 void prefetch_shader_pair(const uint8_t* vs_obj, const uint8_t* ps_obj) {
@@ -7950,6 +8192,22 @@ void print_stats() {
         g->snap_cross_submit=g->snap_failed=0;
         if (const uint64_t expired = g->expired_gpu_results.exchange(0))
             log("native renderer: %llu delayed results rejected (mapping expired or unwritable)", (unsigned long long)expired);
+        {
+            size_t live = 0;
+            {
+                std::shared_lock lk(g->ntex_mu);
+                for (const auto& [o, e] : g->ntex) live += e.img != nullptr;
+            }
+            log("native renderer: native textures: %zu live, %llu events, %llu uploads (%.1f MiB), %llu top mips dropped, "
+                "%llu images created, %llu retired, %llu rejected, %llu draws before first upload, %llu registered textures not owned | loader %.1f ms, "
+                "engine-thread copies %.1f ms",
+                live, (unsigned long long)g->ntex_events.exchange(0), (unsigned long long)g->ntex_uploads.exchange(0),
+                double(g->ntex_bytes.exchange(0)) / 1048576.0, (unsigned long long)g->ntex_drops.exchange(0),
+                (unsigned long long)g->ntex_created.exchange(0), (unsigned long long)g->ntex_retired.exchange(0),
+                (unsigned long long)g->ntex_rejected.exchange(0), (unsigned long long)g->ntex_unready.exchange(0),
+                (unsigned long long)g->ntex_unowned.exchange(0),
+                double(g->ntex_ns.exchange(0)) / 1e6, double(g->ntex_snapshot_ns.exchange(0)) / 1e6);
+        }
         log("native renderer: texture failures since last report: %llu mapped range, %llu split descriptor, %llu upload, %llu valid low chains retained",
             (unsigned long long)g->texture_range_rejects,(unsigned long long)g->split_descriptor_rejects,
             (unsigned long long)g->texture_upload_failures,(unsigned long long)g->split_partial_kept);

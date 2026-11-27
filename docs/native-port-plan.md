@@ -59,6 +59,32 @@ The renderer, not the engine, is failing to keep these textures stable. In the s
 placeholder instead. A texture that resolves on some frames and not others alternates on screen. Owning
 the texture by handle from `bind` removes that inference.
 
+### Status: textures done, buffers and shaders not yet
+
+`Renderer::native_texture_*` in `native/gfx/nrender.cpp` owns every engine texture (resource types
+1-3). The engine's bind and resident-mips events (`resource_bind` and `h_mips` in
+`native/src/native_gfx.cpp`) copy the bytes the new descriptor describes; a loader thread detiles them and
+uploads them into the texture's one image; draws bind by the engine object they captured. Removed with it:
+copying every captured texture's source bytes at draw capture, and the address-keyed prefetch and
+resident-mips paths.
+
+Measured, Earth patrol on lavapipe, against main `259df30`:
+
+| | before | after |
+|---|---|---|
+| Texture binds failed per report interval | about 1,380 | 0 |
+| Registered textures drawn but not owned natively | | 0 |
+| Pre-pass CPU per frame | 75.8 ms | 13.6 ms |
+| Renderer CPU per frame (all parts) | 101.7 ms | 35.7 ms |
+| Images | 7,509 created, 802 dropped | about 3,400 live, none recreated in play |
+
+The player's arms, weapon and the snow, black on main, are textured again.
+
+Still to do in piece 1: the address-based branches of `upload_texture`, `texture_view`, the stream
+history and the texture leases are unreachable for engine textures and get deleted next; render
+targets and CPU-written dynamic textures still go through them. Vertex and index buffers (types 4 and 6)
+move to the same per-object ownership after that.
+
 ## Acceptance for each piece
 
 1. Builds on Windows and Linux in CI.
