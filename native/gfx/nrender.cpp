@@ -914,6 +914,7 @@ struct Renderer {
     void native_texture_load(NativeTextureJob& j);
     void native_texture_sweep();
     bool native_texture_view(uint64_t obj, uint64_t res, const uint32_t* t, gcn::TexDim dim, ViewHandle& out);
+    void resolve_material(Draw* d);
     void load_buffer(const LoadJob& j);
     void load_shader(const LoadJob& j);
     void prefetch(const LoadJob& j) {
@@ -5730,16 +5731,18 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     for (size_t di = 0; di < count; ++di) {
         Draw* d = draws[di];
         if(d->kind!=Draw::Indexed&&d->kind!=Draw::Auto)continue;
-        const uint64_t t_ident=now_ns();
-        d->shader_res[0]=d->vs&&opt.res_current?opt.res_current(uint64_t(d->vs)):0;
-        d->shader_res[1]=d->ps&&opt.res_current?opt.res_current(uint64_t(d->ps)):0;
-        const uint64_t t_mask=now_ns();
-        d->active_tex_mask[0]=d->tex_mask[0]&shader_slots(shader_tex_mask64(d->vs,true,d->shader_res[0]));
-        d->active_tex_mask[1]=d->tex_mask[1]&shader_slots(shader_tex_mask64(d->ps,false,d->shader_res[1]));
-        t_pre_shader_ident+=t_mask-t_ident;t_pre_shader_mask+=now_ns()-t_mask;
-        d->native_tex_ready[0]=d->native_tex_ready[1]=0;
         d->native_geo_mask=0;
-        d->tex_filter_mask[0]=d->tex_filter_mask[1]=0;
+        if(!d->material_ready){
+            const uint64_t t_ident=now_ns();
+            d->shader_res[0]=d->vs&&opt.res_current?opt.res_current(uint64_t(d->vs)):0;
+            d->shader_res[1]=d->ps&&opt.res_current?opt.res_current(uint64_t(d->ps)):0;
+            const uint64_t t_mask=now_ns();
+            d->active_tex_mask[0]=d->tex_mask[0]&shader_slots(shader_tex_mask64(d->vs,true,d->shader_res[0]));
+            d->active_tex_mask[1]=d->tex_mask[1]&shader_slots(shader_tex_mask64(d->ps,false,d->shader_res[1]));
+            t_pre_shader_ident+=t_mask-t_ident;t_pre_shader_mask+=now_ns()-t_mask;
+            d->native_tex_ready[0]=d->native_tex_ready[1]=0;
+            d->tex_filter_mask[0]=d->tex_filter_mask[1]=0;
+        }
         // A registered descriptor has one authoritative resolution per
         // ordered segment, including a failed resolution. The recording path
         // must not repeat thousands of lookups for the same missing image.
@@ -5754,6 +5757,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                               std::popcount(uint32_t(d->tex_mask[1]&~d->active_tex_mask[1]));
         for (int s = 0; s < 2; ++s){
             const auto mask=d->active_tex_mask[s];
+            if(d->native_tex_ready[s]==mask)continue;  // all resolved at capture
             // The material is unchanged across adjacent mesh draws.
             // Copy native bindings as a block rather than hash/probe each
             // descriptor. Restrict reuse to fully resident registered stages.
@@ -5765,7 +5769,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                 ++native_stage_reuse;
                 continue;
             }
-            for (uint32_t mask = d->active_tex_mask[s]; mask; mask &= mask - 1) {
+            for (uint32_t mask = d->active_tex_mask[s]&~d->native_tex_ready[s]; mask; mask &= mask - 1) {
                     const uint32_t i = __builtin_ctz(mask);
                     const uint32_t* t = d->tex[s][i];
                     const uint64_t res=d->tex_res[s][i];
@@ -6556,6 +6560,33 @@ bool Renderer::native_texture_view(uint64_t obj, uint64_t res, const uint32_t* t
     out = view(img, view_type(dim), comp, first, false);
     remember(true, out);
     return true;
+}
+
+// Engine thread, at capture: everything about the draw's material that does not depend on render
+// targets bound later. Unregistered textures (render targets, CPU-written dynamic textures) are left
+// to the recording pass, which knows the targets.
+void Renderer::resolve_material(Draw* d) {
+    if (d->kind != Draw::Indexed && d->kind != Draw::Auto) return;
+    d->shader_res[0] = d->vs && opt.res_current ? opt.res_current(uint64_t(d->vs)) : 0;
+    d->shader_res[1] = d->ps && opt.res_current ? opt.res_current(uint64_t(d->ps)) : 0;
+    d->active_tex_mask[0] = d->tex_mask[0] & shader_slots(shader_tex_mask64(d->vs, true, d->shader_res[0]));
+    d->active_tex_mask[1] = d->tex_mask[1] & shader_slots(shader_tex_mask64(d->ps, false, d->shader_res[1]));
+    d->native_tex_ready[0] = d->native_tex_ready[1] = 0;
+    d->tex_filter_mask[0] = d->tex_filter_mask[1] = 0;
+    for (int s = 0; s < 2; ++s)
+        for (uint32_t m = d->active_tex_mask[s]; m; m &= m - 1) {
+            const uint32_t i = __builtin_ctz(m);
+            if (!d->tex_res[s][i]) continue;
+            const uint32_t* t = d->tex[s][i];
+            ViewHandle vh;
+            if (!native_texture_view(d->tex_obj[s][i], d->tex_res[s][i], t, slot_dim(t), vh)) continue;
+            const uint16_t bit = uint16_t(1u << i);
+            d->native_tex_ready[s] |= bit;
+            d->tex_view[s][i] = vh.id;
+            d->tex_dk[s][i] = uint8_t((vh.dim & 3) | ((vh.kind & 3) << 2));
+            if (vh.filterable) d->tex_filter_mask[s] |= bit;
+        }
+    d->material_ready = true;
 }
 
 // Exact source geometry for ordinary 1D/2D split textures. Cube and
@@ -7886,6 +7917,9 @@ void fill_late(const LateCb& l, uint64_t src, uint32_t size) {
 }
 void native_texture_event(uint64_t obj, uint64_t res, bool moved) {
     if (g) g->native_texture_event(obj, res, moved);
+}
+void resolve_material(Draw* d) {
+    if (g && d) g->resolve_material(d);
 }
 
 void prefetch_shader_pair(const uint8_t* vs_obj, const uint8_t* ps_obj) {

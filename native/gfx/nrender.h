@@ -44,6 +44,7 @@ struct Draw {
     uint16_t tex_mask[kStages] = {}, smp_mask[kStages] = {};
     uint16_t active_tex_mask[kStages] = {}; // published translator mask, intersected with captured bindings
     uint16_t native_tex_ready[kStages] = {}; // registered resident views resolved during resource preparation
+    bool material_ready = false;           // shader identity, slot masks and engine texture views resolved at capture
     const uint32_t* T(int s, uint32_t i) const { return (tex_mask[s] >> (i & 15) & 1) ? tex[s][i & 15] : nullptr; }
     const uint32_t* S(int s, uint32_t i) const { return (smp_mask[s] >> (i & 15) & 1) ? smp[s][i & 15] : nullptr; }
     struct Cb { uint64_t addr; uint32_t size; } cb[kStages][16] = {};
@@ -118,6 +119,9 @@ void submit_recorded(const std::vector<uint32_t>& handles);
 // The engine bound a texture (resource types 1-3), moved its memory, or changed its resident
 // mips; its descriptor at `obj` is current. The renderer owns one image per texture object.
 void native_texture_event(uint64_t obj, uint64_t res, bool moved);
+// Called on the engine thread that captured the draw: resolves the draw's shader identities, the texture
+// slots its shaders read and the native views of its engine textures, so recording does not repeat it.
+void resolve_material(Draw* d);
 void prefetch_buffer(uint64_t base, uint64_t size, uint64_t res, uint64_t obj);
 // Exact native geometry source ownership, called under the resource capture gate.
 void capture_geometry_source(const Draw::Res& resource,bool cpu_required=false);
