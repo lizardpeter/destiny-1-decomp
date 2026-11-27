@@ -1709,10 +1709,10 @@ bool Renderer::init(const Options& o) {
         log("native renderer: recording on %u thread%s (runs of %u+ draws in one pass split)", rec_threads + 1,
             rec_threads ? "s" : "", rec_min_run);
     }
-    // Capturing on the engine threads is cheap; recording Vulkan commands
-    // there before the actual submit order is known is not yet safe for shared
-    // mutable resources. Keep it as an explicitly requested research mode.
-    list_rec=false; // production records in actual submission order
+    // Command lists are recorded on the engine thread that closes them (record_list); the queue
+    // thread submits them in the engine's order. Lists with memory writes (the GPU copy queue)
+    // are still executed at submission.
+    list_rec=true;
     log("native renderer: command lists recorded %s", list_rec ? "on the engine's threads as they end" : "at submission");
     start_loader();
     {
@@ -6179,7 +6179,6 @@ void Renderer::load_buffer(const LoadJob& j) {
                guest_matches_current_spans(j.base,bytes,j.mapping,dst);
     });
     if(!source){++geometry_source_rejects;geometry_source_pressure.store(true,std::memory_order_relaxed);++ld_stale;return;}
-    if(list_rec)return;
     std::lock_guard lk(m);
     if(opt.res_current(j.obj)!=j.res&&!texture_leases().pinned(j.res)){++ld_stale;return;}
     Recorder* const previous=tr;

@@ -1575,6 +1575,10 @@ struct List {
     size_t used = 0;
     bool eop = false;
     uint64_t made = 0;
+    bool recorded = false;
+    uint32_t handle = 0;
+    std::vector<ng::LateCb> late;
+    ng::Draw::Cb dflt[ng::kStages][16] = {};
 };
 // 0x7DD060 submits record+0x30 directly. The registry transfers the native
 // list once for each record use.
@@ -1933,6 +1937,35 @@ D1_SYSV bool h_drain(uint64_t dev) {
 // Source-defined close for ordinary and worker command lists. The engine
 // still owns its ordered ring and its progress labels, but native work does
 // not need a fake nonzero DCB extent. Preserve any genuine segment metadata.
+void record(List* l) {
+    if (!ng::list_recording() || l->items.empty()) return;
+    for (const Item& it : l->items)
+        if (it.d && (it.d->kind == ng::Draw::Dma || (it.d->kind == ng::Draw::WriteData && it.d->prim != ng::kEopLabel)))
+            return;
+    struct SavedCb { ng::Draw* draw; ng::Draw::Cb cb[ng::kStages][16]; };
+    std::vector<SavedCb> saved;
+    ng::Draw::Cb local[ng::kStages][16] = {};
+    bool bound[ng::kStages][16] = {};
+    std::vector<ng::Draw*> items;
+    items.reserve(l->items.size());
+    for (Item& it : l->items) {
+        if (!it.d) { local[it.cb.stage][it.cb.slot] = it.cb.cb; bound[it.cb.stage][it.cb.slot] = true; continue; }
+        ng::Draw* d = it.d;
+        if (d->kind <= ng::Draw::Clear) {
+            saved.emplace_back(); saved.back().draw = d;
+            std::memcpy(saved.back().cb, d->cb, sizeof d->cb);
+            for (int st = 0; st < ng::kStages; ++st)
+                for (int sl = 0; sl < 16; ++sl) {
+                    ng::Draw::Cb& c = d->cb[st][sl];
+                    if (bound[st][sl]) c = local[st][sl];
+                    else { if (!l->dflt[st][sl].addr && c.addr) l->dflt[st][sl] = c; c = {ng::kLateCb | uint64_t(st) << 4 | uint64_t(sl), c.size}; }
+                }
+        }
+        items.push_back(d);
+    }
+    l->recorded = ng::record_list(items, l->handle, l->late);
+    for (const auto& v : saved) std::memcpy(v.draw->cb, v.cb, sizeof v.cb);
+}
 void native_close(uint64_t dev,uint32_t kind,bool worker) {
     const int c=ctx_of_dev(dev);
     const uint64_t global=field<uint64_t>(dev,0),gfx=field<uint64_t>(dev,0x50),rec=field<uint64_t>(dev,0x58);
@@ -1963,6 +1996,7 @@ void native_close(uint64_t dev,uint32_t kind,bool worker) {
     put_field(gfx,0,field<uint64_t>(gfx,0x10));
     put_field(gfx,0x80,field<uint64_t>(gfx,0x90));
     if(!worker)put_field(rec,0x28,uint8_t(plan.flip));
+    record(list);
     // All close-time events are captured now. Publish before either the
     // already-enqueued worker record or the main ring entry becomes ready.
     if(!g_records.publish(rec,list)) {
@@ -2618,6 +2652,7 @@ void native_device_execute_submit(NativeSubmission* batch) {
     // record may legitimately wait behind a worker; never age it out.
     std::vector<nd::List*> orphans = nd::g_records.take_abandoned();
     for (nd::List* l : orphans) {
+        if (l->recorded) ng::discard_recorded(l->handle);
         ++nd::g_orphans;
         nd::free_list(l);
     }
@@ -2642,9 +2677,19 @@ void native_device_execute_submit(NativeSubmission* batch) {
     // events are written once all of its work has finished on the GPU: never before the work that
     // precedes them, and never split into a Vulkan submission per label (the console engine issues
     // about 166 of them per frame; each Vulkan submission costs a driver call and a fence).
+    std::vector<uint32_t> recorded;
+    auto flush_recorded = [&] {
+        if (recorded.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        ng::submit_recorded(recorded);
+        nr::g_exec_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        nr::g_frame_executed = true;
+        recorded.clear();
+    };
     unsigned eops = 0;
     auto complete = [&](bool eop) { eops += eop; };
     auto finish = [&] {
+        flush_recorded();
         flush_draws();
         if (labels.empty() && !eops) return;
         ng::after_gpu([pending = std::move(labels), eops]() mutable {
@@ -2673,6 +2718,22 @@ void native_device_execute_submit(NativeSubmission* batch) {
     };
 
     for (nd::List* l : lists) {
+        if (l->recorded) {
+            flush_draws();
+            for (const ng::LateCb& lc : l->late) {
+                const ng::Draw::Cb& c = nr::g_ce_known[lc.stage][lc.slot] ? nr::g_ce[lc.stage][lc.slot] : l->dflt[lc.stage][lc.slot];
+                ng::fill_late(lc, c.addr, c.size);
+            }
+            recorded.push_back(l->handle);
+            for (nd::Item& it : l->items) {
+                if (!it.d) { nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb; nr::g_ce_known[it.cb.stage][it.cb.slot] = true; continue; }
+                if (it.d->kind == ng::Draw::WriteData && it.d->prim == ng::kEopLabel)
+                    labels.push_back({it.d->caller, owned->completion_mappings.count(it.d) ? owned->completion_mappings[it.d] : 0, it.d->count != 0, it.d->inline_vertices});
+            }
+            if (l->eop) complete(true);
+            continue;
+        }
+        flush_recorded();
         for (nd::Item& it : l->items) {
             if (!it.d) {
                 nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
