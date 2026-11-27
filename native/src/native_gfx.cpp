@@ -262,7 +262,7 @@ void prefetch(uint32_t type, uint64_t o) {
     } else if(type==4||type==6) {
         const auto b=type==4?ng::binding::vertex_source(reinterpret_cast<const void*>(o)):
                              ng::binding::index_source(reinterpret_cast<const void*>(o));
-        ng::prefetch_buffer(b.base,b.size,res,o);
+        ng::native_buffer_event(o,res,b.base,b.size,type==6);
     }
 }
 void event(uint32_t type, uint32_t handle, bool insert) {
@@ -301,7 +301,6 @@ ng::Draw* capture(uint64_t dev,uint32_t engine_prim,uint64_t caller=0,bool captu
     // The pool retirement gate covers both static geometry and texture
     // capture; capture cannot publish a lease after its epoch is retired.
     auto gate=ng::texture_leases().capture();
-    auto* leases=nd_texture_leases(dev);
     uint64_t vbsig = 0;
     if(capture_vertices)if (const uint64_t decl = field<uint64_t>(dev, kVertexDecl)) {
         const uint32_t n = std::min(field<uint32_t>(decl, 0), 16u);
@@ -349,8 +348,6 @@ ng::Draw* capture(uint64_t dev,uint32_t engine_prim,uint64_t caller=0,bool captu
                         binding.identity=resreg::get(obj);
                         binding.resource_size=field<uint32_t>(obj,0);
                         binding.object=obj;
-                        if(leases&&leases->pin_geometry(binding.identity,binding.resource_base,binding.resource_size))
-                            ng::capture_geometry_source({binding.identity,binding.resource_base,binding.resource_size,binding.object});
                     }
                     binding.valid=true;
                 }
@@ -482,8 +479,6 @@ void capture_indexed(uint64_t dev,uint32_t prim,int32_t first,uint32_t count,uin
         ng::Draw* d = nr::capture(dev,prim,caller);
         d->kind = ng::Draw::Indexed;
         {
-        auto gate=ng::texture_leases().capture();
-        auto* leases=nd_texture_leases(dev);
         const uint64_t ib = field<uint64_t>(dev, 0x1D70);
         const uint32_t isz = ib ? field<uint32_t>(ib, 0x38) : 0;
         d->index32 = isz != 0;
@@ -498,8 +493,6 @@ void capture_indexed(uint64_t dev,uint32_t prim,int32_t first,uint32_t count,uin
                 if((words[1]>>16&0x3fff)&&(!r.id||base<r.base||base-r.base>=r.size))
                     cpu_required=true;
             }
-            if(leases&&leases->pin_geometry(d->ires.id,d->ires.base,d->ires.size,cpu_required))
-                ng::capture_geometry_source(d->ires,cpu_required);
         }
         }
         d->count = count;

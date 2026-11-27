@@ -59,7 +59,7 @@ The renderer, not the engine, is failing to keep these textures stable. In the s
 placeholder instead. A texture that resolves on some frames and not others alternates on screen. Owning
 the texture by handle from `bind` removes that inference.
 
-### Status: textures done, buffers and shaders not yet
+### Status: textures and buffers done, shaders not yet
 
 `Renderer::native_texture_*` in `native/gfx/nrender.cpp` owns every engine texture (resource types
 1-3). The engine's bind and resident-mips events (`resource_bind` and `h_mips` in
@@ -80,10 +80,31 @@ Measured, Earth patrol on lavapipe, against main `259df30`:
 
 The player's arms, weapon and the snow, black on main, are textured again.
 
+`Renderer::native_buffer_*` owns every engine vertex and index buffer (resource types 4 and 6) the
+same way: the bind event copies the bytes the engine hands over, the loader uploads them into the
+object's own device-local allocation, and draws bind the allocation of the object they captured.
+Moves and re-points keep it, because they never change the bytes: traced in Earth patrol, about
+20,000 buffer moves, every one with identical contents. A new resource bound into an object (a new
+object id in its identity) gets a new allocation; a sweep frees the allocations of objects whose
+resource is gone. Index buffers also keep their bytes on the CPU for the few primitive types whose
+indices are read there. Removed with it: the per-epoch geometry cache for engine buffers, the
+geometry source snapshots and their leases, the loader's buffer re-preparation on every move, and
+the per-draw geometry pinning at capture.
+
+Measured, against main `ccae578`, lavapipe:
+
+| | before | after |
+|---|---|---|
+| Buffer re-preparations caused by moves | about 20,000 per Earth patrol run | 0 (every move kept) |
+| Draws dropped for missing geometry | none on main; about 460 per report interval on an Intel Arc once lists were recorded on engine threads (test-38) | 0 in Earth patrol and orbit |
+| Engine buffers in Earth patrol | | 4,729, all owned and uploaded, none uploaded at first use in play |
+
+The first-use case still exists: a draw whose buffer the loader has not reached yet uploads it into
+the submission it is in, ahead of its draws.
+
 Still to do in piece 1: the address-based branches of `upload_texture`, `texture_view`, the stream
 history and the texture leases are unreachable for engine textures and get deleted next; render
-targets and CPU-written dynamic textures still go through them. Vertex and index buffers (types 4 and 6)
-move to the same per-object ownership after that.
+targets and CPU-written dynamic textures still go through them.
 
 ## Piece 4 moved up: the frame-rate unlock causes the shaking
 

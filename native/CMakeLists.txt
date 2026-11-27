@@ -230,12 +230,6 @@ target_link_libraries(native-resource-identity-test PRIVATE Threads::Threads)
 add_test(NAME native-resource-identity COMMAND native-resource-identity-test)
 set_tests_properties(native-resource-identity PROPERTIES TIMEOUT 60)
 
-add_executable(native-geometry-sources-test tests/native_geometry_sources_test.cpp)
-target_include_directories(native-geometry-sources-test PRIVATE gfx)
-target_link_libraries(native-geometry-sources-test PRIVATE Threads::Threads)
-add_test(NAME native-geometry-sources COMMAND native-geometry-sources-test)
-set_tests_properties(native-geometry-sources PROPERTIES TIMEOUT 60)
-
 add_executable(native-buffer-binding-test tests/native_buffer_binding_test.cpp)
 target_include_directories(native-buffer-binding-test PRIVATE gfx)
 add_test(NAME native-buffer-binding COMMAND native-buffer-binding-test)

@@ -94,30 +94,5 @@ int main(){
     }
     check(!registry.pinned((uint64_t(77)<<32)|3));
     check(!registry.pinned((uint64_t(77)<<32)|4));
-    {
-        const uint64_t epoch=(uint64_t(88)<<32)|9;
-        TextureLeaseSet a(registry);
-        {
-            auto guard=registry.capture();
-            check(a.pin_geometry(epoch,0x10000,4096));
-            check(!a.pin_geometry(epoch,0x10000,4096));
-            check(a.pin_geometry(epoch,0x10000,4096,true));
-            check(!a.pin_geometry(epoch,0x10000,4096,true));
-            check(a.pin_geometry(epoch,0x20000,4096));
-            check(a.pin_geometry(epoch,0x10000,8192));
-            check(!a.pin_geometry(0,0x10000,4096));
-            check(!a.pin_geometry(epoch,0x10000,0));
-            for(unsigned i=0;i<1024;++i)check(a.pin_geometry(epoch,0x40000+uint64_t(i)*4096,4096));
-            check(!a.pin_geometry(epoch,0x10000,4096));
-        }
-        check(registry.pinned(epoch));
-        {
-            TextureLeaseSet b(registry);
-            auto guard=registry.capture();
-            check(b.pin_geometry(epoch,0x10000,4096));
-        }
-        check(registry.pinned(epoch));
-    }
-    check(!registry.pinned((uint64_t(88)<<32)|9));
-    std::puts("split descriptor identity, independent source layouts and geometry range leases passed");
+    std::puts("split descriptor identity and independent source layouts passed");
 }

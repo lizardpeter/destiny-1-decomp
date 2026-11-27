@@ -48,8 +48,6 @@ class TextureLeaseSet {
     // material binds; collisions fall back to the exact set.
     std::unordered_set<TextureSourceKey,TextureSourceKeyHash> sources_;
     std::array<TextureSourceKey,128> recent_sources_{};
-    std::unordered_set<GeometryKey,GeometryKeyHash> geometry_;
-    std::array<GeometryKey,32> recent_geometry_{};
 public:
     explicit TextureLeaseSet(TextureLeaseRegistry& registry=texture_leases()):registry_(registry){}
     TextureLeaseSet(const TextureLeaseSet&)=delete;
@@ -57,19 +55,6 @@ public:
     ~TextureLeaseSet(){for(auto id:ids_)registry_.unpin(id);}
     // One reference per distinct epoch per list, not per draw or binding.
     bool pin(uint64_t id){if(!id||!ids_.insert(id).second)return false;registry_.pin(id);return true;}
-    // Exact geometry ranges are distinct from epoch lifetime references.
-    // A later CPU index inspection may require bytes even if a previous
-    // all-static draw already pinned the resident Vulkan allocation.
-    bool pin_geometry(uint64_t id,uint64_t base,uint64_t size,bool cpu_required=false){
-        if(!id||!size)return false;
-        const GeometryKey key{id,base,size,uint32_t(cpu_required),0};
-        auto& recent=recent_geometry_[GeometryKeyHash{}(key)&(recent_geometry_.size()-1)];
-        if(recent==key)return false;
-        recent=key;
-        if(!geometry_.insert(key).second)return false;
-        pin(id);
-        return true;
-    }
     bool pin_source(const uint32_t* words,uint64_t id){
         if(!id)return false;
         const auto key=texture_source_key(words,id);

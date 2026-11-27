@@ -14,7 +14,6 @@
 #include "native_memory_policy.h"
 #include "native_staging_pages.h"
 #include "native_resource_identity.h"
-#include "native_geometry_sources.h"
 #include "native_descriptor_slots.h"
 #include "native_texture_identity.h"
 #include "native_mip_source.h"
@@ -577,11 +576,7 @@ struct Renderer {
         std::unordered_map<GeometryKey, GeoEntry, GeometryKeyHash> map;
     };
     GeoShard geo_shards[64];
-    GeometrySources geometry_sources;
-    std::atomic<bool> geometry_source_pressure{false};
-    std::atomic<uint64_t> geometry_source_requests{0},geometry_source_rejects{0};
     std::atomic<uint64_t> geometry_owned_range_reads{0},geometry_current_range_reads{0},geometry_range_rejects{0};
-    void capture_geometry(const Draw::Res& res,bool cpu_required);
     std::mutex geo_block_m;
     uint64_t geo_bytes = 0;
     struct GeoHit {
@@ -590,7 +585,6 @@ struct Renderer {
         uint32_t vfirst = 0, vlast = 0;
     };
     bool geo_alloc(uint64_t size, int& block, uint64_t& off, bool device_local = false);
-    bool prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot=nullptr, uint64_t object=0, const MappingSpans* mapping=nullptr,GeoHit* prepared=nullptr);
     Buffer* geometry_staging(uint64_t bytes, StagingSpan& span);
     void geo_free_now(int block, uint64_t off, uint64_t size);
     void geo_free_later(int block, uint64_t off, uint64_t size);
@@ -914,9 +908,29 @@ struct Renderer {
     void native_texture_load(NativeTextureJob& j);
     void native_texture_sweep();
     bool native_texture_view(uint64_t obj, uint64_t res, const uint32_t* t, gcn::TexDim dim, ViewHandle& out);
+    // Native buffers: one device-local allocation per engine vertex or index buffer object
+    // (resource types 4 and 6), built from the bytes the engine hands over when it binds the
+    // resource. Moves and re-points keep it: they change where the engine keeps the bytes, never
+    // the bytes (measured: about 20,000 moves in Earth patrol, none with different contents).
+    // A new resource bound into the object (a new object id) gets a new allocation.
+    struct NativeBuffer {
+        uint32_t id = 0;        // engine resource id (identity >> 32)
+        uint64_t size = 0;
+        int block = -1;         // geo_blocks allocation once uploaded
+        uint64_t off = 0;
+        std::shared_ptr<const std::vector<uint8_t>> pending;  // bytes not uploaded yet
+        std::shared_ptr<const std::vector<uint8_t>> cpu;      // index buffers: the bytes, for draws that need them on the CPU
+    };
+    std::shared_mutex nbuf_mu;  // the table; taken after m when both are needed
+    std::unordered_map<uint64_t, NativeBuffer> nbuf;  // key: engine buffer object
+    std::deque<std::pair<uint64_t, uint32_t>> nbuf_q;  // (object, id) to upload [ntex_qm]
+    std::atomic<uint64_t> nbuf_events{0}, nbuf_moves{0}, nbuf_uploads{0}, nbuf_bytes{0}, nbuf_retired{0},
+        nbuf_rejected{0}, nbuf_lookups{0}, nbuf_unready{0}, nbuf_unowned{0}, nbuf_first_use{0}, nbuf_ns{0};
+    void native_buffer_event(uint64_t obj, uint64_t res, uint64_t base, uint64_t size, bool index);
+    bool native_buffer_upload(uint64_t obj, uint32_t id, bool into_current = false);  // [m]
+    bool native_buffer(const Draw::Res& r, Draw::NativeGeometry& out);
+    void native_buffer_sweep();
     void resolve_material(Draw* d);
-    bool lookup_local_geometry(const Draw::Res& r, Draw::NativeGeometry& out);
-    void load_buffer(const LoadJob& j);
     void load_shader(const LoadJob& j);
     void prefetch(const LoadJob& j) {
         if (!load_on) return;
@@ -3397,119 +3411,27 @@ Buffer* Renderer::geometry_staging(uint64_t bytes, StagingSpan& span) {
     return &sb.geo_staging.back();
 }
 
-void Renderer::capture_geometry(const Draw::Res& res,bool cpu_required){
-    if(!res.id||!res.object||res.base<0x10000||!res.size||res.size>=(64ull<<20))return;
-    const GeometryKey resident_key{res.id,0,res.size,0,0};
-    auto& sh=geo_shards[(uint64_t(GeometryKeyHash{}(resident_key))*0x9E3779B97F4A7C15ull)>>58];
-    if(!cpu_required){
-        std::lock_guard lk(sh.m);
-        const auto i=sh.map.find(resident_key);
-        if(i!=sh.map.end()&&i->second.valid&&i->second.res==res.id)return;
-    }
-    const GeometryKey key{res.id,res.base,res.size,0,0};
-    ++geometry_source_requests;
-    if(!geometry_sources.capture(key,[&](uint8_t* dst,uint64_t bytes){
-        MappingSpans spans;
-        return opt.res_current&&opt.res_current(res.object)==res.id&&
-               guest_capture_read_spans(res.base,bytes,spans)&&
-               guest_copy_current_spans(res.base,bytes,spans,dst)&&
-               opt.res_current(res.object)==res.id&&
-               guest_matches_current_spans(res.base,bytes,spans,dst);
-    })){
-        ++geometry_source_rejects;
-        geometry_source_pressure.store(true,std::memory_order_relaxed);
-    }
-}
-
-bool Renderer::prepare_local_geometry(const Draw::Res& res, const uint8_t* snapshot, uint64_t object, const MappingSpans* mapping,GeoHit* prepared) {
-    if (!res.id || res.base < 0x10000 || !res.size || res.size >= (64ull << 20) ||
-        rc().cur == UINT32_MAX || (rc().lr&&!snapshot)) return false;
-    const GeometryKey key{res.id, 0, res.size, 0, 0};
-    GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
-    std::unique_lock lk(sh.m);
-    GeoEntry& e = sh.map[key];
-    e.last_used = submit_seq.load(std::memory_order_relaxed);
-    if(e.valid&&e.res==res.id){
-        __atomic_fetch_add(&st.geo_res_hits,1,__ATOMIC_RELAXED);
-        if(prepared)*prepared={geo_blocks[size_t(e.block)].buf.buf,e.off,e.size,e.vfirst,e.vlast};
-        return false;
-    }
-    // A queued native list may refer to an epoch whose original pool
-    // has already been recycled. Prefer the owned immutable source, never
-    // read its old address as if it belonged to the current allocation.
-    const auto retained=geometry_sources.get({res.id,res.base,res.size,0,0});
-    if(!object)object=res.object;
-    MappingSpans local;
-    if(retained){
-        snapshot=retained->data();
-    }else{
-        if(!opt.res_current||!object||opt.res_current(object)!=res.id)return false;
-        if(!snapshot){
-            if(!guest_capture_read_spans(res.base,res.size,local))return false;
-            mapping=&local;
-        }
-        if(!mapping||mapping->empty())return false;
-        if(snapshot&&!guest_matches_current_spans(res.base,res.size,*mapping,snapshot))return false;
-    }
-    int block = -1;
-    uint64_t off = 0;
-    if (!geo_alloc(res.size, block, off, true)) return false;
-    StagingSpan span;
-    Buffer* staging = geometry_staging(res.size, span);
-    if (!staging) {
-        geo_free_now(block, off, res.size);
-        return false;
-    }
-    auto* dst = staging->map + span.offset;
-    // Hash and validate in host-cached memory, not by reading the
-    // potentially write-combined mapped Vulkan staging page.
-    static thread_local std::vector<uint8_t> owned;
-    const uint8_t* source=snapshot;
-    bool copied=true;
-    if(!source){
-        owned.resize(res.size);
-        copied=guest_copy_current_spans(res.base,res.size,*mapping,owned.data());
-        source=owned.data();
-    }
-    if(!copied||(!retained&&(!guest_matches_current_spans(res.base,res.size,*mapping,source)||
-       opt.res_current(object)!=res.id))){
-        // No GPU command references this span yet; return it to the page.
-        subs[rc().cur].geo_staging_used = span.offset;
-        geo_free_now(block, off, res.size);
-        return false;
-    }
-    const uint64_t content=hash_bytes(source,res.size);
-    std::memcpy(dst,source,res.size);
-    std::memset(dst+res.size,0,span.size-res.size);
-    end_pass();
-    VkBufferCopy copy{span.offset, off, span.size};
-    vkCmdCopyBuffer(rc().cmd, staging->buf, geo_blocks[size_t(block)].buf.buf, 1, &copy);
-    if (e.valid) {
-        geo_free_later(e.block, e.off, e.size);
-    }
-    e.block = block, e.off = off, e.size = res.size, e.hash = content;
-    e.res = res.id, e.uploaded = e.last_used, e.valid = true;
-    e.vfirst = e.vlast = 0; // whole-resource entries do not contain index-range metadata
-    if(prepared)*prepared={geo_blocks[size_t(block)].buf.buf,off,res.size,0,0};
-    __atomic_fetch_add(&st.bytes_geo, res.size, __ATOMIC_RELAXED);
-    return true;
-}
-
-// A GPU copy of guest memory [addr, addr+size), valid for this submission, or null (then the
-// caller copies into the ring). Buffers the game keeps rewriting are not cached for a while.
+// Guest memory [address, address+size) copied to out: geometry that is no engine buffer, or an
+// engine buffer's bytes a draw needs on the CPU.
 bool Renderer::read_geometry_range(const Draw::Res& res,uint64_t address,uint64_t size,void* out){
     if(!size)return true;
     const auto reject=[&]{++geometry_range_rejects;return false;};
     if(address<0x10000||size>(64ull<<20))return reject();
     if(res.id){
         if(address<res.base||address-res.base>res.size||size>res.size-(address-res.base))return reject();
-        if(auto retained=geometry_sources.get({res.id,res.base,res.size,0,0})){
-            std::memcpy(out,retained->data()+(address-res.base),size);
-            ++geometry_owned_range_reads;
-            return true;
+        // An engine index buffer's bytes, from the copy its native buffer keeps (moves do not
+        // change them); otherwise where the engine keeps them now, while the same resource
+        // still owns that address.
+        {
+            std::shared_lock rd(nbuf_mu);
+            const auto it = res.object ? nbuf.find(res.object) : nbuf.end();
+            if (it != nbuf.end() && it->second.id == uint32_t(res.id >> 32) && it->second.cpu &&
+                it->second.cpu->size() >= res.size) {
+                std::memcpy(out, it->second.cpu->data() + (address - res.base), size);
+                ++geometry_owned_range_reads;
+                return true;
+            }
         }
-        // No immutable snapshot: the address may only be used while the
-        // same resource epoch still owns it. Never read a recycled pool.
         if(!opt.res_current||!res.object||opt.res_current(res.object)!=res.id)return reject();
     }
     MappingSpans spans;
@@ -3630,7 +3552,6 @@ thread_local Renderer::Recorder* Renderer::tr = nullptr;
 
 void Renderer::evict_geo() {
     auto gate=texture_leases().retire();
-    geometry_sources.prune([](uint64_t id){return texture_leases().pinned(id);});
     const uint64_t horizon = 3000, now = submit_seq.load();
     if (now < horizon) return;
     for (GeoShard& sh : geo_shards) {
@@ -5855,14 +5776,18 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
         // any graphics secondary begins. Different versions remain distinct.
         static thread_local SegmentTable<GeometryKey,Draw::NativeGeometry,GeometryKeyHash> seen_geometry;
         seen_geometry.clear();
-        bool copied=false;
+        // A draw whose buffer the loader has not uploaded yet: upload it now, from the bytes the
+        // engine handed over at bind (native_buffer_upload), ahead of this submission's lists.
         auto prepare=[&](Draw& d,unsigned slot,const Draw::Res& r){
-            if(!r.id||!r.size)return;
-            const GeometryKey key{r.id,r.base,r.size,0,0};
+            if(!r.id||!r.size||!r.object)return;
+            const GeometryKey key{r.id,r.object,r.size,0,0};
             const auto [native,added]=seen_geometry.get_or_insert(key,[&]{
-                GeoHit hit{};
-                copied|=prepare_local_geometry(r,nullptr,0,nullptr,&hit);
-                return Draw::NativeGeometry{uint64_t(hit.buf),hit.off};
+                Draw::NativeGeometry g{};
+                if(!native_buffer(r,g)&&native_buffer_upload(r.object,uint32_t(r.id>>32),true)){
+                    ++nbuf_first_use;
+                    native_buffer(r,g);
+                }
+                return g;
             });
             if(native.buffer){
                 d.native_geo[slot]=native;d.native_geo_mask|=1u<<slot;
@@ -5896,17 +5821,6 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                 }else for(unsigned slot=0;slot<16;++slot)if(!(d.geo_captured>>slot&1))prepare(d,slot,d.vres[slot]);
             }
             prev=&d;
-        }
-        if (copied) {
-            VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-            b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            b.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
-            b.dstAccessMask = VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
-            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-            di.memoryBarrierCount = 1;
-            di.pMemoryBarriers = &b;
-            vkCmdPipelineBarrier2(rc().cmd, &di);
         }
     }
     const uint64_t end=now_ns();
@@ -6125,7 +6039,6 @@ void Renderer::start_loader() {
             if (opt.res_current(j.obj) != j.res) ++ld_stale;
             else if (j.kind == 1) load_texture(j);
             else if (j.kind == 4) load_split_texture(j);
-            else if (j.kind == 0) load_buffer(j);
             else load_shader(j);
             ld_ns += now_ns() - t0;
             {
@@ -6141,58 +6054,33 @@ void Renderer::start_loader() {
         uint64_t last_sweep = now_ns();
         for (;;) {
             NativeTextureJob j;
+            std::pair<uint64_t, uint32_t> buf{0, 0};
             {
                 std::unique_lock lk(ntex_qm);
-                ntex_cv.wait_for(lk, std::chrono::seconds(1), [&] { return !ntex_q.empty(); });
-                if (!ntex_q.empty()) { j = std::move(ntex_q.front()); ntex_q.pop_front(); }
+                ntex_cv.wait_for(lk, std::chrono::seconds(1), [&] { return !ntex_q.empty() || !nbuf_q.empty(); });
+                // Buffers first: they are small, and a draw without its geometry draws nothing.
+                if (!nbuf_q.empty()) { buf = nbuf_q.front(); nbuf_q.pop_front(); }
+                else if (!ntex_q.empty()) { j = std::move(ntex_q.front()); ntex_q.pop_front(); }
+            }
+            if (buf.first) {
+                std::lock_guard lk(m);
+                native_buffer_upload(buf.first, buf.second);
             }
             if (j.obj) {
                 const uint64_t t0 = now_ns();
                 native_texture_load(j);
                 ntex_ns += now_ns() - t0;
             }
-            if (now_ns() - last_sweep > 2000000000ull) { native_texture_sweep(); last_sweep = now_ns(); }
+            if (now_ns() - last_sweep > 2000000000ull) {
+                native_texture_sweep();
+                { std::lock_guard lk(m); native_buffer_sweep(); }
+                last_sweep = now_ns();
+            }
         }
     }).detach();
     log("native renderer: engine textures are owned by engine object, one image each, built from the engine's bind and mip events");
 }
 
-void Renderer::load_buffer(const LoadJob& j) {
-    if (j.base < 0x10000 || !j.size || j.size >= (64ull << 20) || j.mapping.empty()) return;
-    if(!opt.res_current||opt.res_current(j.obj)!=j.res){++ld_stale;return;}
-    {
-        const GeometryKey key{j.res,0,j.size,0,0};
-        auto& sh=geo_shards[(uint64_t(GeometryKeyHash{}(key))*0x9E3779B97F4A7C15ull)>>58];
-        std::lock_guard lk(sh.m);
-        const auto it=sh.map.find(key);
-        if(it!=sh.map.end()&&it->second.valid&&it->second.res==j.res){++ld_skipped;return;}
-    }
-    // The loader and first draw share the same immutable source claim.
-    // Only the first claimant copies from the original allocation; the
-    // copy and mapping validation are outside the renderer mutex.
-    const GeometryKey key{j.res,j.base,j.size,0,0};
-    ++geometry_source_requests;
-    const auto source=geometry_sources.capture(key,[&](uint8_t* dst,uint64_t bytes){
-        return opt.res_current(j.obj)==j.res&&
-               guest_copy_current_spans(j.base,bytes,j.mapping,dst)&&
-               opt.res_current(j.obj)==j.res&&
-               guest_matches_current_spans(j.base,bytes,j.mapping,dst);
-    });
-    if(!source){++geometry_source_rejects;geometry_source_pressure.store(true,std::memory_order_relaxed);++ld_stale;return;}
-    if(list_rec)return;
-    std::lock_guard lk(m);
-    if(opt.res_current(j.obj)!=j.res&&!texture_leases().pinned(j.res)){++ld_stale;return;}
-    Recorder* const previous=tr;
-    struct Restore {Recorder* p;~Restore(){tr=p;}} restore{previous};
-    tr=&up_rec;
-    up_rec.lr=true;
-    if(up_rec.cur==UINT32_MAX)up_rec.submit_no=submit_seq.load(),begin_record();
-    if(up_rec.cur==UINT32_MAX)return;
-    if(prepare_local_geometry({j.res,j.base,j.size,j.obj},source->data(),j.obj,&j.mapping)){
-        barrier();
-        ++ld_buf;
-    }
-}
 
 void Renderer::load_texture(const LoadJob& j) {
     const uint32_t* t = j.t;
@@ -6616,7 +6504,7 @@ void Renderer::resolve_material(Draw* d) {
     // prepared yet are left to the recording pass, which uploads them.
     d->native_geo_mask = d->geo_captured = 0;
     auto take = [&](unsigned slot, const Draw::Res& r) {
-        if (Draw::NativeGeometry g; lookup_local_geometry(r, g)) {
+        if (Draw::NativeGeometry g; native_buffer(r, g)) {
             d->native_geo[slot] = g;
             d->native_geo_mask |= 1u << slot;
             d->geo_captured |= 1u << slot;
@@ -6627,17 +6515,122 @@ void Renderer::resolve_material(Draw* d) {
         for (unsigned slot = 0; slot < 16; ++slot) take(slot, d->vres[slot]);
 }
 
-bool Renderer::lookup_local_geometry(const Draw::Res& r, Draw::NativeGeometry& out) {
-    if (!r.id || r.base < 0x10000 || !r.size || r.size >= (64ull << 20)) return false;
-    const GeometryKey key{r.id, 0, r.size, 0, 0};
-    GeoShard& sh = geo_shards[(uint64_t(GeometryKeyHash{}(key)) * 0x9E3779B97F4A7C15ull) >> 58];
-    std::lock_guard lk(sh.m);
-    const auto it = sh.map.find(key);
-    if (it == sh.map.end() || !it->second.valid || it->second.res != r.id) return false;
-    it->second.last_used = submit_seq.load(std::memory_order_relaxed);
-    __atomic_fetch_add(&st.geo_res_hits, 1, __ATOMIC_RELAXED);
+// An engine buffer was bound or moved. A bind of a new resource copies the bytes it describes
+// (the engine has finished loading them) and queues the upload; a move of a buffer the renderer
+// already owns changes nothing.
+void Renderer::native_buffer_event(uint64_t obj, uint64_t res, uint64_t base, uint64_t size, bool index) {
+    if (!ntex_on || obj < 0x10000 || !res || base < 0x10000 || !size || size >= (64ull << 20)) return;
+    ++nbuf_events;
+    const uint32_t id = uint32_t(res >> 32);
+    {
+        std::shared_lock r(nbuf_mu);
+        const auto it = nbuf.find(obj);
+        if (it != nbuf.end() && it->second.id == id && it->second.size == size) { ++nbuf_moves; return; }
+    }
+    auto bytes = std::make_shared<std::vector<uint8_t>>(size);
+    MappingSpans spans;
+    if (!guest_capture_read_spans(base, size, spans) || !guest_copy_current_spans(base, size, spans, bytes->data())) {
+        ++nbuf_rejected;
+        return;
+    }
+    {
+        std::unique_lock w(nbuf_mu);
+        NativeBuffer& e = nbuf[obj];
+        if (e.id == id && e.size == size) return;  // (another thread got there first)
+        if (e.block >= 0) geo_free_later(e.block, e.off, e.size), ++nbuf_retired;
+        e = NativeBuffer{id, size, -1, 0, bytes, index ? bytes : nullptr};
+    }
+    {
+        std::lock_guard lk(ntex_qm);
+        nbuf_q.emplace_back(obj, id);
+    }
+    ntex_cv.notify_one();
+}
+
+// Upload a buffer's bytes into its own allocation. The loader records the copy in the shared
+// upload slot (submitted before any later list); the ordered pre-pass, when a draw needs a buffer
+// the loader has not reached yet, records it into the submission it is preparing (into_current),
+// ahead of that submission's draws.
+bool Renderer::native_buffer_upload(uint64_t obj, uint32_t id, bool into_current) {
+    std::shared_ptr<const std::vector<uint8_t>> bytes;
+    uint64_t size = 0;
+    {
+        std::shared_lock r(nbuf_mu);
+        const auto it = nbuf.find(obj);
+        if (it == nbuf.end() || it->second.id != id) return false;  // released or replaced since
+        if (it->second.block >= 0) return true;                      // already uploaded
+        bytes = it->second.pending;
+        size = it->second.size;
+    }
+    if (!bytes) return false;
+    const uint64_t t0 = now_ns();
+    Recorder* const previous = tr;
+    struct Restore { Recorder* p; ~Restore() { tr = p; } } restore{previous};
+    if (into_current) end_pass();
+    else {
+        tr = &up_rec;
+        if (up_rec.cur == UINT32_MAX) up_rec.submit_no = submit_seq.load(), begin_record();
+    }
+    if (rc().cur == UINT32_MAX) { ++nbuf_rejected; return false; }
+    int block = -1;
+    uint64_t off = 0;
+    if (!geo_alloc(size, block, off, true)) { ++nbuf_rejected; return false; }
+    StagingSpan span;
+    Buffer* staging = geometry_staging(size, span);
+    if (!staging) { geo_free_now(block, off, size); ++nbuf_rejected; return false; }
+    std::memcpy(staging->map + span.offset, bytes->data(), size);
+    std::memset(staging->map + span.offset + size, 0, span.size - size);
+    VkBufferCopy copy{span.offset, off, span.size};
+    vkCmdCopyBuffer(rc().cmd, staging->buf, geo_blocks[size_t(block)].buf.buf, 1, &copy);
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
+    b.dstAccessMask = VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(rc().cmd, &di);
+    bool published = false;
+    {
+        std::unique_lock w(nbuf_mu);
+        const auto it = nbuf.find(obj);
+        if (it != nbuf.end() && it->second.id == id && it->second.block < 0) {
+            it->second.block = block, it->second.off = off, it->second.pending.reset();
+            published = true;
+        }
+    }
+    if (!published) geo_free_later(block, off, size);
+    ++nbuf_uploads;
+    nbuf_bytes += size;
+    nbuf_ns += now_ns() - t0;
+    return published;
+}
+
+// The native buffer a draw's captured resource names, if it is uploaded.
+bool Renderer::native_buffer(const Draw::Res& r, Draw::NativeGeometry& out) {
+    if (!r.object || !r.id) return false;
+    ++nbuf_lookups;
+    std::shared_lock rd(nbuf_mu);
+    const auto it = nbuf.find(r.object);
+    if (it == nbuf.end()) { ++nbuf_unowned; return false; }
+    if (it->second.id != uint32_t(r.id >> 32) || it->second.block < 0) { ++nbuf_unready; return false; }
     out = {uint64_t(geo_blocks[size_t(it->second.block)].buf.buf), it->second.off};
     return true;
+}
+
+// An engine buffer object whose resource is gone (released, or now holding another resource)
+// no longer owns its allocation.
+void Renderer::native_buffer_sweep() {
+    if (!opt.res_current) return;
+    std::unique_lock w(nbuf_mu);
+    for (auto it = nbuf.begin(); it != nbuf.end();) {
+        const uint64_t cur = opt.res_current(it->first);
+        if (cur && uint32_t(cur >> 32) == it->second.id) { ++it; continue; }
+        if (it->second.block >= 0) geo_free_later(it->second.block, it->second.off, it->second.size);
+        ++nbuf_retired;
+        it = nbuf.erase(it);
+    }
 }
 
 // Exact source geometry for ordinary 1D/2D split textures. Cube and
@@ -7758,14 +7751,12 @@ void Renderer::end_frame() {
     }
     retire_completed();
     const bool source_pressure=source_prune_requested.exchange(false,std::memory_order_relaxed);
-    const bool geo_pressure=geometry_source_pressure.exchange(false,std::memory_order_relaxed);
     if (st.frames % 120 == 0) evict_textures(), evict_geo();
-    else if(source_pressure||geo_pressure){
+    else if(source_pressure){
         // Reclaim unpinned source snapshots at the next frame boundary,
         // rather than losing new texture epochs for another 120 frames.
         auto gate=texture_leases().retire();
-        if(source_pressure)prune_sources();
-        if(geo_pressure)geometry_sources.prune([](uint64_t id){return texture_leases().pinned(id);});
+        prune_sources();
     }
     // Use elapsed wall time, not frame count: a 30-frame interval was only 250 ms
     // at 120 FPS. Never serialize concurrently with loader pipeline construction.
@@ -7984,13 +7975,8 @@ void prefetch_shader_pair(const uint8_t* vs_obj, const uint8_t* ps_obj) {
         if (res) g->prefetch({3, {}, uint64_t(ps_obj), 0, res, uint64_t(ps_obj)});
     }
 }
-void capture_geometry_source(const Draw::Res& resource,bool cpu_required){
-    if(g)g->capture_geometry(resource,cpu_required);
-}
-void prefetch_buffer(uint64_t base, uint64_t size, uint64_t res, uint64_t obj) {
-    if (!g || !res || !g->load_on || !size || size >= (64ull<<20)) return;
-    Renderer::LoadJob j{0,{},base,size,res,obj};
-    if(guest_capture_read_spans(base,size,j.mapping))g->prefetch(j);
+void native_buffer_event(uint64_t obj, uint64_t res, uint64_t base, uint64_t size, bool index) {
+    if (g) g->native_buffer_event(obj, res, base, size, index);
 }
 void prefetch_shader(const uint8_t* shader, bool vs, uint64_t res, uint64_t obj) {
     if (!g || !res || !shader) return;
@@ -8256,10 +8242,7 @@ void print_stats() {
     g->t_pre_writes=g->t_pre_views=g->t_pre_geometry=g->t_run_feedback=g->t_run_resolve=g->t_run_worker_wall=g->t_run_worker_wait=0;
     log("native renderer: %llu prepared native geometry bindings consumed without recording-thread resource lookup",(unsigned long long)g->native_geometry_bindings);
     g->native_geometry_bindings=0;
-    log("native renderer: geometry source ownership %.1f MiB, %llu requests, %llu rejected | CPU slices: %llu retained, %llu current, %llu rejected",
-        double(g->geometry_sources.bytes())/1048576.0,
-        (unsigned long long)g->geometry_source_requests.exchange(0),
-        (unsigned long long)g->geometry_source_rejects.exchange(0),
+    log("native renderer: geometry read on the CPU: %llu from native index copies, %llu from engine memory, %llu rejected",
         (unsigned long long)g->geometry_owned_range_reads.exchange(0),
         (unsigned long long)g->geometry_current_range_reads.exchange(0),
         (unsigned long long)g->geometry_range_rejects.exchange(0));
@@ -8334,6 +8317,21 @@ void print_stats() {
                 (unsigned long long)g->ntex_lookups.exchange(0), (unsigned long long)g->ntex_misses.exchange(0),
                 (unsigned long long)(g->ntex_gen.load() - g->ntex_gens.exchange(g->ntex_gen.load())),
                 double(g->ntex_ns.exchange(0)) / 1e6, double(g->ntex_snapshot_ns.exchange(0)) / 1e6);
+            size_t blive = 0, bready = 0;
+            {
+                std::shared_lock lk(g->nbuf_mu);
+                blive = g->nbuf.size();
+                for (const auto& [o, e] : g->nbuf) bready += e.block >= 0;
+            }
+            log("native renderer: native buffers: %zu live (%zu uploaded), %llu events (%llu moves kept), %llu uploads "
+                "(%.1f MiB, %.1f ms), %llu at first use, %llu retired, %llu rejected | %llu lookups: %llu not uploaded yet, "
+                "%llu not engine buffers",
+                blive, bready, (unsigned long long)g->nbuf_events.exchange(0), (unsigned long long)g->nbuf_moves.exchange(0),
+                (unsigned long long)g->nbuf_uploads.exchange(0), double(g->nbuf_bytes.exchange(0)) / 1048576.0,
+                double(g->nbuf_ns.exchange(0)) / 1e6, (unsigned long long)g->nbuf_first_use.exchange(0),
+                (unsigned long long)g->nbuf_retired.exchange(0), (unsigned long long)g->nbuf_rejected.exchange(0),
+                (unsigned long long)g->nbuf_lookups.exchange(0), (unsigned long long)g->nbuf_unready.exchange(0),
+                (unsigned long long)g->nbuf_unowned.exchange(0));
         }
         log("native renderer: texture failures since last report: %llu mapped range, %llu split descriptor, %llu upload, %llu valid low chains retained",
             (unsigned long long)g->texture_range_rejects,(unsigned long long)g->split_descriptor_rejects,
