@@ -42,6 +42,25 @@ per-draw pipeline, geometry, descriptor and command work. Measured on an Intel A
 patrol, about 9,300 draws: pre-pass 6-7 ms, commands 7-8 ms, submit 2.4 ms per frame; the queue thread
 spends about 20 ms per frame, which is what limits the frame rate.
 
+### The console command layer the setters call
+
+The device layer (`007dc180`-`007e5600`) calls about 80 functions of the statically linked Gnm library
+(`00f7d010`-`00f8f0e0`). Two kinds:
+
+- **Register builders** that only compute a register word stored in `D` (for example `00f819f0`,
+  `00f81a10`, `00f81a30` build the blend control at `D+0x25d8`; `00f81b30`-`00f81ec0` the depth/stencil
+  control at `D+0x25dc`/`D+0x25e0`). Pure computation on engine state.
+- **Context calls** that take the GPU context `*(D+0x50)` and write the console command buffer or its
+  shadow state: blend control `00f7e7c0`, target mask `00f7e740`, depth control `00f80790`, viewport
+  `00f80340`, primitive setup `00f7fe20`, VS / PS `00f8b790` / `00f8b8c0`, textures `00f8afd0`, samplers
+  `00f8b410`, constant buffers `00f8b500`, render targets `00f8f0e0` / `00f7eec0`, draw packets
+  `00f7f1e0` / `00f7f260` / `00f7f320`, pre-draw commit `00f8df60` / `00f8e880`, and so on.
+
+Step 1 keeps the register builders (they are the engine's state) and removes every context call, so the
+device layer stops producing console GPU commands. Step 2 replaces the register words themselves with
+native state built once from the engine's preset tables (`015d16c4` blend, `015d2394` depth,
+`015d2424` polygon offset, `015d1cd0`/`015d1d70` stencil).
+
 ## Target
 
 - **Setters keep only the engine's own state.** Each one updates exactly the `D` fields its original
