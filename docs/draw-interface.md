@@ -123,6 +123,14 @@ ownership therefore means owning images per surface at record creation (`0081be0
 engine's own create/release calls deciding lifetime and aliasing, instead of discovering targets
 from bound register words at draw time.
 
+The record says what it is: `008187e0` fills the render target (`00819f20`, record flag `0x10000`)
+only when the descriptor's flag `0x10` is clear, and always fills the T# (`0081a330`, flag
+`0x20000`); a descriptor with `0x10` set is a texture the CPU writes (locked and unlocked through
+`00818f80` / `00818fa0`, double-buffered: flag `8` selects the second buffer at `+0x48`). Release
+(`008183e0`, `00818620`) unbinds the record if bound and clears both. So the hooks for native
+targets are the two fills (create the image and its sampled view from the record's own words) and
+the release (end of use), with CPU-written records kept apart from render targets by that flag.
+
 Still order-dependent, to be replaced before lists are recorded on engine threads: targets the CPU
 rewrites (`target_current`), feedback copies of attachments a pass samples, occlusion queries and
 predication, and GPU results read back into guest memory.
