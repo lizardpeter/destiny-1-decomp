@@ -302,8 +302,8 @@ void stencil_dynamic(const RenderState& rs, uint32_t refmask, uint32_t& ref, uin
 // Interned once per distinct state: a table that only grows (ids index it without a lock) and a
 // map from the engine words, behind a shared mutex; each thread remembers its last few answers.
 namespace {
-constexpr uint32_t kMaxRenderStates = 1u << 16;
-RenderState g_states[kMaxRenderStates];
+constexpr uint32_t kMaxRenderStates = 1u << 14;
+RenderState* const g_states = new RenderState[kMaxRenderStates];  // (heap: not 600 KB of initialised image data)
 std::atomic<uint32_t> g_state_count{0};
 std::shared_mutex g_states_m;
 std::unordered_map<uint64_t, uint32_t> g_state_by_value;  // (hash of the RenderState)
