@@ -352,8 +352,7 @@ struct Image {
         return src_size && a < src_addr + src_size && e > src_addr;
     }
     bool stale = false;
-    uint64_t last_write_submit = 0;
-    uint64_t target_revision=1, snapshot_revision=0;
+    std::atomic<uint64_t> last_write_submit{0};  // (the latest submission that wrote it; set by recording threads)
 };
 
 struct Shader {
@@ -742,7 +741,9 @@ struct Renderer {
         return key;
     }
     // (new_pass: the run gets a render pass instance of its own)
-    void feedback_snapshots(const Draw* const* run, size_t n, Image* const* colors, Image* depth, bool new_pass = false);
+    bool feedback_snapshots(const Draw* const* run, size_t n, Image* const* colors, Image* depth, bool new_pass = false,
+                            bool unlocked = false);
+    bool sampled_target(const uint32_t* t, bool fill, Image*& target, Image*& stencil);
     // what these draws may write: bit i color target i, bit 8 depth, bit 9 stencil
     static uint32_t run_writes(const Draw* const* run, size_t n);
     // Shared images (render targets, snapshots) are set up - layout, first clear - in the upload
@@ -781,13 +782,11 @@ struct Renderer {
     void mark_target_write(Image* img,uint8_t aspects){
         if(!img||!aspects)return;
         wrote_target(img,aspects);
-        ++img->target_revision;
-        if(img->last_write_submit!=rc().submit_no){
-            img->last_write_submit=rc().submit_no;
-            rc().written_targets.push_back(img);
-        }
+        auto& w=rc().written_targets;
+        if(std::find(w.begin(),w.end(),img)==w.end())w.push_back(img);
+        img->last_write_submit.store(rc().submit_no,std::memory_order_relaxed);
     }
-    uint64_t snap_reused = 0, snap_cross_submit=0, snap_failed=0;
+    uint64_t snap_reused = 0, snap_failed=0;
     ViewHandle target_view(Image* img, const Image* like, const uint32_t* t);
     static bool verify_late() { static const bool v = std::getenv("D1_NG_VERIFY_LATE") != nullptr; return v; }
     void note_copy(uint8_t kind, uint64_t addr, uint64_t size) {
@@ -796,7 +795,6 @@ struct Renderer {
     uint64_t late_checked[3] = {}, late_changed[3] = {};
     uint64_t recopy_n[3] = {}, recopy_changed[3] = {};  // constants, vertices, indices
     Recorder up_rec;  // uploads and target set-up for lists recorded on engine threads
-    Recorder* pre_for = nullptr;  // the list whose textures pre_pass is preparing (in the upload slot)
     // the loader thread: engine shaders prepared when the engine binds them (textures and
     // buffers have their own native paths: native_texture_*, native_buffer_*)
     struct LoadJob {
@@ -1040,9 +1038,10 @@ struct Renderer {
         return it == dyn_mem.end() ? ~0ull : it->second.second + 1;
     }
     std::atomic<uint64_t> lr_lists{0}, lr_ns{0}, lr_wait_ns{0}, lr_sub_ns{0}, lr_runs{0}, lr_resolve_locked{0}, lr_lock_why[3]{};  // (statistics)
+    std::atomic<uint64_t> lr_pre_free{0}, lr_fb_locked{0};  // (runs whose feedback check needed the lock)  // (the pre-pass's texture views, resolved without the lock)
     std::atomic<uint64_t> lr_phase[7]{};  // locked: pre-pass, targets, feedback, resolve, pass begin; unlocked: draws; locked: end
     bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late);
-    void pre_pass(Draw* const* draws, size_t count);
+    void pre_pass(Draw* const* draws, size_t count, std::unique_lock<std::mutex>& lk, const std::function<void()>& relock);
     void submit_recorded(const std::vector<uint32_t>& handles);
     void discard_recorded(uint32_t handle);
     Recorder main_rec;
@@ -3721,9 +3720,39 @@ VkCommandBuffer Renderer::secondary(uint32_t w) {
 // that no command of the render pass instance writes; the pass is split when a later run
 // writes it, or when an earlier one did). One the run writes too is copied first, and the
 // draws read the copy.
-void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const* colors, Image* depth, bool new_pass) {
+// Which render target a non-engine T# samples, and the stencil target at its address, from this
+// thread's cache: valid while the target tables have not changed (target_views_gen) and, when the
+// answer depended on which aliased target is current (target_for's fallback, stencil), until a
+// rebind (target_rebind_gen). fill: look it up in the tables (renderer lock held); otherwise
+// false on a miss.
+bool Renderer::sampled_target(const uint32_t* t, bool fill, Image*& target, Image*& stencil) {
+    struct Entry { uint64_t key = 0, tg = 0, rg = 0; uint32_t words[8]{}; Image* target = nullptr; Image* stencil = nullptr; bool order = false; const Renderer* owner = nullptr; };
+    static thread_local std::unique_ptr<Entry[]> cache_ptr;
+    if (!cache_ptr) cache_ptr = std::make_unique<Entry[]>(1024);
+    const uint64_t key = hash_bytes(t, 32) | 1;
+    Entry& e = cache_ptr[key & 1023];
+    const uint64_t tg = target_views_gen.load(std::memory_order_acquire), rg = target_rebind_gen.load(std::memory_order_acquire);
+    if (e.owner == this && e.key == key && e.tg == tg && (!e.order || e.rg == rg) && std::memcmp(e.words, t, 32) == 0) {
+        target = e.target, stencil = e.stencil;
+        return true;
+    }
+    if (!fill) return false;
+    const auto ts = fmt::decode_tsharp(t);
+    stencil = nullptr;
+    if (auto sit = stencil_by_base.find(ts.base); sit != stencil_by_base.end() && sit->second->stencil) stencil = sit->second;
+    target = target_for(ts);
+    e = {key, tg, rg, {}, target, stencil, stencil != nullptr || (target && tf_fallback), this};
+    std::memcpy(e.words, t, 32);
+    return true;
+}
+
+// unlocked: called without the renderer lock; returns false, having changed nothing, if a lookup
+// misses this thread's cache or the run needs a snapshot (the caller then takes the lock and calls
+// again). Otherwise only this list's pass state changes.
+bool Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const* colors, Image* depth, bool new_pass,
+                                  bool unlocked) {
     static const bool off = [] { const char* v = std::getenv("D1_NG_FEEDBACK_COPY"); return v && std::atoi(v) == 0; }();
-    if (off) return;
+    if (off) return true;
     const uint32_t w = run_writes(run, n);
     auto writes = [&](Image* img) -> uint8_t {  // aspects (1 color / depth, 2 stencil) the run writes
         if (img && img == depth) return uint8_t((w >> 8 & 1) | (w >> 9 & 1) << 1);
@@ -3756,20 +3785,19 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
             for (uint32_t msk = dr.active_tex_mask[st2]&~dr.native_tex_ready[st2]; msk; msk &= msk - 1) {
                 const uint32_t slot = __builtin_ctz(msk);
                 if (dr.tex_res[st2][slot] != 0) continue;  // registered textures are never render targets
-                const uint32_t* t = dr.tex[st2][slot];
-                const auto ts = fmt::decode_tsharp(t);
-                if (depth && depth->stencil)
-                    if (auto sit = stencil_by_base.find(ts.base); sit != stencil_by_base.end() && sit->second == depth) {
-                        add(depth, 2);
-                        continue;
-                    }
-                Image* ri = target_for(ts);
+                Image *ri = nullptr, *sti = nullptr;
+                if (!sampled_target(dr.tex[st2][slot], !unlocked, ri, sti)) return false;
+                if (depth && depth->stencil && sti == depth) {
+                    add(depth, 2);
+                    continue;
+                }
                 if (!ri || ri->is3d || ri->layers > 1) continue;
                 bool attached = ri == depth;
                 for (int i = 0; i < 8; ++i) attached |= ri == colors[i];
                 if (attached) add(ri, 1);
             }
     }
+    if (unlocked && !need.empty()) return false;
     const uint64_t key = pass_key_of(colors, depth);
     if (rc().in_pass && (new_pass || rc().pass_key != key)) end_pass();  // (begin_pass would; the new instance's tracking starts here)
     const bool same_pass = rc().in_pass;
@@ -3815,12 +3843,12 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
     };
     if (snap_need.empty()) {
         if (!keep) rc().snaps.clear(), rc().snap_key = 0;
-        return done();
+        return done(), true;
     }
     if (keep && std::all_of(snap_need.begin(), snap_need.end(), [&](const Need& x) {
             return std::any_of(rc().snaps.begin(), rc().snaps.end(), [&](auto& p) { return p.first == x.img; });
         }))
-        return done();  // (copied for this pass already: the draws read the pass's starting contents)
+        return done(), true;  // (copied for this pass already: the draws read the pass's starting contents)
     if (keep)
         for (auto& p : rc().snaps)
             if (std::none_of(snap_need.begin(), snap_need.end(), [&](const Need& x) { return x.img == p.first; }))
@@ -3834,11 +3862,7 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
         const uint8_t want = x.asp ? x.asp : 3;
         if (f != rc().fresh.end() && si != snap_img.end() && si->second.get() == f->sn && (f->valid & want) == want)
             snaps.push_back({x.img, f->sn}), ++snap_reused;
-        else if(!rc().lr&&si!=snap_img.end()&&si->second&&
-                si->second->snapshot_revision==x.img->target_revision){
-            snaps.push_back({x.img,si->second.get()});
-            ++snap_reused;++snap_cross_submit;
-        }else copy.push_back(x.img);
+        else copy.push_back(x.img);
     }
     if (!copy.empty()) {
         end_pass();  // (copies run outside render passes; the next draw begins the pass again)
@@ -3870,7 +3894,6 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
             snaps.push_back({img, sn.get()});
             wrote_target(img);
             rc().fresh.push_back({img, sn.get(), 3});
-            sn->snapshot_revision=rc().lr?0:img->target_revision;
             ++snap_copies;
             if (static const bool lg = std::getenv("D1_NG_LOG_SNAPS"); lg)
                 if (static uint64_t tot = 0; ++tot >= 1000 && tot < 1080)
@@ -3882,6 +3905,7 @@ void Renderer::feedback_snapshots(const Draw* const* run, size_t n, Image* const
     rc().snaps = std::move(snaps);
     rc().snap_key = key;
     done();
+    return true;
 }
 
 uint32_t Renderer::run_writes(const Draw* const* run, size_t n) {
@@ -4816,7 +4840,12 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
 
 // Resources first (copies cannot run inside a render pass): targets, then textures (each
 // distinct target set and T# once per recording: thousands of draws share a few).
-void Renderer::pre_pass(Draw* const* draws, size_t count) {
+// The submission's resources before its lists record: targets, then each draw's texture views. The
+// views come from the native texture table and the per-thread caches, so that part runs without the
+// renderer lock (lk unlocked, relock() to take it again); textures that are not engine textures
+// (render targets, CPU-written) are prepared under it afterwards, in the shared upload slot.
+void Renderer::pre_pass(Draw* const* draws, size_t count, std::unique_lock<std::mutex>& lk,
+                        const std::function<void()>& relock) {
     const uint64_t tp = now_ns();
     apply_cpu_writes();
     if (reload_all) {
@@ -4830,17 +4859,24 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     // (each distinct target set and T# once per submission: thousands of draws share a few)
     const uint64_t t_tgt0 = now_ns();
     t_pre_writes+=t_tgt0-tp;
-    const Draw* prev_d = nullptr;
-    for (size_t i = 0; i < count; ++i) {
-        Draw* d = draws[i];
-        if (d->kind != Draw::Indexed && d->kind != Draw::Auto && d->kind != Draw::Clear) continue;
-        if (prev_d && std::memcmp(prev_d->color, d->color, sizeof d->color) == 0 &&
-            std::memcmp(prev_d->depth, d->depth, sizeof d->depth) == 0)
-            continue;
-        prev_d = d;
-        for (int i = 0; i < 5; ++i) color_target(d->color[i], false);
-        depth_target(d->depth, false);
+    if (up_rec.cur != UINT32_MAX) {  // (otherwise the run loop creates them in the list itself)
+        const Draw* prev_d = nullptr;
+        for (size_t i = 0; i < count; ++i) {
+            Draw* d = draws[i];
+            if (d->kind != Draw::Indexed && d->kind != Draw::Auto && d->kind != Draw::Clear) continue;
+            if (prev_d && std::memcmp(prev_d->color, d->color, sizeof d->color) == 0 &&
+                std::memcmp(prev_d->depth, d->depth, sizeof d->depth) == 0)
+                continue;
+            prev_d = d;
+            for (int i = 0; i < 5; ++i) color_target(d->color[i], false);
+            depth_target(d->depth, false);
+        }
     }
+    lk.unlock();
+    const uint64_t t_free = now_ns();
+    static thread_local std::vector<const uint32_t*> later;
+    later.clear();
+    uint64_t stage_reuse = 0, unused_slots = 0;
     const uint64_t t_views=now_ns();
     st.t_tgt+=t_views-t_tgt0;
     struct Seen { uint64_t key, sub, res; const uint32_t* words; ViewHandle native; bool resolved=false; };
@@ -4879,7 +4915,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
             d->tex_dk[stage][slot]=uint8_t((vh.dim&3)|((vh.kind&3)<<2));
             if(vh.filterable)d->tex_filter_mask[stage]|=bit;
         };
-        unused_texture_slots+=std::popcount(uint32_t(d->tex_mask[0]&~d->active_tex_mask[0]))+
+        unused_slots+=std::popcount(uint32_t(d->tex_mask[0]&~d->active_tex_mask[0]))+
                               std::popcount(uint32_t(d->tex_mask[1]&~d->active_tex_mask[1]));
         for (int s = 0; s < 2; ++s){
             const auto mask=d->active_tex_mask[s];
@@ -4892,7 +4928,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                 d->tex_filter_mask[s]=prior->tex_filter_mask[s];
                 std::memcpy(d->tex_view[s],prior->tex_view[s],sizeof d->tex_view[s]);
                 std::memcpy(d->tex_dk[s],prior->tex_dk[s],sizeof d->tex_dk[s]);
-                ++native_stage_reuse;
+                ++stage_reuse;
                 continue;
             }
             for (uint32_t mask = d->active_tex_mask[s]&~d->native_tex_ready[s]; mask; mask &= mask - 1) {
@@ -4926,74 +4962,48 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
                         ++ntex_unowned_draws;
                         continue;
                     }
-                    const uint64_t b = fmt::decode_tsharp(t).base;
-                    const bool possible_target=target_bases.count(b)!=0;
-                    if(possible_target)tsharp_bases.insert(b);
-                    // Preparing a later attachment must not publish it as
-                    // the owner of memory sampled by an earlier draw.
-                    const bool is_target=possible_target&&(target_by_base.count(b)||stencil_by_base.count(b));
-                    if(!is_target||!target_current(b))upload_texture(t);
+                    later.push_back(t);  // (render targets and CPU-written textures: under the lock, below)
                 }
         }
         prior=d;
     }
-    flush_uploads();
-    const uint64_t t_geometry=now_ns();
-    t_pre_views+=t_geometry-t_views;
-    if (!rc().lr) {
-        // Prepare each exact resource epoch/range once per ordered segment, before
-        // any graphics secondary begins. Different versions remain distinct.
-        static thread_local SegmentTable<GeometryKey,Draw::NativeGeometry,GeometryKeyHash> seen_geometry;
-        seen_geometry.clear();
-        // A draw whose buffer the loader has not uploaded yet: upload it now, from the bytes the
-        // engine handed over at bind (native_buffer_upload), ahead of this submission's lists.
-        auto prepare=[&](Draw& d,unsigned slot,const Draw::Res& r){
-            if(!r.id||!r.size||!r.object)return;
-            const GeometryKey key{r.id,r.object,r.size,0,0};
-            const auto [native,added]=seen_geometry.get_or_insert(key,[&]{
-                Draw::NativeGeometry g{};
-                if(!native_buffer(r,g)&&native_buffer_upload(r.object,uint32_t(r.id>>32),true)){
-                    ++nbuf_first_use;
-                    native_buffer(r,g);
-                }
-                return g;
-            });
-            if(native.buffer){
-                d.native_geo[slot]=native;d.native_geo_mask|=1u<<slot;
-            }
-        };
-        auto live_vertex_slots=[](const Draw& d){
-            uint32_t m=0;
-            for(unsigned slot=0;slot<16;++slot)if(d.vres[slot].id&&d.vres[slot].size)m|=1u<<slot;
-            return m;
-        };
-        const Draw* prev=nullptr;
-        for(size_t di=0;di<count;++di){
-            Draw& d=*draws[di];
-            if(d.kind!=Draw::Indexed&&d.kind!=Draw::Auto)continue;
-            d.native_geo_mask=d.geo_captured;
-            if(d.geo_captured==((d.kind==Draw::Indexed?1u<<16:0u)|(d.inline_vertices.empty()?live_vertex_slots(d):0u))){prev=&d;continue;}
-            if(d.kind==Draw::Indexed&&!(d.geo_captured>>16&1)){
-                if(prev&&prev->kind==Draw::Indexed&&std::memcmp(&d.ires,&prev->ires,sizeof d.ires)==0){
-                    if(prev->native_geo_mask&(1u<<16)){
-                        d.native_geo[16]=prev->native_geo[16];d.native_geo_mask|=1u<<16;
-                    }
-                }else prepare(d,16,d.ires);
-            }
-            if(d.inline_vertices.empty()){
-                if(prev&&prev->inline_vertices.empty()&&std::memcmp(d.vres,prev->vres,sizeof d.vres)==0){
-                    const uint32_t mask=prev->native_geo_mask&0xffffu;
-                    for(uint32_t m=mask;m;m&=m-1){
-                        const unsigned slot=__builtin_ctz(m);d.native_geo[slot]=prev->native_geo[slot];
-                    }
-                    d.native_geo_mask|=mask;
-                }else for(unsigned slot=0;slot<16;++slot)if(!(d.geo_captured>>slot&1))prepare(d,slot,d.vres[slot]);
-            }
-            prev=&d;
+    lr_pre_free += now_ns() - t_free;
+    relock();
+    native_stage_reuse += stage_reuse, unused_texture_slots += unused_slots;
+    tr = &up_rec;
+    if (up_rec.cur == UINT32_MAX) begin_record();
+    if (up_rec.cur != UINT32_MAX) {
+        for (const uint32_t* t : later) {
+            const uint64_t b = fmt::decode_tsharp(t).base;
+            const bool possible_target=target_bases.count(b)!=0;
+            if(possible_target)tsharp_bases.insert(b);
+            // Preparing a later attachment must not publish it as
+            // the owner of memory sampled by an earlier draw.
+            const bool is_target=possible_target&&(target_by_base.count(b)||stencil_by_base.count(b));
+            if(!is_target||!target_current(b))upload_texture(t);
         }
+        // An engine buffer the loader has not uploaded yet when the draw was captured: upload it
+        // now, from the bytes the engine handed over at bind, ahead of this list.
+        for (size_t di = 0; di < count; ++di) {
+            Draw& d = *draws[di];
+            if (d.kind != Draw::Indexed && d.kind != Draw::Auto) continue;
+            auto prepare = [&](unsigned slot, const Draw::Res& r) {
+                if ((d.native_geo_mask >> slot & 1) || !r.id || !r.size || !r.object) return;
+                Draw::NativeGeometry g{};
+                if (!native_buffer(r, g) && native_buffer_upload(r.object, uint32_t(r.id >> 32), true)) {
+                    ++nbuf_first_use;
+                    native_buffer(r, g);
+                }
+                if (g.buffer) d.native_geo[slot] = g, d.native_geo_mask |= 1u << slot;
+            };
+            if (d.kind == Draw::Indexed) prepare(16, d.ires);
+            if (d.inline_vertices.empty())
+                for (unsigned slot = 0; slot < 16; ++slot) prepare(slot, d.vres[slot]);
+        }
+        flush_uploads();
     }
     const uint64_t end=now_ns();
-    t_pre_geometry+=end-t_geometry;st.t_pre+=end-tp;
+    t_pre_views+=end-t_views;st.t_pre+=end-tp;
 }
 
 
@@ -5375,7 +5385,7 @@ void Renderer::resolve_material(Draw* d) {
         }
     d->material_ready = true;
     // Engine vertex and index buffers already prepared on the GPU: bind them directly. Buffers not
-    // prepared yet are left to the recording pass, which uploads them.
+    // prepared yet are uploaded by the pre-pass of the list that records them.
     d->native_geo_mask = d->geo_captured = 0;
     auto take = [&](unsigned slot, const Draw::Res& r) {
         if (Draw::NativeGeometry g; native_buffer(r, g)) {
@@ -5581,21 +5591,7 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
     begin_record();
     uint64_t lap0 = now_ns();
     // (the list's GPU memory copies are applied at its submission: apply_memory_writes)
-    pre_for = &R;
-    if(up_rec.cur!=UINT32_MAX)pre_pass(items.data(),items.size());
-    else{
-        // The experimental early recorder may exhaust upload slots.
-        // Preserve the conservative captured binding set in that case.
-        for(Draw* d:items){
-            if(d->kind!=Draw::Indexed&&d->kind!=Draw::Auto)continue;
-            d->shader_res[0]=d->vs&&opt.res_current?opt.res_current(uint64_t(d->vs)):0;
-            d->shader_res[1]=d->ps&&opt.res_current?opt.res_current(uint64_t(d->ps)):0;
-            d->active_tex_mask[0]=d->tex_mask[0];
-            d->active_tex_mask[1]=d->tex_mask[1];
-            d->native_tex_ready[0]=d->native_tex_ready[1]=0;
-        }
-    }
-    pre_for = nullptr;
+    pre_pass(items.data(), items.size(), lk, relock);
     lr_phase[0] += now_ns() - lap0;
     tr = &R;
     // Resolve once per plain run after its actual targets have been bound.
@@ -5641,9 +5637,16 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
                 i = j - 1;
                 break;
             }
-            feedback_snapshots(items.data() + i, j - i, colors, depth);
-            lr_phase[2] += now_ns() - lap, lap = now_ns();
+            // A run that samples no attached target needs no snapshot, and only this list's own pass
+            // state changes: decided without the lock from this thread's target lookups.
             lk.unlock();
+            if (!feedback_snapshots(items.data() + i, j - i, colors, depth, false, true)) {
+                relock();
+                feedback_snapshots(items.data() + i, j - i, colors, depth);
+                ++lr_fb_locked;
+                lk.unlock();
+            }
+            lr_phase[2] += now_ns() - lap, lap = now_ns();
             ++lr_runs;
             resolve_draw_resources(items.data() + i, j - i, &lk);
             if (!lk.owns_lock()) relock();
@@ -6100,7 +6103,7 @@ void Renderer::queue_readbacks() {
         if (!img || img->last_used != rc().submit_no || img->depth || img->is3d || img->swap || !img->bpp || img->bpp % 8 ||
             uint64_t(img->w) * img->h > max_pix || !img->base)
             continue;
-        if(img->last_write_submit!=rc().submit_no){++readback_unused_skipped;continue;}
+        if(img->last_write_submit.load(std::memory_order_relaxed)!=rc().submit_no){++readback_unused_skipped;continue;}
         if (img->sampled || sampled_bases.count(img->base) || base_targets[img->base] != 1 || tsharp_bases.count(img->base)) {
             static std::unordered_set<uint64_t> told;
             if (std::getenv("D1_NG_LOG_READBACK") && told.insert(img->base).second)
@@ -6945,12 +6948,14 @@ void print_stats() {
     if (const double f = double(s.frames - s.t_frames); f > 0 && g->list_rec) {
         double p[7];
         for (int k = 0; k < 7; ++k) p[k] = double(g->lr_phase[k].exchange(0)) / f / 1e6;
+        const double pre_free = double(g->lr_pre_free.exchange(0)) / f / 1e6;
+        p[0] -= pre_free;
         const double runs = double(g->lr_runs.exchange(0)), locked_runs = double(g->lr_resolve_locked.exchange(0));
-        log("native renderer: engine-thread recording ms/frame: under the lock: pre-pass %.2f, targets %.2f, feedback %.2f, "
-            "pass begin %.2f, end %.2f | resolve %.2f (%.0f%% of runs needed the lock: CPU textures %llu, new lookups %llu, feedback copies %llu) | without the lock: draws %.2f",
-            p[0], p[1], p[2], p[4], p[6], p[3], runs > 0 ? 100.0 * locked_runs / runs : 0.0,
+        log("native renderer: engine-thread recording ms/frame: under the lock: pre-pass %.2f, targets %.2f, feedback %.2f (%.0f%% of runs), "
+            "pass begin %.2f, end %.2f | resolve %.2f (%.0f%% of runs needed the lock: CPU textures %llu, new lookups %llu, feedback copies %llu) | without the lock: texture views %.2f, draws %.2f",
+            p[0], p[1], p[2], runs > 0 ? 100.0 * double(g->lr_fb_locked.exchange(0)) / runs : 0.0, p[4], p[6], p[3], runs > 0 ? 100.0 * locked_runs / runs : 0.0,
             (unsigned long long)g->lr_lock_why[0].exchange(0), (unsigned long long)g->lr_lock_why[1].exchange(0),
-            (unsigned long long)g->lr_lock_why[2].exchange(0), p[5]);
+            (unsigned long long)g->lr_lock_why[2].exchange(0), pre_free, p[5]);
     }
     if (const double f = double(s.frames - s.t_frames); f > 0)
         log("native renderer: pre-pass per frame: targets %.2f ms, texture checks %.2f ms (%.0f, %.0f unwatched), texture loads %.2f ms "
@@ -6991,9 +6996,8 @@ void print_stats() {
         log("native renderer: feedback loops: %llu target snapshots copied, %llu reused | texture copies made stale by copy commands %llu, by readbacks %llu, by CPU writes %llu",
             (unsigned long long)g->snap_copies, (unsigned long long)g->snap_reused, (unsigned long long)g->dma_stale,
             (unsigned long long)g->readback_stale, (unsigned long long)g->cpu_stale);
-        log("native renderer: feedback snapshots reused across ordered submissions %llu, allocation failures %llu",
-            (unsigned long long)g->snap_cross_submit,(unsigned long long)g->snap_failed);
-        g->snap_cross_submit=g->snap_failed=0;
+        log("native renderer: feedback snapshot allocation failures %llu", (unsigned long long)g->snap_failed);
+        g->snap_failed=0;
         if (const uint64_t expired = g->expired_gpu_results.exchange(0))
             log("native renderer: %llu delayed results rejected (mapping expired or unwritable)", (unsigned long long)expired);
         {

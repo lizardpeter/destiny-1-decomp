@@ -164,8 +164,17 @@ address. Measured on lavapipe, Earth patrol: runs that needed the lock went from
 new lookups per statistics interval) to 15-18% (350-520), and resolution under the lock from 5-8 ms
 to 0.3-1.6 ms per frame. Rendered frames are unchanged.
 
-Still to do in this stage: the pre-pass and feedback copies under the lock; two recording stalls of
-130-145 ms without new shaders or pipelines, not yet explained.
+The pre-pass resolves each draw's engine texture views without the lock too; only render targets,
+CPU-written textures and buffers the loader has not uploaded yet (uploaded at first use, in the
+shared upload slot) are prepared under it. Feedback snapshots are decided from a per-thread cache of
+which target a T# samples, with the same generations: a run that samples no attached target (no
+snapshot needed) changes only its own list's pass state and takes no lock. Lavapipe, Earth patrol:
+runs whose feedback check took the lock went from 84% to 13%. The cross-submission snapshot reuse
+(`target_revision`) only applied to the deleted queue-thread path and was removed with it; a target's
+last writing submission is an atomic, as recording threads set it.
+
+Still to do in this stage: measure on the Arc (lavapipe on two cores cannot show lock wait
+reliably); two recording stalls of 130-145 ms without new shaders or pipelines, not yet explained.
 
 ## Target
 
