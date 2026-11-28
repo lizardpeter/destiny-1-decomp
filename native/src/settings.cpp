@@ -48,8 +48,10 @@ vsync = off-tearing            # [D1_VSYNC]
 # Stats overlay (FPS, render/window resolution, v-sync, GPU). F3 toggles it while running.
 overlay = false                # [D1_OVERLAY=1]
 
-# Frame-rate limit (30 for now, while debugging): 0 = unlimited (one game tick per rendered frame), or a cap such as
-# 60, 120 or 144 (30 is the console's own rate). Use vsync = on to lock to the display.
+# Frame rate: the game runs one fixed simulation tick per frame at this rate, e.g. 30 (the
+# console's), 60, 120 or 144. Set it to what the PC sustains: below it the game slows down
+# rather than skipping time. Use vsync = on to lock to the display. Above 30, systems the game
+# tuned for 30 ticks a second (weapon recoil, for one) are still being fixed.
 fps = 30                       # [D1_FPS]
 
 # Discord Rich Presence (needs the Discord desktop app running).
@@ -142,7 +144,7 @@ static void apply_setting(const std::string& key, const std::string& v) {
     else if (key == "fullscreen") s.fullscreen = truthy(v);
     else if (key == "vsync") s.vsync = v;
     else if (key == "overlay") s.overlay = truthy(v);
-    else if (key == "fps") s.fps = (v == "unlimited" || v == "max") ? 0 : std::atoi(v.c_str());
+    else if (key == "fps") s.fps = std::atoi(v.c_str());
     else if (key == "fov") s.fov = static_cast<float>(std::atof(v.c_str()));
     else if (key == "discord") s.discord = truthy(v);
     else if (key == "discord_app_id") s.discord_app_id = v;
@@ -230,7 +232,7 @@ void load_settings(const std::string& path) {
     log("settings: render resolution %dx%d", s.render_width, s.render_height);
     log("settings: %s (game %s, backend %s, window %dx%d%s, vsync %s, fps %s, fov %.1f, discord %s)", g_path.c_str(), s.game_dir.c_str(), s.backend.c_str(), s.window_width,
         s.window_height, s.fullscreen ? " fullscreen" : "", s.vsync.c_str(),
-        s.fps ? std::to_string(s.fps).c_str() : "unlimited", s.fov,
+        std::to_string(s.fps).c_str(), s.fov,
         !s.discord ? "off" : s.discord_app_id.empty() ? "no app id" : "on");
 }
 

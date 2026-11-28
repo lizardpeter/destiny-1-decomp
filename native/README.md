@@ -87,7 +87,7 @@ with commented defaults. Environment variables override it:
 | `overlay` | `D1_OVERLAY=1` | stats overlay (FPS, frame time, where a frame's time goes, render and window resolution, v-sync, GPU, game state); F3 toggles it while running. The same breakdown is logged every 10 s as a `perf:` line |
 | `render_resolution` | `D1_RENDER_RESOLUTION=2560x1440` | the game's own internal resolution (1920x1080 on the console): display buffers and UI at this size; the 3D scene follows it up to 1920x1080 (above that the game crashes in a job at the title screen; `D1_SCENE_RESOLUTION=0` keeps the scene at 1920x1080) |
 | `vsync` | `D1_VSYNC` | `off-tearing` (default: Immediate, lowest latency, may tear), `off` (Mailbox: newest frame at the next refresh, no tearing), `on` (Fifo) |
-| `fps` | `D1_FPS` | frame-rate limit: 0 / `unlimited` runs with no limiter; a number caps it (30 = the console's rate). Either way every rendered frame runs one game tick of that frame's real length, so game time stays real time when the cap is not reached |
+| `fps` | `D1_FPS` | frame rate: the game runs one fixed simulation tick per frame at this rate (30 = the console's; default 30 while systems tuned for 30 ticks a second are fixed). Below the rate the game slows down rather than skipping time |
 | `aim` | `D1_AIM=toggle` | aim down sights: `hold` (default) or `toggle` (press to aim, press again to stop) |
 | `discord`, `discord_app_id` | `D1_DISCORD=0`, `D1_DISCORD_APP_ID` | Discord Rich Presence over Discord's local IPC socket; needs the Discord desktop app and an application id |
 
@@ -101,7 +101,6 @@ engine-side patch (not done yet).
 |---|---|
 | `D1_TRACE=1` | log every firmware call with its first three arguments |
 | `D1_TIMING_TRACE=1` | (research) in the world, log every frame's game time outputs (elapsed, tick dt, tick count) and the player update's dt / nominal / facing and camera kicks |
-| `D1_TICK_NOMINAL30=1` | (research) keep the console's fixed 1/30 nominal tick instead of the frame's real tick |
 | `D1_SEMA_BROADCAST=1` | (research) semaphore signals wake every waiter (the old behaviour) instead of only as many as the count allows |
 | `D1_CALL_STATS=1` | route every implemented import through the logging entry (call counts at exit, the last calls in crash reports); off by default, implemented imports jump straight to their code |
 | `D1_TRACE_CALLS=off[:n][/a[+bytes]],...` | (research) log the first n calls (default 20) of up to 16 eboot functions (hex offsets): six integer arguments, return value and caller; `/a` also dumps the memory argument a (0-5) points at before the call (default 0x80 bytes). Only for functions with at most six integer / pointer arguments |
@@ -142,7 +141,6 @@ Native renderer (`native/gfx`): the native asset loader and resource registry ar
 | `D1_PC_PTHREAD_KEYS=1` | experimental native guest key registry with a single host exit-notification key; guest destructor/cancellation behavior still needs live validation |
 | `D1_FIOS_TRACE=1` | Bounded first 32 calls per native FIOS import argument trace |
 | `D1_NATIVE_FRAME_TRACE=1` | optional scheduler instrumentation: observe published 0x591D40 frame records, including follow-up steps and aggregate timing channels; reports every 10 seconds. |
-| `D1_NATIVE_FIXED_TICK=1` | experimental fixed-step path: preserve the original accumulator period and temporarily suppress the forced one-primary-step branch during timing calculation. Not the default; animation, physics, networking, and stage scheduling need live validation. |
 | `D1_NG_READBACK=<pixels>` | largest never-sampled render target written back to guest memory for the CPU (default 4096, 0 off); `D1_NG_LOG_READBACK=1` lists the decisions |
 | `D1_NG_STATS=1` | renderer statistics every 5 s instead of 15 s |
 | `D1_NG_LOG_FAULTS=1` | the 64 KiB regions the game keeps rewriting (write-protection faults) |

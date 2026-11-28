@@ -1,1 +1,2 @@
 id	build	va	function	source	kind	priority	description	evidence	enhanced
+B0001	ps4-0133	00900ad0	camera kick	native/src/hooks.cpp (D1_TIMING_TRACE)	limit	high	Weapon camera kick is applied per simulation tick and scaled by tick / nominal tick; at a fixed tick above 30 Hz the full kick lands on every tick, so recoil grows with the tick rate.	Measured with D1_TIMING_TRACE: 5x the recoil at 144 ticks a second when the nominal tick followed the rate.	planned

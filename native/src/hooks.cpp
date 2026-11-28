@@ -264,7 +264,6 @@ const char* game_state();
 // D1_TIMING_TRACE=1 (research): log every player control update in the world: wall time,
 // the update's dt, the summed dt (game time) and the desired facing (yaw, pitch), to compare
 // runs at different frame rates (with D1_STATE_PRESS scripting turns, fire, movement).
-static float g_real_tick = 0.0f;  // seconds of the current game tick (game_time_hook; 0 = unknown)
 using ImpulseFn = D1_SYSV uint64_t (*)(float, int32_t, float*, float*, void*);
 static ImpulseFn g_impulse_orig = nullptr;
 // Camera kick (recoil) samples (0x900AD0) are per-tick amounts tuned for 30 ticks a second,
@@ -1710,117 +1709,40 @@ static D1_SYSV bool steal_guard() {
 // (research: does the editor controller load a world without online services?).
 static D1_SYSV bool flag_true() { return true; }
 
-// ---- frame rate (eboot+0x593F00 builds "time control config globals", pointer at 0x26BCD08)
-// Config fields (µs): +0x08 frame period (33366 = 29.97 fps), +0x28 vblank period,
-// +0x38 integer target fps. The main loop (0x594460) waits until last frame + period
-// (`add rcx, [rsi+8]` at 0x594A3B), and the game-time update (0x591710, given the real
-// elapsed seconds) runs elapsed / period simulation ticks of one period each (0x593890
-// seconds, 0x5938B0 fps), so game time stays wall-clock correct and the tick rate equals
-// the target. But the tick count per frame is capped (about two), so with fixed short ticks
-// a frame slower than two periods loses game time (slow motion). So in both modes, every
-// frame, the period is set to that frame's real duration (1-33.4 ms) just before the tick
-// math: one simulation tick per rendered frame with dt = the frame time (below 30 fps
-// several 33 ms ticks). `fps = N` then puts the period back to 1/N for the limiter's wait;
-// `fps = 0` (unlimited) removes the wait. The integer rate (+0x38) stays the console's 30:
-// the game copies it into its nominal tick (game time globals +8 = 1/30, read by 0x591B80),
-// and per-tick effects scale by dt / nominal (camera kick 0x900AD0); a nominal that follows
-// the frame rate made recoil apply in full on every tick (5x at 144 fps, D1_TIMING_TRACE).
+// ---- tick rate (eboot+0x593F00 builds "time control config globals", pointer at 0x26BCD08)
+// Config fields (us): +0x08 frame period (33366 on the console), +0x38 the integer tick rate
+// (30). The game's simulation tick is fixed: 0x009067F0 copies +0x38 (read by 0x593880) into the
+// game options, whose first field is the tick rate (0x009067E0); 0x5915C0 sets the game-time
+// globals (0x26BC880: +4 ticks per second, +8 seconds per tick) from it, and time-scale effects
+// recompute from the same integer (0x591710). The main loop (0x594460) paces frames by +0x08
+// (`add rcx, [rsi+8]` at 0x594A3B) and the game-time update (0x591710) turns the real elapsed time
+// into ticks of +0x08 each. So the tick rate is configured once, here, at its source: the rate and
+// the period both become the `fps` setting. One fixed tick per frame at that rate, no
+// interpolation and no tick that follows the frame time (a per-frame tick rate is what made the
+// orbit planet, trees and sky shake). Systems that assume 30 ticks a second are fixed where they
+// are, in the game code (records/bugs.tsv, kind limit).
 using TimeInitFn = D1_SYSV void (*)(void*);
-using GameTimeFn = D1_SYSV void (*)(float, float*, int32_t*, float*, int32_t*);
 static TimeInitFn g_time_init_orig = nullptr;
-static GameTimeFn g_game_time_orig = nullptr;
-static int64_t g_original_frame_period_us = 0;
-static bool fixed_tick_research() {
-    static const bool enabled = [] { const char* v = getenv("D1_NATIVE_FIXED_TICK"); return v && std::atoi(v) != 0; }();
-    return enabled;
+static int tick_rate() {
+    const int fps = settings().fps;
+    return fps >= 30 ? std::min(fps, 1000) : 30;
 }
 static D1_SYSV void time_init_hook(void* cfg) {
     g_time_init_orig(cfg);
-    static const int fps = settings().fps;
     auto* tc = *reinterpret_cast<uint8_t**>(rt().modules[0].base + 0x26BCD08);
     if (!tc) return;
-    g_original_frame_period_us = *reinterpret_cast<int64_t*>(tc + 0x08);
-    if (fixed_tick_research()) log("hooks: fixed-tick research: original accumulator period %lld us", (long long)g_original_frame_period_us);
-    if (fps <= 0) return;
-    *reinterpret_cast<int64_t*>(tc + 0x08) = 1000000 / fps;
-    log("hooks: frame rate target %d fps (period %d us)", fps, 1000000 / fps);
-}
-static D1_SYSV void game_time_hook(float elapsed, float* dt, int32_t* ticks, float* dt2, int32_t* ticks2) {
-    auto* tc = *reinterpret_cast<uint8_t**>(rt().modules[0].base + 0x26BCD08);
-    auto* gt = *reinterpret_cast<uint8_t**>(rt().modules[0].base + 0x26BC880);
-    static const bool nominal30 = getenv("D1_TICK_NOMINAL30") != nullptr;  // research: old behaviour
-    const bool fixed = fixed_tick_research() && tc && g_original_frame_period_us > 0;
-    const int64_t pacing_period = tc ? *reinterpret_cast<int64_t*>(tc + 8) : 0;
-    auto* force_primary = reinterpret_cast<uint8_t*>(rt().modules[0].base + 0x18DCAA4);
-    const uint8_t saved_force = fixed ? *force_primary : 0;
-    if (fixed) {
-        // 0x591710's normal accumulator uses +8, whereas the main scheduler
-        // uses the same field for pacing. Keep the original accumulator
-        // period and let the original zero/multi-step path run in this mode.
-        // Do not modify the nominal game rate, pause, timescale or cap logic.
-        *reinterpret_cast<int64_t*>(tc + 8) = g_original_frame_period_us;
-        *force_primary = 0;
-    } else if (tc && std::isfinite(elapsed) && elapsed > 0.0f) {
-        // One tick of the frame's real duration. The game runs at most about two ticks per
-        // frame (0x591710 caps the count), so fixed short ticks lose time whenever a frame
-        // takes longer than two periods (fps = 120 rendering at 50: slow motion).
-        // The simulation's tick dt is the nominal tick (game time globals +4 ticks per
-        // second, +8 seconds; 0x591B80; 0x591710 returns it as the tick's dt), so it follows
-        // the frame too, set before the call so this frame's ticks use it. It is kept a
-        // consistent pair, 1 / an integer rate (30..1000): a nominal off the console's exact
-        // 1/30 (29 ticks a second at 33.366 ms) hid the orbit character screen's character.
-        static const int32_t forced = [] { const char* e = getenv("D1_TICK_RATE_FORCE"); return e ? std::atoi(e) : 0; }();  // research
-        const int32_t rate = forced > 0 ? std::clamp(forced, 30, 1000) :
-            int32_t(std::clamp(1.0 / double(elapsed) + 0.5, 30.0, 1000.0));
-        *reinterpret_cast<int64_t*>(tc + 0x08) = (1000000 + rate / 2) / rate;
-        if (gt && !nominal30) {
-            *reinterpret_cast<int32_t*>(gt + 4) = rate;
-            *reinterpret_cast<float*>(gt + 8) = 1.0f / float(rate);
-        }
-        g_real_tick = 1.0f / float(rate);
-    }
-    g_game_time_orig(elapsed, dt, ticks, dt2, ticks2);
-    if (fixed) {
-        *force_primary = saved_force;
-        *reinterpret_cast<int64_t*>(tc + 8) = pacing_period;
-        g_real_tick = gt ? *reinterpret_cast<float*>(gt + 8) : 0.0f;
-    }
-    {  // 0x591d40 consumes aggregate time, then splits additional steps
-        static auto since = std::chrono::steady_clock::now();
-        static double sum_elapsed = 0, sum_primary = 0, sum_secondary = 0;
-        static int frames = 0, ticks_total = 0, ticks2_total = 0, zero = 0, multi = 0;
-        sum_elapsed += elapsed;
-        sum_primary += *dt; // aggregate seconds, NOT dt * count
-        sum_secondary += *dt2;
-        ticks_total += *ticks;
-        ticks2_total += *ticks2;
-        zero += *ticks == 0;
-        multi += *ticks > 1;
-        ++frames;
-        const auto now = std::chrono::steady_clock::now();
-        if (const double wall = std::chrono::duration<double>(now - since).count(); wall >= 10.0) {
-            const char* gs = game_state();
-            log("timing: %.1f s real, %.1f s measured by the game, %.3f s primary aggregate, %.3f s secondary aggregate | %d batches, %d/%d scheduled steps, %d zero / %d multi (%s)", wall,
-                sum_elapsed, sum_primary, sum_secondary, frames, ticks_total, ticks2_total, zero, multi, gs ? gs : "?");
-            since = now, sum_elapsed = sum_primary = sum_secondary = 0;
-            frames = ticks_total = ticks2_total = zero = multi = 0;
-        }
-    }
-    static const bool trace = getenv("D1_TIMING_TRACE") != nullptr;
-    if (trace) {
-        static int n = 0;
-        const char* gs = game_state();
-        if (gs && std::strcmp(gs, "activity:in_world") == 0 && ++n < 20000)
-            log("timing: frame elapsed %.5f dt %.5f ticks %d dt2 %.5f ticks2 %d real %.5f", elapsed, *dt, *ticks, *dt2, *ticks2, g_real_tick);
-    }
-    static const int fps = settings().fps;
-    if (tc && fps > 0)  // the limiter (0x594A3B) waits for the target period again
-        *reinterpret_cast<int64_t*>(tc + 0x08) = 1000000 / fps;
+    const int rate = tick_rate();
+    const int64_t console_period = *reinterpret_cast<int64_t*>(tc + 0x08);
+    const int32_t console_rate = *reinterpret_cast<int32_t*>(tc + 0x38);
+    *reinterpret_cast<int64_t*>(tc + 0x08) = (1000000 + rate / 2) / rate;
+    *reinterpret_cast<int32_t*>(tc + 0x38) = rate;
+    log("hooks: fixed game tick %d Hz, one per frame (period %lld us; the console's was %d Hz, %lld us)", rate,
+        (long long)*reinterpret_cast<int64_t*>(tc + 0x08), console_rate, (long long)console_period);
 }
 
 // 0x591D40 publishes a 0x38-byte frame state before the job graph is kicked.
 // Observe the actual scheduled step, including follow-up steps that do not
-// call game_time_hook. This distinguishes accumulator loss from stage stalls.
+// call 0x591710. This distinguishes accumulator loss from stage stalls.
 using PublishFrameTimeFn = D1_SYSV void (*)(uint32_t, uint32_t);
 static PublishFrameTimeFn g_publish_frame_time_orig = nullptr;
 static D1_SYSV void publish_frame_time_hook(uint32_t previous, uint32_t next) {
@@ -2790,23 +2712,8 @@ void install_game_hooks() {
             hook_function(exe.base + 0x591D40, reinterpret_cast<const void*>(&publish_frame_time_hook)));
         if (!g_publish_frame_time_orig) log("hooks: frame schedule publication trace FAILED");
     }
-    if (settings().fps > 0) {
-        g_time_init_orig = reinterpret_cast<TimeInitFn>(hook_function(exe.base + 0x593F00, reinterpret_cast<const void*>(&time_init_hook)));
-        g_game_time_orig = reinterpret_cast<GameTimeFn>(hook_function(exe.base + 0x591710, reinterpret_cast<const void*>(&game_time_hook)));
-        if (!g_time_init_orig || !g_game_time_orig) log("hooks: frame-rate hook FAILED");
-    } else {  // unlimited: remove the limiter, retain scheduler contracts
-        if (fixed_tick_research())
-            g_time_init_orig = reinterpret_cast<TimeInitFn>(hook_function(exe.base + 0x593F00, reinterpret_cast<const void*>(&time_init_hook)));
-        auto* wait = reinterpret_cast<uint8_t*>(exe.base + 0x594A3B);
-        const uint8_t expect[4] = {0x48, 0x03, 0x4E, 0x08}, nop4[4] = {0x0F, 0x1F, 0x40, 0x00};
-        g_game_time_orig = reinterpret_cast<GameTimeFn>(hook_function(exe.base + 0x591710, reinterpret_cast<const void*>(&game_time_hook)));
-        if (g_game_time_orig && std::memcmp(wait, expect, 4) == 0) {
-            std::memcpy(wait, nop4, 4);
-            log("hooks: frame rate unlimited (%s)", fixed_tick_research() ? "fixed-tick research" : "variable tick");
-        } else {
-            log("hooks: unlimited frame rate hook FAILED");
-        }
-    }
+    g_time_init_orig = reinterpret_cast<TimeInitFn>(hook_function(exe.base + 0x593F00, reinterpret_cast<const void*>(&time_init_hook)));
+    if (!g_time_init_orig) log("hooks: tick rate hook FAILED");
     if (const char* w = getenv("D1_WORLD_CONTROLLER"); w && std::strcmp(w, "editor") == 0) {
         replace_function(exe.base + 0x239B70, reinterpret_cast<const void*>(&flag_true));
         log("hooks: editor world controller selected");

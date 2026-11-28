@@ -127,10 +127,10 @@ the console) removed the shaking, and game time matched real time (9.97 s per 10
 the variable tick). It never appeared in headless runs because at about one frame per second the rate is
 always clamped to 30.
 
-The fix is piece 4, not another timing patch: keep the simulation on its authored tick and present
-more often by reconstructing the frame scheduler (`00594460`, `00593970`, `00591710`, `00591d40`). The
-per-frame rewrite of the tick rate is removed when that lands. Until then, `fps = 30` is the correct
-setting.
+The fix is piece 4, not another timing patch. Chosen design: a fixed simulation tick at the frame
+rate, one tick per frame, with no interpolation. The tick rate is now configured once at its source
+and the per-frame rewrite is gone; see [frame-scheduler.md](frame-scheduler.md). What remains is
+fixing the systems that assume 30 ticks a second; until they are, the default stays `fps = 30`.
 
 ## Acceptance for each piece
 
