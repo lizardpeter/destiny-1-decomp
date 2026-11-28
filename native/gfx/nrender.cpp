@@ -1033,6 +1033,7 @@ struct Renderer {
         return it == dyn_mem.end() ? ~0ull : it->second.second + 1;
     }
     std::atomic<uint64_t> lr_lists{0}, lr_ns{0}, lr_wait_ns{0}, lr_sub_ns{0};  // (statistics)
+    std::atomic<uint64_t> lr_phase[7]{};  // locked: pre-pass, targets, feedback, resolve, pass begin; unlocked: draws; locked: end
     bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late);
     void pre_pass(Draw* const* draws, size_t count);
     void run_inline(Draw* const* run,size_t n);
@@ -5844,6 +5845,7 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
     up_rec.lr = true;
     up_rec.submit_no = R.submit_no;
     begin_record();
+    uint64_t lap0 = now_ns();
     run_copies(items.data(), items.size());
     pre_for = &R;
     if(up_rec.cur!=UINT32_MAX)pre_pass(items.data(),items.size());
@@ -5860,6 +5862,7 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
         }
     }
     pre_for = nullptr;
+    lr_phase[0] += now_ns() - lap0;
     tr = &R;
     // Resolve once per plain run after its actual targets have been bound.
     for (const Draw* d : items) R.q_on |= d->kind == Draw::ZPass;
@@ -5894,29 +5897,37 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
                        std::memcmp(x->depth, d->depth, sizeof d->depth) == 0;
             };
             while (j < items.size() && plain(items[j])) ++j;
+            uint64_t lap = now_ns();
             Image* colors[8] = {};
             for (int k = 0; k < 5; ++k) colors[k] = color_target(d->color[k]);
             Image* depth = depth_target(d->depth);
+            lr_phase[1] += now_ns() - lap, lap = now_ns();
             if (!depth && std::none_of(colors, colors + 8, [](Image* x) { return x != nullptr; })) {
                 for (size_t k = i; k < j; ++k) skip("no target");
                 i = j - 1;
                 break;
             }
             feedback_snapshots(items.data() + i, j - i, colors, depth);
+            lr_phase[2] += now_ns() - lap, lap = now_ns();
             resolve_draw_resources(items.data() + i, j - i);
+            lr_phase[3] += now_ns() - lap, lap = now_ns();
             begin_pass(colors, depth);
+            lr_phase[4] += now_ns() - lap;
             // The early recorder shares Rec across attachment runs; the
             // adjacent PSO fast path is valid only inside the current run.
             run_rec.last_pipeline_draw=nullptr;
             run_rec.last_pipeline=nullptr;
             lk.unlock();
+            lap = now_ns();
             for (size_t k = i; k < j; ++k) draw(*items[k], run_rec, colors, depth);
+            lr_phase[5] += now_ns() - lap;
             relock();
             i = j - 1;
             break;
         }
         }
     }
+    uint64_t lap_end = now_ns();
     par_draws += run_rec.draws;
     ++par_runs;
     merge(run_rec);
@@ -5929,6 +5940,7 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
     if (subs[R.cur].timepool)
         vkCmdWriteTimestamp2(R.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, subs[R.cur].timepool, 1);
     vkEndCommandBuffer(R.cmd);
+    lr_phase[6] += now_ns() - lap_end;
     subs[R.cur].state = Sub::Recorded;
     subs[R.cur].copies.clear();
     subs[R.cur].dyn = std::move(R.dyn);
@@ -7192,6 +7204,13 @@ void print_stats() {
             "(%.2f ms waiting for the renderer lock) | submitting them %.2f ms per frame",
             double(g->lr_lists.exchange(0)) / f, double(g->lr_ns.exchange(0)) / f / 1e6, double(g->lr_wait_ns.exchange(0)) / f / 1e6,
             double(g->lr_sub_ns.exchange(0)) / f / 1e6);
+    if (const double f = double(s.frames - s.t_frames); f > 0 && g->list_rec) {
+        double p[7];
+        for (int k = 0; k < 7; ++k) p[k] = double(g->lr_phase[k].exchange(0)) / f / 1e6;
+        log("native renderer: engine-thread recording ms/frame: under the lock: pre-pass %.2f, targets %.2f, feedback %.2f, "
+            "resolve %.2f, pass begin %.2f, end %.2f | without it: draws %.2f",
+            p[0], p[1], p[2], p[3], p[4], p[6], p[5]);
+    }
     if (const double f = double(s.frames - s.t_frames); f > 0)
         log("native renderer: pre-pass per frame: targets %.2f ms, texture checks %.2f ms (%.0f, %.0f unwatched), texture loads %.2f ms "
             "(detile %.2f, mip check %.2f, protect %.2f, new images %.2f)",
