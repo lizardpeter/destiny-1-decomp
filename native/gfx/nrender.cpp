@@ -281,14 +281,11 @@ VkStencilOp stencil_op(uint32_t o) {
 // Reference and write mask for a draw's stencil ops (DB_STENCILREFMASK: test value, test mask,
 // write mask, op value). Vulkan has one reference for the test and REPLACE, and no
 // AND/OR/XOR: the op that writes (z-pass, else z-fail, else fail) picks the value and mask.
-void stencil_dynamic(uint32_t stencil_ctl, uint32_t depth_ctl, uint32_t refmask, uint32_t& ref, uint32_t& write_mask) {
+void stencil_dynamic(const RenderState& rs, uint32_t refmask, uint32_t& ref, uint32_t& write_mask) {
     ref = refmask & 0xFF, write_mask = refmask >> 16 & 0xFF;
     const uint32_t opval = refmask >> 24 & 0xFF;
-    uint32_t op = stencil_ctl >> 4 & 0xF;
-    if (!op) op = stencil_ctl >> 8 & 0xF;
-    if (!op) op = stencil_ctl & 0xF;
     int value = -1;
-    switch (op) {
+    switch (rs.stencil_op) {
     case 2: value = 0xFF; break;
     case 4: value = int(opval); break;
     case 10: value = 0, write_mask &= ~opval & 0xFF; break;
@@ -296,9 +293,117 @@ void stencil_dynamic(uint32_t stencil_ctl, uint32_t depth_ctl, uint32_t refmask,
     case 12: write_mask &= opval; break;
     default: break;
     }
-    const uint32_t func = depth_ctl >> 8 & 7;
-    if (value >= 0 && (func == 0 || func == 7 || !(depth_ctl & 1))) ref = uint32_t(value);
+    if (value >= 0 && rs.stencil_ref_from_op) ref = uint32_t(value);
 }
+
+}  // namespace
+
+// ---------------------------------------------------------------------------- render states
+// Interned once per distinct state: a table that only grows (ids index it without a lock) and a
+// map from the engine words, behind a shared mutex; each thread remembers its last few answers.
+namespace {
+constexpr uint32_t kMaxRenderStates = 1u << 16;
+RenderState g_states[kMaxRenderStates];
+std::atomic<uint32_t> g_state_count{0};
+std::shared_mutex g_states_m;
+std::unordered_map<uint64_t, uint32_t> g_state_by_value;  // (hash of the RenderState)
+std::unordered_map<uint64_t, uint32_t> g_state_by_words;  // (hash of the engine words)
+
+RenderState convert_state(uint8_t prim, uint32_t su_sc_mode, uint32_t blend, uint32_t target_mask, uint32_t depth_ctl,
+                          uint32_t stencil_ctl) {
+    RenderState r{};
+    r.prim = prim;
+    r.cull = uint8_t((su_sc_mode & 1 ? VK_CULL_MODE_FRONT_BIT : 0) | (su_sc_mode & 2 ? VK_CULL_MODE_BACK_BIT : 0));
+    r.front_face = uint8_t((su_sc_mode & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    r.depth_bias = (su_sc_mode >> 11 & 3) != 0;
+    r.depth_test = depth_ctl >> 1 & 1;
+    r.depth_write = depth_ctl >> 2 & 1;
+    r.depth_compare = uint8_t(depth_ctl >> 4 & 7);
+    r.stencil_test = depth_ctl & 1;
+    auto face = [](uint32_t func, uint32_t ops) {
+        return RenderState::Face{uint8_t(stencil_op(ops & 0xF)), uint8_t(stencil_op(ops >> 4 & 0xF)),
+                                 uint8_t(stencil_op(ops >> 8 & 0xF)), uint8_t(func & 7)};
+    };
+    r.front = face(depth_ctl >> 8, stencil_ctl);
+    r.back = (depth_ctl >> 7 & 1) ? face(depth_ctl >> 20, stencil_ctl >> 12) : r.front;
+    uint32_t op = stencil_ctl >> 4 & 0xF;
+    if (!op) op = stencil_ctl >> 8 & 0xF;
+    if (!op) op = stencil_ctl & 0xF;
+    r.stencil_op = uint8_t(op);
+    const uint32_t func = depth_ctl >> 8 & 7;
+    r.stencil_ref_from_op = func == 0 || func == 7 || !(depth_ctl & 1);
+    r.stencil_writes = (stencil_ctl & 0xFFFFFF) != 0;
+    if (blend >> 30 & 1) {
+        r.blend = 1;
+        r.color_src = uint8_t(blend_factor(blend & 0x1F));
+        r.color_op = uint8_t(blend_op(blend >> 5 & 7));
+        r.color_dst = uint8_t(blend_factor(blend >> 8 & 0x1F));
+        if (blend >> 29 & 1) {
+            r.alpha_src = uint8_t(blend_factor(blend >> 16 & 0x1F));
+            r.alpha_op = uint8_t(blend_op(blend >> 21 & 7));
+            r.alpha_dst = uint8_t(blend_factor(blend >> 24 & 0x1F));
+        } else {
+            r.alpha_src = r.color_src, r.alpha_op = r.color_op, r.alpha_dst = r.color_dst;
+        }
+    }
+    r.write_mask = target_mask;
+    return r;
+}
+
+uint32_t intern_state(const RenderState& r, uint64_t words_key, bool by_words) {
+    const uint64_t vk = hash_bytes(&r, sizeof r);
+    std::unique_lock lk(g_states_m);
+    uint32_t id;
+    if (auto it = g_state_by_value.find(vk); it != g_state_by_value.end() &&
+        std::memcmp(&g_states[it->second], &r, sizeof r) == 0)
+        id = it->second;
+    else {
+        id = g_state_count.load(std::memory_order_relaxed);
+        if (id >= kMaxRenderStates) return 0;  // (never reached: the game has a few hundred)
+        g_states[id] = r;
+        g_state_count.store(id + 1, std::memory_order_release);
+        g_state_by_value[vk] = id;
+    }
+    if (by_words) g_state_by_words[words_key] = id;
+    return id;
+}
+}  // namespace
+
+uint32_t render_state(uint8_t prim, uint32_t su_sc_mode, uint32_t blend, uint32_t target_mask, uint32_t depth_ctl,
+                      uint32_t stencil_ctl) {
+    const uint64_t words[3] = {uint64_t(prim) << 32 | su_sc_mode, uint64_t(blend) << 32 | target_mask,
+                               uint64_t(depth_ctl) << 32 | stencil_ctl};
+    struct Last { uint64_t w[3]; uint32_t id; bool valid; };
+    static thread_local Last last[16]{};
+    const uint64_t key = hash_bytes(words, sizeof words);
+    Last& l = last[key & 15];
+    if (l.valid && std::memcmp(l.w, words, sizeof words) == 0) return l.id;
+    uint32_t id;
+    bool found = false;
+    {
+        std::shared_lock lk(g_states_m);
+        if (auto it = g_state_by_words.find(key); it != g_state_by_words.end()) id = it->second, found = true;
+    }
+    // (a words hash collision would only cost a wrong cached id; the value check below decides)
+    const RenderState r = convert_state(prim, su_sc_mode, blend, target_mask, depth_ctl, stencil_ctl);
+    if (!found || std::memcmp(&g_states[id], &r, sizeof r) != 0) id = intern_state(r, key, true);
+    std::memcpy(l.w, words, sizeof words), l.id = id, l.valid = true;
+    return id;
+}
+
+uint32_t render_state(const RenderState& s) {
+    {
+        const uint64_t vk = hash_bytes(&s, sizeof s);
+        std::shared_lock lk(g_states_m);
+        if (auto it = g_state_by_value.find(vk); it != g_state_by_value.end() && std::memcmp(&g_states[it->second], &s, sizeof s) == 0)
+            return it->second;
+    }
+    return intern_state(s, 0, false);
+}
+
+const RenderState& render_state_of(uint32_t id) { return g_states[id < g_state_count.load(std::memory_order_acquire) ? id : 0]; }
+
+namespace {
 
 VkSamplerAddressMode address_mode(uint32_t c) {
     switch (c) {
@@ -677,7 +782,7 @@ struct Renderer {
         int32_t raw_vp[4]{};
         uint32_t raw_pass_w=0,raw_pass_h=0;
         float raw_znear=0,raw_zfar=0,raw_zk=0;
-        uint32_t raw_stencil_ctl=0,raw_depth_ctl=0,raw_stencil_ref=0;
+        uint32_t raw_state=0,raw_stencil_ref=0;
         uint32_t sref = 0, cmask = 0, wmask = 0;
         float bias[2]{};
         VkBuffer ib = VK_NULL_HANDLE;
@@ -1148,11 +1253,12 @@ struct Renderer {
         uint64_t tex_sig[2] = {};
         uint64_t vb_sig = 0;
         uint32_t vb1[16] = {}, vb3[16] = {};
-        uint32_t blend = 0, target_mask = 0, su_sc_mode = 0, depth_ctl = 0, stencil_ctl = 0;
+        RenderState state{};
         uint16_t color_fmt[8] = {};
         uint16_t depth_fmt = 0;
-        uint8_t prim = 0, depth_stencil = 0, tex_dk[2][16] = {};
+        uint8_t depth_stencil = 0, tex_dk[2][16] = {}, pad[9] = {};
     };
+    static_assert(sizeof(DiskPipeSpec) == 264, "no implicit padding: specs are hashed and stored as bytes");
     std::vector<DiskPipeSpec> pipe_specs;
     std::vector<uint8_t> spec_warmed;
     std::unordered_set<uint64_t> pipe_spec_hashes;
@@ -3177,12 +3283,8 @@ void Renderer::warm_shader_specs(const uint8_t* obj, bool vs, uint64_t res) {
         d.ps = pref.obj;
         d.shader_res[0] = vref.res;
         d.shader_res[1] = pref.res;
-        d.prim = sp.prim;
-        d.blend = sp.blend;
-        d.target_mask = sp.target_mask;
-        d.su_sc_mode = sp.su_sc_mode;
-        d.depth_ctl = sp.depth_ctl;
-        d.stencil_ctl = sp.stencil_ctl;
+        d.prim = sp.state.prim;
+        d.state = render_state(sp.state);
         d.vb_sig = sp.vb_sig;
         d.tex_sig[0] = sp.tex_sig[0];
         d.tex_sig[1] = sp.tex_sig[1];
@@ -3224,7 +3326,7 @@ void Renderer::warm_shader_specs(const uint8_t* obj, bool vs, uint64_t res) {
 
 void Renderer::load_pipeline_specs() {
     if (!opt.pipeline_cache) return;
-    const std::string path = std::string(opt.pipeline_cache) + ".specs.v2";
+    const std::string path = std::string(opt.pipeline_cache) + ".specs.v3";
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return;
     std::fseek(f, 0, SEEK_END);
@@ -3379,8 +3481,7 @@ uint64_t Renderer::pipe_key(const Draw& dr,uint64_t color_signature,uint64_t dep
     // and exclude dr.tex_mask[0..1] so leftover textures in unused device slots never cause misses.
     uint64_t k = mix(mix(shader_object_key(dr.vs, true, dr.shader_res[0]),
                          shader_object_key(dr.ps, false, dr.shader_res[1])), uint64_t(dr.prim));
-    k = mix(mix(k, uint64_t(dr.blend) | uint64_t(dr.target_mask) << 32), uint64_t(dr.su_sc_mode) | uint64_t(dr.depth_ctl) << 32);
-    k = mix(mix(k, dr.stencil_ctl), dr.vb_sig);
+    k = mix(mix(k, dr.state), dr.vb_sig);
     const uint64_t tsig0 = dr.tex_sig[0] & shader_tex_mask64(dr.vs, true, dr.shader_res[0]);
     const uint64_t tsig1 = dr.ps ? (dr.tex_sig[1] & shader_tex_mask64(dr.ps, false, dr.shader_res[1])) : 0;
     k = mix(mix(k, tsig0), tsig1);
@@ -3444,6 +3545,7 @@ Pipeline* Renderer::pipeline_resolve(const Draw& dr, Image* const* colors, Image
     if (uin | sin | scl) vs = shader(dr, true, dims[0], kinds[0], uin, sin, scl);
     Shader* ps = dr.ps ? shader(dr, false, dims[1], kinds[1]) : nullptr;  // no pixel shader: depth-only
     if (!vs->ok || (ps && !ps->ok)) return nullptr;
+    const RenderState& st8 = render_state_of(dr.state);
     VkPrimitiveTopology topo;
     if (!topology_of(dr.prim, topo)) return nullptr;
     // key
@@ -3454,8 +3556,7 @@ Pipeline* Renderer::pipeline_resolve(const Draw& dr, Image* const* colors, Image
         const uint32_t* v = dr.vb[a.vb_slot & 15];
         key = mix(key, (v[1] >> 16 & 0x3FFF) | uint64_t(v[3] >> 12 & 0x7F) << 16 | uint64_t(a.index_vgpr) << 24);
     }
-    key = mix(key, dr.blend), key = mix(key, dr.target_mask), key = mix(key, dr.su_sc_mode);
-    key = mix(key, dr.depth_ctl), key = mix(key, dr.stencil_ctl);
+    key = mix(key, dr.state);
     for (int i = 0; i < 8; ++i) key = mix(key, colors[i] ? colors[i]->format : 0);
     key = mix(key, depth ? depth->format : 0);
     auto it = pipelines.find(key);
@@ -3520,31 +3621,26 @@ Pipeline* Renderer::pipeline_resolve(const Draw& dr, Image* const* colors, Image
     vp.viewportCount = vp.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = opt.no_cull ? VK_CULL_MODE_NONE
-                              : VkCullModeFlags((dr.su_sc_mode & 1 ? VK_CULL_MODE_FRONT_BIT : 0) |
-                                                (dr.su_sc_mode & 2 ? VK_CULL_MODE_BACK_BIT : 0));
-    rs.frontFace = (dr.su_sc_mode & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.depthBiasEnable = (dr.su_sc_mode >> 11 & 3) != 0;
+    rs.cullMode = opt.no_cull ? VK_CULL_MODE_NONE : VkCullModeFlags(st8.cull);
+    rs.frontFace = VkFrontFace(st8.front_face);
+    rs.depthBiasEnable = st8.depth_bias;
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     if (depth) {
-        ds.depthTestEnable = (dr.depth_ctl >> 1) & 1;
-        ds.depthWriteEnable = (dr.depth_ctl >> 2) & 1;
-        ds.depthCompareOp = VkCompareOp(dr.depth_ctl >> 4 & 7);
-        ds.stencilTestEnable = depth->stencil && (dr.depth_ctl & 1);
-        auto face = [&](uint32_t func, uint32_t ops) {
+        ds.depthTestEnable = st8.depth_test;
+        ds.depthWriteEnable = st8.depth_write;
+        ds.depthCompareOp = VkCompareOp(st8.depth_compare);
+        ds.stencilTestEnable = depth->stencil && st8.stencil_test;
+        auto face = [](const RenderState::Face& f) {
             VkStencilOpState s{};
-            s.failOp = stencil_op(ops & 0xF);
-            s.passOp = stencil_op(ops >> 4 & 0xF);
-            s.depthFailOp = stencil_op(ops >> 8 & 0xF);
-            s.compareOp = VkCompareOp(func & 7);
+            s.failOp = VkStencilOp(f.fail), s.passOp = VkStencilOp(f.pass), s.depthFailOp = VkStencilOp(f.depth_fail);
+            s.compareOp = VkCompareOp(f.compare);
             s.compareMask = s.writeMask = 0xFF;
             return s;
         };
-        ds.front = face(dr.depth_ctl >> 8, dr.stencil_ctl);
-        ds.back = (dr.depth_ctl >> 7 & 1) ? face(dr.depth_ctl >> 20, dr.stencil_ctl >> 12) : ds.front;
+        ds.front = face(st8.front), ds.back = face(st8.back);
     }
     VkPipelineColorBlendAttachmentState cb[8]{};
     VkFormat cfmt[8]{};
@@ -3553,22 +3649,14 @@ Pipeline* Renderer::pipeline_resolve(const Draw& dr, Image* const* colors, Image
         if (colors[i]) ncolor = i + 1;
         cfmt[i] = colors[i] ? colors[i]->format : VK_FORMAT_UNDEFINED;
         auto& a = cb[i];
-        a.colorWriteMask = (dr.target_mask >> (4 * i)) & 0xF;
-        if (i < 4 && (dr.blend >> 30 & 1) && colors[i] && !is_int_format(colors[i]->format) &&
+        a.colorWriteMask = (st8.write_mask >> (4 * i)) & 0xF;
+        if (i < 4 && st8.blend && colors[i] && !is_int_format(colors[i]->format) &&
             (format_props(colors[i]->format).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) {
             a.blendEnable = VK_TRUE;
-            a.srcColorBlendFactor = blend_factor(dr.blend & 0x1F);
-            a.colorBlendOp = blend_op(dr.blend >> 5 & 7);
-            a.dstColorBlendFactor = blend_factor(dr.blend >> 8 & 0x1F);
-            if (dr.blend >> 29 & 1) {
-                a.srcAlphaBlendFactor = blend_factor(dr.blend >> 16 & 0x1F);
-                a.alphaBlendOp = blend_op(dr.blend >> 21 & 7);
-                a.dstAlphaBlendFactor = blend_factor(dr.blend >> 24 & 0x1F);
-            } else {
-                a.srcAlphaBlendFactor = a.srcColorBlendFactor;
-                a.alphaBlendOp = a.colorBlendOp;
-                a.dstAlphaBlendFactor = a.dstColorBlendFactor;
-            }
+            a.srcColorBlendFactor = VkBlendFactor(st8.color_src), a.dstColorBlendFactor = VkBlendFactor(st8.color_dst);
+            a.colorBlendOp = VkBlendOp(st8.color_op);
+            a.srcAlphaBlendFactor = VkBlendFactor(st8.alpha_src), a.dstAlphaBlendFactor = VkBlendFactor(st8.alpha_dst);
+            a.alphaBlendOp = VkBlendOp(st8.alpha_op);
         }
     }
     VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
@@ -3627,14 +3715,9 @@ Pipeline* Renderer::pipeline_resolve(const Draw& dr, Image* const* colors, Image
             sp.vb1[i] = dr.vb[i][1];
             sp.vb3[i] = dr.vb[i][3];
         }
-        sp.blend = dr.blend;
-        sp.target_mask = dr.target_mask;
-        sp.su_sc_mode = dr.su_sc_mode;
-        sp.depth_ctl = dr.depth_ctl;
-        sp.stencil_ctl = dr.stencil_ctl;
+        sp.state = st8;
         for (int i = 0; i < 8; ++i) sp.color_fmt[i] = uint16_t(colors[i] ? colors[i]->format : 0);
         sp.depth_fmt = uint16_t(depth ? depth->format : 0);
-        sp.prim = dr.prim;
         sp.depth_stencil = uint8_t(depth && depth->stencil ? 1 : 0);
         for (int s = 0; s < 2; ++s) {
             const uint64_t m64 = s ? (dr.ps ? shader_tex_mask64(dr.ps, false, dr.shader_res[1]) : 0) : shader_tex_mask64(dr.vs, true, dr.shader_res[0]);
@@ -3912,13 +3995,14 @@ uint32_t Renderer::run_writes(const Draw* const* run, size_t n) {
     uint32_t w = 0;
     for (size_t k = 0; k < n; ++k) {
         const Draw& dr = *run[k];
+        const RenderState& rs = render_state_of(dr.state);
         for (int i = 0; i < 8; ++i)
-            if (dr.target_mask >> (4 * i) & 0xF) w |= 1u << i;
-        if (dr.depth_ctl & 4) w |= 1u << 8;  // (z write; conservatively even without the z test)
-        if (dr.depth_ctl & 1) {              // stencil test: written unless every op keeps or nothing is writable
+            if (rs.write_mask >> (4 * i) & 0xF) w |= 1u << i;
+        if (rs.depth_write) w |= 1u << 8;  // (z write; conservatively even without the z test)
+        if (rs.stencil_test && rs.stencil_writes) {  // stencil test: written unless every op keeps or nothing is writable
             uint32_t ref, wm;
-            stencil_dynamic(dr.stencil_ctl, dr.depth_ctl, dr.stencil_ref, ref, wm);
-            if (wm && (dr.stencil_ctl & 0xFFFFFF)) w |= 1u << 9;
+            stencil_dynamic(rs, dr.stencil_ref, ref, wm);
+            if (wm) w |= 1u << 9;
         }
         if (dr.kind == Draw::Clear || dr.clear_flags) w = 0x3FF;
         if(w==0x3ff)break;
@@ -4355,9 +4439,7 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     if(run_colors&&prev&&r.last_pipeline&&r.last_pipeline_mask_epoch==mask_epoch&&
        prev->vs==dr.vs&&prev->ps==dr.ps&&
        prev->shader_res[0]==dr.shader_res[0]&&prev->shader_res[1]==dr.shader_res[1]&&
-       prev->prim==dr.prim&&prev->blend==dr.blend&&prev->target_mask==dr.target_mask&&
-       prev->su_sc_mode==dr.su_sc_mode&&prev->depth_ctl==dr.depth_ctl&&
-       prev->stencil_ctl==dr.stencil_ctl&&prev->vb_sig==dr.vb_sig&&
+       prev->state==dr.state&&prev->vb_sig==dr.vb_sig&&
        prev->tex_sig[0]==dr.tex_sig[0]&&prev->tex_sig[1]==dr.tex_sig[1]){
         p=r.last_pipeline;++r.memo_tl;
     }else{
@@ -4759,15 +4841,14 @@ void Renderer::draw(const Draw& dr, Rec& r, Image* const* run_colors, Image* run
     ds.raw_pass_w=rc().pass_w;ds.raw_pass_h=rc().pass_h;
     ds.raw_znear=dr.znear;ds.raw_zfar=dr.zfar;ds.raw_zk=dr.zk;
     }
-    if(!ds.valid||ds.raw_stencil_ctl!=dr.stencil_ctl||
-       ds.raw_depth_ctl!=dr.depth_ctl||ds.raw_stencil_ref!=dr.stencil_ref){
+    if(!ds.valid||ds.raw_state!=dr.state||ds.raw_stencil_ref!=dr.stencil_ref){
         uint32_t sref, swm;
-        stencil_dynamic(dr.stencil_ctl, dr.depth_ctl, dr.stencil_ref, sref, swm);
+        stencil_dynamic(render_state_of(dr.state), dr.stencil_ref, sref, swm);
         const uint32_t cmask = dr.stencil_ref >> 8 & 0xFF;
         if (!ds.valid || ds.sref != sref) vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, sref), ds.sref = sref;
         if (!ds.valid || ds.cmask != cmask) vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, cmask), ds.cmask = cmask;
         if (!ds.valid || ds.wmask != swm) vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, swm), ds.wmask = swm;
-        ds.raw_stencil_ctl=dr.stencil_ctl;ds.raw_depth_ctl=dr.depth_ctl;ds.raw_stencil_ref=dr.stencil_ref;
+        ds.raw_state=dr.state;ds.raw_stencil_ref=dr.stencil_ref;
     }
     if (!ds.valid || ds.bias[0] != dr.poly_offset || ds.bias[1] != dr.poly_scale)
         vkCmdSetDepthBias(cmd, dr.poly_offset, 0.0f, dr.poly_scale), ds.bias[0] = dr.poly_offset, ds.bias[1] = dr.poly_scale;
@@ -6418,7 +6499,7 @@ void Renderer::save_pipeline_cache() {
             if (ok) std::remove(path.c_str()), std::rename(tmp.c_str(), path.c_str());
         }
         if (!specs->empty()) {
-            const std::string sp_path = path + ".specs.v2", sp_tmp = sp_path + ".tmp";
+            const std::string sp_path = path + ".specs.v3", sp_tmp = sp_path + ".tmp";
             if (FILE* sf = std::fopen(sp_tmp.c_str(), "wb")) {
                 const bool sok = std::fwrite(specs->data(), sizeof(DiskPipeSpec), specs->size(), sf) == specs->size();
                 std::fclose(sf);
@@ -6867,11 +6948,11 @@ void print_stats() {
     if (!g) return;
     std::lock_guard lk(g->m);
     auto& s = g->st;
-    log("native renderer: %llu frames, %llu submissions | %llu draws, %llu clears, %llu skipped | %llu pipelines, "
+    log("native renderer: %llu frames, %llu submissions | %llu draws, %llu clears, %llu skipped | %u render states, %llu pipelines, "
         "%llu shaders (%llu failed), %llu textures (%llu dropped), %llu targets | ring peak %.1f MiB | "
         "image memory %.0f MiB in %zu blocks",
         (unsigned long long)s.frames, (unsigned long long)s.submits, (unsigned long long)s.draws,
-        (unsigned long long)s.clears, (unsigned long long)s.skipped, (unsigned long long)s.pipelines,
+        (unsigned long long)s.clears, (unsigned long long)s.skipped, g_state_count.load(), (unsigned long long)s.pipelines,
         (unsigned long long)s.shaders, (unsigned long long)s.bad_shaders, (unsigned long long)s.textures,
         (unsigned long long)s.evicted, (unsigned long long)s.targets, double(s.ring_peak) / 1048576.0,
         double(g->heap.used) / 1048576.0, g->heap.blocks.size());

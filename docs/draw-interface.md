@@ -197,6 +197,13 @@ reliably); two recording stalls of 130-145 ms without new shaders or pipelines, 
 1. ~~Setters stop producing console commands~~: already the case (see above).
 2. Native per-thread state: blend, depth, stencil and polygon-offset presets converted once from the
    engine's tables into Vulkan pipeline state; shaders and render targets resolved at set time.
+   Fixed-function state: done. A draw carries a `RenderState` id (`ng::render_state`): the
+   primitive, cull, depth, stencil and blend state in Vulkan form, built once per distinct
+   combination of what the preset setters left in the context (111 in Earth patrol, 65 in orbit) and
+   shared by every draw. Pipelines are keyed by it and built from it, the persistent pipeline specs
+   store it (`.specs.v3`), and the stencil reference and write mask are worked out from it; no
+   register word is decoded per draw or per pipeline any more. Stencil reference and masks, depth
+   bias amounts and the viewport stay per draw (dynamic state).
 3. Draws recorded on the engine threads, in two stages:
    1. Each command list is recorded into its own secondary command buffers by the engine thread that
       built it, when the list is closed. The DMA and data writes inside lists are applied in issue order

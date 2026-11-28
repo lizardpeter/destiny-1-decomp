@@ -385,13 +385,13 @@ ng::Draw* capture(uint64_t dev,uint32_t engine_prim,uint64_t caller=0,bool captu
     }
     }
     }
-    d->clip = field<uint32_t>(dev, 0x25D0);
-    d->su_sc_mode = field<uint32_t>(dev, 0x25D4);
-    d->blend = field<uint32_t>(dev, 0x25D8);
-    d->depth_ctl = field<uint32_t>(dev, 0x25DC);
-    d->stencil_ctl = field<uint32_t>(dev, 0x25E0);
+    // The fixed-function state the preset setters left in the context (primitive setup, depth and
+    // polygon-offset presets in 0x25D4, blend 0x25D8, depth 0x25DC, stencil 0x25E0, the blend
+    // preset's target mask), as a native state built once per distinct combination.
+    d->state = ng::render_state(d->prim, field<uint32_t>(dev, 0x25D4), field<uint32_t>(dev, 0x25D8),
+                                eb<uint32_t>(0x15D16E0 + uint64_t(field<uint32_t>(dev, kBlendIndex)) * 0x24),
+                                field<uint32_t>(dev, 0x25DC), field<uint32_t>(dev, 0x25E0));
     d->stencil_ref = field<uint32_t>(dev, 0x25E4);
-    d->target_mask = eb<uint32_t>(0x15D16E0 + uint64_t(field<uint32_t>(dev, kBlendIndex)) * 0x24);
     const uint64_t rast = 0x15D2424 + uint64_t(field<uint32_t>(dev, kRasterIndex)) * 0xC;
     d->poly_offset = eb<float>(rast) * 2.0f;
     d->poly_scale = eb<float>(rast + 4) * eb<float>(0x165FE78);
@@ -415,7 +415,7 @@ ng::Draw* alloc_draw() {
     if (cache.empty()) return new ng::Draw;
     ng::Draw* d = cache.back();
     cache.pop_back();
-    d->kind = ng::Draw::Auto, d->prim = 4, d->index32 = 0, d->clear_flags = 0;
+    d->kind = ng::Draw::Auto, d->prim = 4, d->index32 = 0, d->clear_flags = 0, d->state = 0;
     d->count = 0, d->instances = 1, d->index_addr = 0, d->order = 0, d->seq = 0, d->frame = 0, d->caller = 0;
     d->vs = d->ps = nullptr, d->num_vb = 0;
     d->dma_src_spans.clear();d->dma_dst_spans.clear();d->dma_checked=false;

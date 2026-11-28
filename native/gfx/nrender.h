@@ -15,6 +15,32 @@ extern std::atomic<uint64_t> g_queue_lock_wait_ns, g_dma_bytes;  // (statistics:
 constexpr int kStages = 2;  // 0 = vertex, 1 = pixel
 constexpr uint8_t kTexIsTarget = 1u << 5;
 
+// A draw's fixed-function state in Vulkan form, built once per distinct engine state (the blend,
+// depth, stencil, polygon-offset presets and primitive setup the setters stored in the device
+// context) and shared by every draw that uses it: render_state() interns it, Draw::state names it.
+// Values that change per draw without changing the pipeline (stencil reference and masks, depth
+// bias amounts, viewport) stay on the draw.
+struct RenderState {
+    uint8_t prim = 4;                        // engine primitive (topology; rect/quad lists expand)
+    uint8_t cull = 0, front_face = 0;        // VkCullModeFlags, VkFrontFace
+    uint8_t depth_bias = 0;
+    uint8_t depth_test = 0, depth_write = 0, depth_compare = 0, stencil_test = 0;
+    struct Face { uint8_t fail = 0, pass = 0, depth_fail = 0, compare = 0; } front, back;  // VkStencilOp / VkCompareOp
+    uint8_t stencil_op = 0;                  // the op that writes (z-pass, else z-fail, else fail): its value and mask
+    uint8_t stencil_ref_from_op = 0;         // the reference is the op's value (no test compares it)
+    uint8_t stencil_writes = 0;              // some op changes the stencil
+    uint8_t blend = 0;                       // blending requested (targets 0-3, where the format allows)
+    uint8_t color_src = 0, color_dst = 0, color_op = 0, alpha_src = 0, alpha_dst = 0, alpha_op = 0;  // VkBlendFactor / VkBlendOp
+    uint8_t pad[3] = {};
+    uint32_t write_mask = 0;                 // 4 bits per colour target
+};
+static_assert(sizeof(RenderState) == 36, "RenderState is stored in the pipeline spec file");
+// The id of the state these engine words describe (thread-safe; ids are stable for the process).
+uint32_t render_state(uint8_t prim, uint32_t su_sc_mode, uint32_t blend, uint32_t target_mask, uint32_t depth_ctl,
+                      uint32_t stencil_ctl);
+uint32_t render_state(const RenderState& s);
+const RenderState& render_state_of(uint32_t id);
+
 struct Draw {
     // ZPass / PredOn / PredOff: command-buffer events at their place among the draws (not draws):
     // an occlusion counter dump to index_addr (ZPASS_DONE), draw predication on the query results
@@ -72,7 +98,8 @@ struct Draw {
     uint64_t pipe_base_key = 0;           // pre-mixed draw pipeline key (without target formats)
     bool samples_target = false;          // true if any active texture slot references a render target
     // registers
-    uint32_t blend = 0, target_mask = 0xF, su_sc_mode = 0, clip = 0, depth_ctl = 0, stencil_ctl = 0, stencil_ref = 0;
+    uint32_t state = 0;         // RenderState id (render_state)
+    uint32_t stencil_ref = 0;   // DB_STENCILREFMASK: test value, test mask, write mask, op value
     float poly_offset = 0, poly_scale = 0;
     int32_t vp[4] = {};         // x, y, w, h
     float znear = 0, zfar = 1, zk = 1;

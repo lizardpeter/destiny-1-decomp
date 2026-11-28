@@ -10,8 +10,7 @@ inline bool same_native_draw_state(const Draw& a,const Draw& b){
     if(a.kind!=Draw::Indexed||b.kind!=Draw::Indexed||a.prim!=b.prim||a.prim==0x13||
        a.index32!=b.index32||a.vs!=b.vs||a.ps!=b.ps||
        a.shader_res[0]!=b.shader_res[0]||a.shader_res[1]!=b.shader_res[1]||
-       a.blend!=b.blend||a.target_mask!=b.target_mask||a.su_sc_mode!=b.su_sc_mode||
-       a.depth_ctl!=b.depth_ctl||a.stencil_ctl!=b.stencil_ctl||a.stencil_ref!=b.stencil_ref||
+       a.state!=b.state||a.stencil_ref!=b.stencil_ref||
        a.poly_offset!=b.poly_offset||a.poly_scale!=b.poly_scale||
        a.znear!=b.znear||a.zfar!=b.zfar||a.zk!=b.zk||
        a.clear_flags||b.clear_flags||!a.inline_vertices.empty()||!b.inline_vertices.empty()||
