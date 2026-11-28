@@ -110,12 +110,10 @@ struct Options {
 
 bool init(const Options& opt);
 bool active();
-void execute(const std::vector<Draw*>& draws);
 
 constexpr uint64_t kLateCb = 1ull << 62;
 constexpr uint8_t kEopLabel = 0xE0;  // Draw::prim of a WriteData that is an end-of-pipe label
 struct LateCb { uint8_t stage, slot; uint32_t size; uint64_t off; };
-bool list_recording();
 bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late);
 void fill_late(const LateCb& l, uint64_t src, uint32_t size);
 // GPU memory copies and data writes of a recorded list, applied at its submission, in its order.

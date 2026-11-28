@@ -1039,7 +1039,6 @@ struct Renderer {
     std::atomic<uint64_t> lr_phase[7]{};  // locked: pre-pass, targets, feedback, resolve, pass begin; unlocked: draws; locked: end
     bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late);
     void pre_pass(Draw* const* draws, size_t count);
-    void run_inline(Draw* const* run,size_t n);
     void submit_recorded(const std::vector<uint32_t>& handles);
     void discard_recorded(uint32_t handle);
     Recorder main_rec;
@@ -1049,7 +1048,6 @@ struct Renderer {
     // pipeline() results by a hash of everything they depend on, valid for one targets_gen
     struct PipeMemo { uint64_t key = 0, gen = 0; Pipeline* p = nullptr; };
     std::vector<PipeMemo> pipe_memo = std::vector<PipeMemo>(1u << 14);
-    uint64_t ring_copy(const void* src, uint64_t size);
     // submissions
     void begin_record();
     void submit(const VkSemaphoreSubmitInfo* wait = nullptr, const VkSemaphoreSubmitInfo* signal = nullptr);
@@ -1085,7 +1083,6 @@ struct Renderer {
         submit();
         wait_idle();
     }
-    VkDescriptorSet alloc_set(VkDescriptorSetLayout layout);
     // push descriptors (Vulkan 1.4 core): the pixel shader's bindings are written straight into
     // the command buffer instead of allocating and updating a descriptor set per draw
     PFN_vkCmdPushDescriptorSetKHR push_fn = nullptr;
@@ -1248,13 +1245,11 @@ struct Renderer {
     uint64_t native_stage_reuse=0,inline_run_draws=0,inline_runs=0;
     uint64_t native_view_cache_hits=0,native_view_cache_misses=0;
     uint64_t t_pre_shader_ident=0,t_pre_shader_mask=0;
-    uint64_t ex_t[9]{};  // execute(): begin, copies, pre-pass, clears, parallel runs, inline draws, end+readbacks, other, submit
     uint64_t t_pre_writes=0,t_pre_views=0,t_pre_geometry=0,t_run_resolve=0,t_run_feedback=0,
              t_run_worker_wall=0,t_run_worker_wait=0;
     uint64_t native_geometry_bindings=0;
     uint64_t batched_draws=0,indirect_batches=0;
     void start_workers();
-    void run_parallel(Draw* const* run, size_t n);
     VkCommandBuffer secondary(uint32_t worker);
     void end_pass();
     void queue_readbacks();
@@ -1316,7 +1311,6 @@ struct Renderer {
         merge(r);
     }
     void clear(const Draw& dr);
-    void execute(const std::vector<Draw*>& draws);
     // presentation
     bool make_swapchain(uint32_t w, uint32_t h);
     void destroy_swapchain(bool keep_surface);
@@ -1718,31 +1712,6 @@ void Renderer::submit_recorded_group(const uint32_t* slots,size_t count){
     ++grouped_submissions;queue_calls_saved+=count-1;
 }
 
-// Descriptor sets come from pools owned by the recording submission, reset when it is reused.
-VkDescriptorSet Renderer::alloc_set(VkDescriptorSetLayout layout) {
-    Sub& sb = subs[rc().cur];
-    for (;;) {
-        if (sb.pool == sb.pools.size()) {
-            const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16384},
-                                                  {VK_DESCRIPTOR_TYPE_SAMPLER, 16384},
-                                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}};
-            VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-            pci.maxSets = 4096;
-            pci.poolSizeCount = 3;
-            pci.pPoolSizes = sizes;
-            VkDescriptorPool p = VK_NULL_HANDLE;
-            if (vkCreateDescriptorPool(ctx.device, &pci, nullptr, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
-            sb.pools.push_back(p);
-        }
-        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool = sb.pools[sb.pool];
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts = &layout;
-        VkDescriptorSet set = VK_NULL_HANDLE;
-        if (vkAllocateDescriptorSets(ctx.device, &ai, &set) == VK_SUCCESS) return set;
-        ++sb.pool;  // full: the next pool
-    }
-}
 
 // The GPU's results where the game reads them (occlusion counts, small targets): once per
 // submission, in submission order, by whichever comes first - the completion thread (without
@@ -2254,12 +2223,6 @@ uint64_t Renderer::ring_alloc(uint64_t size, uint64_t align) {
     return p;
 }
 
-uint64_t Renderer::ring_copy(const void* src, uint64_t size) {
-    const uint64_t p = ring_alloc(std::max<uint64_t>(size, 16));
-    if (p == UINT64_MAX) return p;
-    std::memcpy(ring.map + p, src, size);
-    return p;
-}
 
 uint64_t Renderer::rec_ring(Rec& r, uint64_t size, uint64_t align) {
     if (!r.parallel) return ring_alloc(size, align);
@@ -3734,95 +3697,6 @@ VkCommandBuffer Renderer::secondary(uint32_t w) {
     return sc.cbs[sc.used++];
 }
 
-// n plain draws with the same render targets: one render pass whose contents are secondary
-// command buffers, each recorded by a thread (the workers and this one) from a contiguous
-// slice, executed in order.
-void Renderer::run_parallel(Draw* const* run, size_t n) {
-    Image* colors[8] = {};
-    for (int i = 0; i < 5; ++i) colors[i] = color_target(run[0]->color[i]);
-    Image* depth = depth_target(run[0]->depth);
-    if (!depth && std::none_of(colors, colors + 8, [](Image* x) { return x != nullptr; })) {
-        for (size_t i = 0; i < n; ++i) skip("no target");
-        return;
-    }
-    // Do not dispatch seven command buffers for a 64-draw run. Each
-    // worker has a fixed begin/end and synchronization cost.
-    const uint32_t T=std::min(rec_threads+1,std::max(2u,uint32_t(n/128)));
-    Sub& sb = subs[rc().cur];
-    if (sb.sec.size() < T) sb.sec.resize(T);
-    // slices and their command buffers (allocated here: the pools belong to this thread's use)
-    std::array<VkCommandBuffer,16> cbs{};
-    for (uint32_t t = 0; t < T; ++t)
-        if (!(cbs[t] = secondary(t))) {
-            for (size_t i = 0; i < n; ++i) draw(*run[i]);
-            return;
-        }
-    const uint64_t t_feedback=now_ns();
-    feedback_snapshots(run,n,colors,depth,true);
-    const uint64_t t_resolve=now_ns();
-    resolve_draw_resources(run,n);
-    const uint64_t t_workers=now_ns();
-    t_run_feedback+=t_resolve-t_feedback;
-    t_run_resolve+=t_workers-t_resolve;
-    begin_pass(colors,depth,true);
-    rc().pass_secondary = true;
-    VkFormat cfmt[8]{};
-    uint32_t ncolor = 0;
-    for (uint32_t i = 0; i < 8; ++i)
-        if (colors[i]) cfmt[i] = colors[i]->format, ncolor = i + 1;
-    VkCommandBufferInheritanceRenderingInfo iri{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO};
-    iri.colorAttachmentCount = ncolor;
-    iri.pColorAttachmentFormats = cfmt;
-    iri.depthAttachmentFormat = depth ? depth->format : VK_FORMAT_UNDEFINED;
-    iri.stencilAttachmentFormat = depth && depth->stencil ? depth->format : VK_FORMAT_UNDEFINED;
-    iri.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkCommandBufferInheritanceInfo ii{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, &iri};
-    ii.occlusionQueryEnable = rc().q_active >= 0;
-    ii.queryFlags = rc().q_active >= 0 && ctx.occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0;
-    std::array<Rec,16> recs{};
-    std::array<DrawState,16> states{};
-    auto slice = [&](uint32_t t) {
-        const size_t b = n * t / T, e = n * (t + 1) / T;
-        Rec& r = recs[t];
-        r.cmd = cbs[t], r.ds = &states[t], r.parallel = true, r.secondary = true;
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
-        bi.pInheritanceInfo = &ii;
-        vkBeginCommandBuffer(r.cmd, &bi);
-        if (bindless_set && pipe_layout)
-            vkCmdBindDescriptorSets(r.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_layout, 0, 1, &bindless_set, 0, nullptr);
-        for(size_t i=b;i<e;){
-            size_t used=1;
-            draw(*run[i],r,colors,depth,run+i+1,e-i-1,&used);
-            i+=used;
-        }
-        vkEndCommandBuffer(r.cmd);
-    };
-    {
-        std::lock_guard lk(wk.m);
-        for (uint32_t t = 1; t < T; ++t) wk.jobs.push_back([&slice, t] { slice(t); });
-        wk.pending += T - 1;
-    }
-    for(uint32_t t=1;t<T;++t)wk.cv.notify_one();
-    slice(0);
-    const uint64_t t_wait=now_ns();
-    {
-        std::unique_lock lk(wk.m);
-        wk.done_cv.wait(lk,[&]{return wk.pending==0;});
-    }
-    t_run_worker_wait+=now_ns()-t_wait;
-    vkCmdExecuteCommands(rc().cmd,T,cbs.data());
-    t_run_worker_wall+=now_ns()-t_workers;
-    for(uint32_t t=0;t<T;++t)merge(recs[t]);
-    rc().dstate.valid = false;  // (the primary's bindings and dynamic state are undefined after secondaries)
-    rc().dstate.stage_valid[0] = rc().dstate.stage_valid[1] = false;
-    // Primary inline graphics state is not legal inside a rendering
-    // instance declared SECONDARY_COMMAND_BUFFERS_BIT.
-    end_pass();
-    if (bindless_set && pipe_layout)
-        vkCmdBindDescriptorSets(rc().cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_layout, 0, 1, &bindless_set, 0, nullptr);
-    ++par_runs, par_draws += n;
-}
 
 // GCN reads a render target that the same pass renders into from memory, as it was before the
 // pass (the color / depth caches are not coherent with texture reads; the engine relies on
@@ -5088,190 +4962,7 @@ void Renderer::pre_pass(Draw* const* draws, size_t count) {
     t_pre_geometry+=end-t_geometry;st.t_pre+=end-tp;
 }
 
-void Renderer::run_inline(Draw* const* run,size_t n){
-    Image* colors[8]{};
-    for(int i=0;i<5;++i)colors[i]=color_target(run[0]->color[i]);
-    Image* depth=depth_target(run[0]->depth);
-    if(!depth&&std::none_of(colors,colors+8,[](Image* x){return x!=nullptr;})){
-        for(size_t i=0;i<n;++i)skip("no target");return;
-    }
-    feedback_snapshots(run,n,colors,depth);
-    resolve_draw_resources(run,n);
-    Rec rec;rec.cmd=rc().cmd;rec.ds=&rc().dstate;rec.fixed_inline_pass=true;
-    for(size_t i=0;i<n;){
-        size_t used=1;
-        draw(*run[i],rec,colors,depth,run+i+1,n-i-1,&used);
-        i+=used;
-    }
-    merge(rec);
-    ++inline_runs;inline_run_draws+=n;
-}
 
-void Renderer::execute(const std::vector<Draw*>& draws) {
-    uint64_t tx=now_ns();
-    auto lap=[&](int b){const uint64_t n=now_ns();ex_t[b]+=n-tx;tx=n;};
-    if (up_rec.cur != UINT32_MAX && !tr) {  // uploads for lists recorded on engine threads go first
-        tr = &up_rec;
-        submit();
-        tr = nullptr;
-    }
-    // D1_NG_PASSLOG=world: log the frame after the first big (in-world) submission, plus 3
-    if (passlog_frame == UINT64_MAX - 1 && draws.size() > 2000) passlog_frame = st.frames + 3;
-    rc().submit_no = ++submit_seq;
-    ++st.submits;
-    retire_completed();
-    begin_record();
-    if (rc().cur == UINT32_MAX) {
-        log("native renderer: no available native submission slot");
-        std::_Exit(1);
-    }
-    lap(0);
-    rc().q_on = false;
-    for (Draw* d : draws) rc().q_on |= d->kind == Draw::ZPass;
-    if (rc().q_on) {
-        Sub& sb = subs[rc().cur];
-        if (!sb.qpool) {
-            VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-            qci.queryType = VK_QUERY_TYPE_OCCLUSION;
-            qci.queryCount = kQueries;
-            vkCreateQueryPool(ctx.device, &qci, nullptr, &sb.qpool);
-        }
-        if (sb.qpool) {
-            end_pass();  // (resets happen outside render passes)
-            vkCmdResetQueryPool(rc().cmd, sb.qpool, 0, kQueries);
-        } else rc().q_on = false;
-    }
-    // Preserve the original order of resource writes relative to draw commands.
-    // Previously all DMA writes were executed before the first draw, and
-    // WRITE_DATA was executed after pre-pass uploads. Both could expose the
-    // wrong texture contents. Each native run is prepared after its preceding
-    // writes, and uploads are encoded into the same command buffer.
-    const auto memory_write = [](const Draw* d) {
-        return d->kind == Draw::Dma || d->kind == Draw::WriteData;
-    };
-    for (size_t i = 0; i < draws.size();) {
-        if (memory_write(draws[i])) {
-            size_t end = i + 1;
-            while (end < draws.size() && memory_write(draws[end])) ++end;
-            lap(7);
-            end_pass();
-            run_copies(draws.data() + i, end - i, true);
-            lap(1);
-            i = end;
-            continue;
-        }
-        // Stop preparation before a second epoch of any persistent
-        // texture. Otherwise the later upload overwrites the image before
-        // the earlier draw has even recorded its sampling commands.
-        static thread_local EpochCohort cohort;
-        cohort.clear();
-        size_t end=i;
-        const Draw* prior_epoch_draw=nullptr;
-        for(;end<draws.size()&&!memory_write(draws[end]);++end){
-            const Draw& dr=*draws[end];
-            if(dr.kind!=Draw::Indexed&&dr.kind!=Draw::Auto)continue;
-            if(prior_epoch_draw&&std::memcmp(dr.tex_mask,prior_epoch_draw->tex_mask,sizeof dr.tex_mask)==0&&
-               std::memcmp(dr.tex_res,prior_epoch_draw->tex_res,sizeof dr.tex_res)==0)continue;
-            bool conflict=false;
-            for(unsigned stage=0;stage<2&&!conflict;++stage)
-                for(uint32_t mask=dr.tex_mask[stage];mask;mask&=mask-1){
-                    const unsigned slot=__builtin_ctz(mask);
-                    if(!cohort.observe(dr.tex_res[stage][slot])){conflict=true;break;}
-                }
-            if(conflict){
-                if(end==i){++texture_draw_epoch_conflicts;continue;}
-                ++texture_cohort_splits;break;
-            }
-            prior_epoch_draw=&dr;
-        }
-        // Any preceding inline rendering must finish before preparation
-        // records texture or geometry transfer commands.
-        lap(7);
-        end_pass();
-        pre_pass(draws.data()+i,end-i);
-        lap(2);
-        for (; i < end; ++i) {
-        Draw* d = draws[i];
-        switch (d->kind) {
-        case Draw::Clear: lap(7); clear(*d); lap(3); break;
-        case Draw::ZPass: zpass(d->index_addr); break;
-        case Draw::PredOn: predicate(d->index_addr, d->count & 1); break;
-        case Draw::PredOff: rc().pred_cur = -1; break;
-        case Draw::Dma: case Draw::WriteData: break; // handled at ordered resource-write boundaries
-        case Draw::Eop: break;  // (the device layer raises the event after the submission)
-        default: {
-            // a run of plain draws into the same targets: recorded in parallel
-            size_t j = i + 1;
-            if (rec_threads && !debug && st.frames != passlog_frame) {
-                auto plain = [&](const Draw* x) {
-                    return (x->kind == Draw::Indexed || x->kind == Draw::Auto) && std::memcmp(x->color, d->color, sizeof d->color) == 0 &&
-                           std::memcmp(x->depth, d->depth, sizeof d->depth) == 0;
-                };
-                while (j < end && plain(draws[j])) ++j;
-            }
-            lap(7);
-            if (j - i >= rec_min_run) {
-                run_parallel(draws.data() + i, j - i);
-                lap(4);
-                i = j - 1;
-            } else {
-                // Short runs with only registered sampled resources have no
-                // framebuffer feedback. Prepare and record them as one native
-                // inline run, rather than rebuilding attachment state per draw.
-                auto safe=[](const Draw& x){
-                    for(unsigned stage=0;stage<2;++stage)
-                        for(uint32_t m=x.active_tex_mask[stage];m;m&=m-1)
-                            if(!x.tex_res[stage][__builtin_ctz(m)])return false;
-                    return true;
-                };
-                size_t k=i+1;
-                if(!debug&&st.frames!=passlog_frame&&safe(*d)){
-                    while(k<end){
-                        const Draw& x=*draws[k];
-                        if((x.kind!=Draw::Indexed&&x.kind!=Draw::Auto)||
-                           std::memcmp(x.color,d->color,sizeof x.color)!=0||
-                           std::memcmp(x.depth,d->depth,sizeof x.depth)!=0||!safe(x))break;
-                        ++k;
-                    }
-                }
-                if(k-i>1){run_inline(draws.data()+i,k-i);i=k-1;}
-                else draw(*d);
-                lap(5);
-            }
-            break;
-        }
-        }
-        }
-    }
-    lap(7);
-    end_pass();
-    rc().pred_cur = -1;
-    if (rc().q_on) store_query_predicates();
-    rc().q_on = false;
-    queue_readbacks();
-    // Results the game reads back (small targets, occlusion counts) reach guest memory when
-    // the work completes, a frame or two later - about what the console's GPU latency is.
-    // D1_NG_READBACK_SYNC=1 waits for them here instead (the CPU then waits for the GPU at that
-    // point every frame, which costs a lot of frame rate on slower GPUs).
-    static const bool rb_sync = [] {
-        const char* v = std::getenv("D1_NG_READBACK_SYNC");
-        return v && std::atoi(v) != 0;
-    }();
-    // occlusion counts too: the game reads them back (object visibility), and the null GPU no
-    // longer answers for executed submissions
-    const bool has_rb = rc().cur != UINT32_MAX && (!subs[rc().cur].readbacks.empty() || !subs[rc().cur].zrecs.empty());
-    if (has_rb && std::getenv("D1_NG_LOG_READBACK")) {
-        static int n = 0;
-        if (n++ < 40)
-            log("ng readback sync: submission %llu of the frame, %zu draws, %zu readbacks, %zu counter dumps",
-                (unsigned long long)(rc().submit_no - frame_first_submit), draws.size(), subs[rc().cur].readbacks.size(),
-                subs[rc().cur].zrecs.size());
-    }
-    lap(6);
-    submit();
-    lap(8);
-    if ((rb_sync != bool(debug_toggles() & 2)) && has_rb && !inflight.empty()) wait_serial(subs[inflight.back()].serial);
-}
 
 // ---------------------------------------------------------------------------- loader
 // Engine resources are prepared when the engine binds or moves them, on this thread: textures
@@ -5834,7 +5525,13 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
     ++st.submits;
     retire_completed();
     begin_record();
-    if (R.cur == UINT32_MAX) return false;  // no free slot: executed at submission instead
+    while (R.cur == UINT32_MAX) {  // every slot is recorded and waiting for the queue thread
+        lk.unlock();
+        std::this_thread::yield();
+        relock();
+        retire_completed();
+        begin_record();
+    }
     for (auto& row : R.late)
         for (auto& l : row) l = {};
     R.late_list.clear();
@@ -6894,14 +6591,8 @@ static std::unique_lock<std::mutex> queue_lock() {
     g_queue_lock_wait_ns += now_ns() - t;
     return lk;
 }
-void execute(const std::vector<Draw*>& draws) {
-    if (!g) return;
-    auto lk = queue_lock();
-    g->execute(draws);
-}
-bool list_recording() { return g && g->list_rec; }
 bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late) {
-    return g && g->list_rec && g->record_list(items, handle, late);
+    return g && g->record_list(items, handle, late);
 }
 void apply_memory_writes(Draw* const* items, size_t count) {
     if (!g || !count) return;
@@ -7196,13 +6887,6 @@ void print_stats() {
         log("native renderer: CPU detail ms/frame: pre-pass = writes %.2f + targets %.2f + material preparation %.2f (shader identity %.2f, shader slot masks %.2f) + geometry preparation %.2f; feedback %.2f, run binding resolution %.2f, worker wall %.2f (wait %.2f)",
             g->t_pre_writes/fi/1e6,double(s.t_tgt)/fi/1e6,g->t_pre_views/fi/1e6,g->t_pre_shader_ident/fi/1e6,g->t_pre_shader_mask/fi/1e6,g->t_pre_geometry/fi/1e6,
             g->t_run_feedback/fi/1e6,g->t_run_resolve/fi/1e6,g->t_run_worker_wall/fi/1e6,g->t_run_worker_wait/fi/1e6);
-    }
-    {
-        const double fi = double(std::max<uint64_t>(1, s.frames - s.t_frames));
-        auto ms=[&](int k){return double(g->ex_t[k])/fi/1e6;};
-        log("native renderer: queue thread ms/frame: begin %.2f, resource writes %.2f, pre-pass %.2f, clears %.2f, parallel runs %.2f, inline draws %.2f, end of submission %.2f, between steps %.2f, submit %.2f (total %.2f)",
-            ms(0),ms(1),ms(2),ms(3),ms(4),ms(5),ms(6),ms(7),ms(8),ms(0)+ms(1)+ms(2)+ms(3)+ms(4)+ms(5)+ms(6)+ms(7)+ms(8));
-        std::fill(std::begin(g->ex_t),std::end(g->ex_t),0);
     }
     g->t_pre_shader_ident=g->t_pre_shader_mask=0;
     g->t_pre_writes=g->t_pre_views=g->t_pre_geometry=g->t_run_feedback=g->t_run_resolve=g->t_run_worker_wall=g->t_run_worker_wait=0;

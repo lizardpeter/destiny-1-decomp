@@ -146,10 +146,16 @@ Recorded lists already go to the GPU in one `vkQueueSubmit2` per engine submissi
 `submit_recorded_group`); merging across calls would let a label the engine waits on between calls
 wait for later work, so it is not done.
 
+Recording is the only path: every list with items is recorded on the engine thread that closes it
+(a thread that finds every command buffer slot recorded and waiting yields until the queue thread
+submits one, instead of handing the list to the queue thread). Deleted: the queue thread's
+`Renderer::execute` translation path with its parallel and inline runs (about 370 lines). The
+queue thread applies memory writes, fills inherited constants, submits and writes completion
+labels.
+
 Still to do in this stage: less work under the renderer lock (pre-pass, feedback copies and
 resource resolution, about 2 ms per frame on the Arc); two recording stalls of 130-145 ms without
-new shaders or pipelines, not yet explained; and deleting the submission-time translation path
-once the GPU copy lists no longer need it.
+new shaders or pipelines, not yet explained;.
 
 ## Target
 

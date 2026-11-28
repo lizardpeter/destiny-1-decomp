@@ -1931,13 +1931,7 @@ D1_SYSV bool h_drain(uint64_t dev) {
 // still owns its ordered ring and its progress labels, but native work does
 // not need a fake nonzero DCB extent. Preserve any genuine segment metadata.
 void record(List* l) {
-    if (!ng::list_recording() || l->items.empty()) return;
-    // Lists that write guest memory with inline data run at submission; none are seen in play.
-    // GPU memory copies (Dma) do not stop a list from being recorded: they are applied at
-    // submission (apply_memory_writes), and no draw reads guest memory they write.
-    for (const Item& it : l->items)
-        if (it.d && it.d->kind == ng::Draw::WriteData && it.d->prim != ng::kEopLabel)
-            return;
+    if (l->items.empty()) return;
     struct SavedCb { ng::Draw* draw; ng::Draw::Cb cb[ng::kStages][16]; };
     std::vector<SavedCb> saved;
     ng::Draw::Cb local[ng::kStages][16] = {};
@@ -2652,7 +2646,6 @@ void native_device_execute_submit(NativeSubmission* batch) {
         ++nd::g_orphans;
         nd::free_list(l);
     }
-    std::vector<ng::Draw*> draws;
     struct PendingLabel { uint64_t addr, mapping; bool timestamp; std::vector<uint8_t> bytes; };
     std::vector<PendingLabel> labels;
     if (!ng::active()) {
@@ -2660,15 +2653,6 @@ void native_device_execute_submit(NativeSubmission* batch) {
         std::abort();
     }
 
-    auto flush_draws = [&] {
-        if (draws.empty()) return;
-        const auto t0 = std::chrono::steady_clock::now();
-        ng::execute(draws);
-        nr::g_exec_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - t0).count());
-        nr::g_frame_executed = true;
-        draws.clear();
-    };
     // One engine submission becomes one native submission. Its completion labels and end-of-pipe
     // events are written once all of its work has finished on the GPU: never before the work that
     // precedes them, and never split into a Vulkan submission per label (the console engine issues
@@ -2686,7 +2670,6 @@ void native_device_execute_submit(NativeSubmission* batch) {
     auto complete = [&](bool eop) { eops += eop; };
     auto finish = [&] {
         flush_recorded();
-        flush_draws();
         if (labels.empty() && !eops) return;
         ng::after_gpu([pending = std::move(labels), eops]() mutable {
             for (auto& label : pending) {
@@ -2714,15 +2697,17 @@ void native_device_execute_submit(NativeSubmission* batch) {
     };
 
     for (nd::List* l : lists) {
+        // Every list with items was recorded when it was closed (record); an empty one only ends.
         if (l->recorded) {
-            flush_draws();
-            // The list's GPU memory copies, in its order, before the GPU runs it (as the console's
-            // GPU does them when it reaches them).
+            // The list's GPU memory copies and data writes, in its order, before the GPU runs it
+            // (as the console's GPU does them when it reaches them). No draw reads guest memory
+            // they write: textures and buffers are owned natively.
             {
                 static thread_local std::vector<ng::Draw*> copies;
                 copies.clear();
                 for (nd::Item& it : l->items)
-                    if (it.d && it.d->kind == ng::Draw::Dma) copies.push_back(it.d);
+                    if (it.d && (it.d->kind == ng::Draw::Dma || (it.d->kind == ng::Draw::WriteData && it.d->prim != ng::kEopLabel)))
+                        copies.push_back(it.d);
                 if (!copies.empty()) ng::apply_memory_writes(copies.data(), copies.size());
             }
             for (const ng::LateCb& lc : l->late) {
@@ -2735,29 +2720,6 @@ void native_device_execute_submit(NativeSubmission* batch) {
                 if (it.d->kind == ng::Draw::WriteData && it.d->prim == ng::kEopLabel)
                     labels.push_back({it.d->caller, owned->completion_mappings.count(it.d) ? owned->completion_mappings[it.d] : 0, it.d->count != 0, it.d->inline_vertices});
             }
-            if (l->eop) complete(true);
-            continue;
-        }
-        flush_recorded();
-        for (nd::Item& it : l->items) {
-            if (!it.d) {
-                nr::g_ce[it.cb.stage][it.cb.slot] = it.cb.cb;
-                nr::g_ce_known[it.cb.stage][it.cb.slot] = true;
-                continue;
-            }
-            ng::Draw* d = it.d;
-            if (d->kind == ng::Draw::WriteData && d->prim == ng::kEopLabel) {
-                auto stamp = owned->completion_mappings.find(d);
-                labels.push_back({d->caller, stamp == owned->completion_mappings.end() ? 0 : stamp->second,
-                                  d->count != 0, d->inline_vertices});
-                complete(false);
-                continue;
-            }
-            if (d->kind <= ng::Draw::Clear)
-                for (int st = 0; st < 2; ++st)
-                    for (int sl = 0; sl < 16; ++sl)
-                        if (nr::g_ce_known[st][sl]) d->cb[st][sl] = nr::g_ce[st][sl];
-            draws.push_back(d);
         }
         if (l->eop) complete(true);
     }
