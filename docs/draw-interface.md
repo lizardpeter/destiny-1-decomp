@@ -111,6 +111,35 @@ Still order-dependent, to be replaced before lists are recorded on engine thread
 rewrites (`target_current`), feedback copies of attachments a pass samples, occlusion queries and
 predication, and GPU results read back into guest memory.
 
+### Lists recorded on the engine threads (step 3, stage 1): done
+
+Each command list without GPU memory copies is recorded into its own Vulkan command buffer by the
+engine thread that closes it (`record` in `native/src/native_gfx.cpp`, `Renderer::record_list`); the
+queue thread fills the constants a list inherits from earlier lists, and submits the recorded
+lists in the engine's order. Lists from the GPU copy queue (memory moves) still run at
+submission.
+
+It needed native buffers first: on the old per-epoch geometry cache, every engine buffer move
+made a list recorded early miss its geometry, and the dropped draws showed as surfaces flickering
+to black (test-38/39 on an Intel Arc). With native buffers no draw is dropped.
+
+Measured on the owner's Intel Arc, Earth patrol, `fps = 120`, 2560x1440 (test-42):
+
+| | test-37 (queue thread records) | test-42 (engine threads record) |
+|---|---|---|
+| Frame rate | 30 (capped) | 103-111 |
+| Queue thread per frame | 13-18 ms | 0.35 ms |
+| Engine threads' recording per frame (all threads) | | 7-8 ms, of it 1.6-2.3 ms waiting for the renderer lock |
+| GPU timestamp spans per frame | | about 2.3 ms |
+| Draws dropped | 0 | 0 |
+| Slow frames in the world | 83 | 15 |
+
+Still to do in this stage: one submission per frame for the recorded lists (each is still its own
+submission, about 30 per frame); less work under the renderer lock (pre-pass, feedback copies and
+resource resolution, about 2 ms per frame on the Arc); two recording stalls of 130-145 ms without
+new shaders or pipelines, not yet explained; and deleting the submission-time translation path
+once the GPU copy lists no longer need it.
+
 ## Target
 
 - **Setters keep only the engine's own state.** Each one updates exactly the `D` fields its original
