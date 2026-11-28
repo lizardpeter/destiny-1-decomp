@@ -58,6 +58,7 @@ void log(const char* fmt, ...);
 }
 
 namespace d1::ng {
+std::atomic<uint64_t> g_queue_lock_wait_ns{0}, g_dma_bytes{0};  // (statistics: slow-frame report)
 using namespace d1::vk;
 
 namespace {
@@ -553,6 +554,7 @@ struct Renderer {
     bool read_geometry_range(const Draw::Res& res,uint64_t address,uint64_t size,void* out);
     void evict_geo();
     uint64_t pcache_saved_pipelines = 0;
+    std::atomic<bool> pcache_writing{false};
     uint64_t pcache_last_attempt_ns = 0;
     void save_pipeline_cache();
     std::unordered_map<uint64_t, std::unique_ptr<Image>> targets;   // (base, format, size)
@@ -926,6 +928,7 @@ struct Renderer {
                 std::memmove(reinterpret_cast<void*>(d->caller), reinterpret_cast<const void*>(d->index_addr), d->count);
             } else continue;
             if (!d->count) continue;
+            g_dma_bytes += d->count;
             ranges.emplace_back(d->caller, d->count);
             dma_texture_check(d->caller, d->count);
         }
@@ -6658,33 +6661,35 @@ void Renderer::present(uint64_t addr) {
 // Written next to the game's data whenever enough new pipelines were built (the process ends
 // without a shutdown path, so there is no "on exit").
 void Renderer::save_pipeline_cache() {
-    if (!opt.pipeline_cache || !pcache || st.pipelines == pcache_saved_pipelines) return;
+    if (!opt.pipeline_cache || !pcache || st.pipelines == pcache_saved_pipelines || pcache_writing.load()) return;
     const uint64_t saving_pipelines = st.pipelines;
     size_t n = 0;
     if (vkGetPipelineCacheData(ctx.device, pcache, &n, nullptr) != VK_SUCCESS || !n) return;
-    std::vector<char> data(n);
-    if (vkGetPipelineCacheData(ctx.device, pcache, &n, data.data()) != VK_SUCCESS) return;
-    const std::string tmp = std::string(opt.pipeline_cache) + ".tmp";
-    FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (!f) return;
-    const bool ok = std::fwrite(data.data(), 1, n, f) == n;
-    std::fclose(f);
-    if (ok) {
-        std::remove(opt.pipeline_cache);
-        if (std::rename(tmp.c_str(), opt.pipeline_cache) == 0) pcache_saved_pipelines = saving_pipelines;
-    }
-    if (!pipe_specs.empty()) {
-        const std::string sp_path = std::string(opt.pipeline_cache) + ".specs.v2";
-        const std::string sp_tmp = sp_path + ".tmp";
-        if (FILE* sf = std::fopen(sp_tmp.c_str(), "wb")) {
-            const bool sok = std::fwrite(pipe_specs.data(), sizeof(DiskPipeSpec), pipe_specs.size(), sf) == pipe_specs.size();
-            std::fclose(sf);
-            if (sok) {
-                std::remove(sp_path.c_str());
-                std::rename(sp_tmp.c_str(), sp_path.c_str());
+    auto data = std::make_shared<std::vector<char>>(n);
+    if (vkGetPipelineCacheData(ctx.device, pcache, &n, data->data()) != VK_SUCCESS) return;
+    data->resize(n);
+    auto specs = std::make_shared<std::vector<DiskPipeSpec>>(pipe_specs);
+    pcache_saved_pipelines = saving_pipelines;
+    pcache_writing = true;
+    // (the files are written on a thread of their own: neither the renderer lock nor the frame
+    // waits for the disk)
+    std::thread([this, data, specs, path = std::string(opt.pipeline_cache)] {
+        const std::string tmp = path + ".tmp";
+        if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+            const bool ok = std::fwrite(data->data(), 1, data->size(), f) == data->size();
+            std::fclose(f);
+            if (ok) std::remove(path.c_str()), std::rename(tmp.c_str(), path.c_str());
+        }
+        if (!specs->empty()) {
+            const std::string sp_path = path + ".specs.v2", sp_tmp = sp_path + ".tmp";
+            if (FILE* sf = std::fopen(sp_tmp.c_str(), "wb")) {
+                const bool sok = std::fwrite(specs->data(), sizeof(DiskPipeSpec), specs->size(), sf) == specs->size();
+                std::fclose(sf);
+                if (sok) std::remove(sp_path.c_str()), std::rename(sp_tmp.c_str(), sp_path.c_str());
             }
         }
-    }
+        pcache_writing = false;
+    }).detach();
 }
 
 // End of a frame: limit how far the CPU runs ahead, and housekeeping.
@@ -6882,9 +6887,16 @@ bool init(const Options& opt) {
     return true;
 }
 bool active() { return g != nullptr; }
+// Time the queue thread waits for the renderer lock (statistics; read by the slow-frame report).
+static std::unique_lock<std::mutex> queue_lock() {
+    const uint64_t t = now_ns();
+    std::unique_lock lk(g->m);
+    g_queue_lock_wait_ns += now_ns() - t;
+    return lk;
+}
 void execute(const std::vector<Draw*>& draws) {
     if (!g) return;
-    std::lock_guard lk(g->m);
+    auto lk = queue_lock();
     g->execute(draws);
 }
 bool list_recording() { return g && g->list_rec; }
@@ -6994,7 +7006,7 @@ void Renderer::completion_loop() {
 
 void submit_recorded(const std::vector<uint32_t>& handles) {
     if (!g) return;
-    std::lock_guard lk(g->m);
+    auto lk = queue_lock();
     g->submit_recorded(handles);
 }
 void discard_recorded(uint32_t handle) {

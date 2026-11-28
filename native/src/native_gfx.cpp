@@ -2786,7 +2786,7 @@ void native_gfx_flip(void* addr, uint32_t width, uint32_t height) {
         nr::g_flip_ns += flip_ns;
         {
             static auto last = std::chrono::steady_clock::now();
-            static uint64_t exec0 = 0, faults0 = 0;
+            static uint64_t exec0 = 0, faults0 = 0, lockw0 = 0, dma0 = 0;
             static ng::Counters c0 = ng::counters();
             const auto now = std::chrono::steady_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(now - last).count();
@@ -2796,14 +2796,16 @@ void native_gfx_flip(void* addr, uint32_t width, uint32_t height) {
             if (ms > 40.0 && told < 300) {
                 ++told;
                 const char* gs = game_state();
-                log("slow frame: %.1f ms | recording %.1f ms, present %.1f ms | new pipelines %llu, shaders %llu, textures %llu "
+                log("slow frame: %.1f ms | recording %.1f ms (lock wait %.1f ms, memory copies %.1f MiB), present %.1f ms | new pipelines %llu, shaders %llu, textures %llu "
                     "(%.1f MiB) | %llu draws, %llu write faults (%s)",
-                    ms, double(nr::g_exec_ns >= exec0 ? nr::g_exec_ns - exec0 : nr::g_exec_ns) / 1e6, double(flip_ns) / 1e6,
+                    ms, double(nr::g_exec_ns >= exec0 ? nr::g_exec_ns - exec0 : nr::g_exec_ns) / 1e6,
+                    double(ng::g_queue_lock_wait_ns.load() - lockw0) / 1e6, double(ng::g_dma_bytes.load() - dma0) / 1048576.0,
+                    double(flip_ns) / 1e6,
                     (unsigned long long)(c.pipelines - c0.pipelines), (unsigned long long)(c.shaders - c0.shaders),
                     (unsigned long long)(c.textures - c0.textures), double(c.tex_bytes - c0.tex_bytes) / 1048576.0,
                     (unsigned long long)(c.draws - c0.draws), (unsigned long long)(faults - faults0), gs ? gs : "?");
             }
-            last = now, exec0 = nr::g_exec_ns, faults0 = faults, c0 = c;
+            last = now, exec0 = nr::g_exec_ns, faults0 = faults, c0 = c, lockw0 = ng::g_queue_lock_wait_ns.load(), dma0 = ng::g_dma_bytes.load();
         }
         static auto t0 = std::chrono::steady_clock::now();
         static uint64_t n0 = 0;

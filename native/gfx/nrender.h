@@ -2,6 +2,7 @@
 // device layer (src/native_gfx.cpp captures them) with our own translated shaders, our own
 // images and our own pipelines. No PM4, no emulated GPU.
 #pragma once
+#include <atomic>
 #include <functional>
 #include <cstdint>
 #include <vector>
@@ -9,6 +10,7 @@
 
 namespace d1::tiling { struct Surface; }
 namespace d1::ng {
+extern std::atomic<uint64_t> g_queue_lock_wait_ns, g_dma_bytes;  // (statistics: slow-frame report)
 
 constexpr int kStages = 2;  // 0 = vertex, 1 = pixel
 constexpr uint8_t kTexIsTarget = 1u << 5;
