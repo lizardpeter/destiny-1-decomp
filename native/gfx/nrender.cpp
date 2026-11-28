@@ -562,6 +562,7 @@ struct Renderer {
     std::vector<std::unique_ptr<Image>> retired;                    // replaced targets (still referenced)
     std::unordered_map<TextureKey, std::unique_ptr<Image>, TextureKeyHash> textures;
     std::unordered_map<uint64_t, SamplerEntry> samplers;
+    std::shared_mutex samplers_mu;  // (read by every recording thread; written when a new sampler is made)
     std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders;
     std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> pipelines;
     std::unique_ptr<Image> dummy[4][3];  // per (TexDim, tex_kind)
@@ -642,13 +643,16 @@ struct Renderer {
                 publish_ambiguous(base);
                 (++targets_gen, ++gen_why[0]);
             }
-            it->second = img, ++target_views_gen;
+            // A new address changes what T#s resolve to; switching the current target at an address
+            // only changes the order-dependent answers (target_for's fallback, stencil reads).
+            if (added) ++target_views_gen;
+            it->second = img, ++target_rebind_gen;
         } else if (auto ib = images_by_base.find(base); ib != images_by_base.end() && ib->second.size() > 1) {
             // (target_for picks among same-size images at one address by format)
             bool same_size = false, other_attrs = false;
             for (Image* c : ib->second)
                 if (c != img && c->w == img->w && c->h == img->h) same_size = true, other_attrs |= target_attrs(c) != target_attrs(img);
-            if (same_size) ++target_views_gen;
+            if (same_size) ++target_rebind_gen;
             // an address whose sampled image alternates between kinds: pipeline() keys draws
             // that sample it by what it resolves to (instead of invalidating every pipeline)
             if (other_attrs && !std::binary_search(ambiguous_bases.begin(), ambiguous_bases.end(), base)) {
@@ -661,7 +665,7 @@ struct Renderer {
     // Asset residency and attachment aliases are separate namespaces. Only
     // unregistered descriptors can depend on attachment-address mappings.
     std::atomic<uint64_t> views_gen{1};
-    std::atomic<uint64_t> target_views_gen{1};
+    std::atomic<uint64_t> target_views_gen{1}, target_rebind_gen{1};
     // what draw() last set in the current command buffer (invalid: set everything)
     struct DrawState {
         bool valid = false;
@@ -1035,7 +1039,7 @@ struct Renderer {
         auto it = dyn_mem.find(base);
         return it == dyn_mem.end() ? ~0ull : it->second.second + 1;
     }
-    std::atomic<uint64_t> lr_lists{0}, lr_ns{0}, lr_wait_ns{0}, lr_sub_ns{0};  // (statistics)
+    std::atomic<uint64_t> lr_lists{0}, lr_ns{0}, lr_wait_ns{0}, lr_sub_ns{0}, lr_runs{0}, lr_resolve_locked{0}, lr_lock_why[3]{};  // (statistics)
     std::atomic<uint64_t> lr_phase[7]{};  // locked: pre-pass, targets, feedback, resolve, pass begin; unlocked: draws; locked: end
     bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late);
     void pre_pass(Draw* const* draws, size_t count);
@@ -1138,7 +1142,8 @@ struct Renderer {
     const ViewHandle* existing_view(Image* img, VkImageViewType type, VkComponentMapping comp, uint32_t base_level);
     // Prepared linear bytes are optional and only valid for the full, non-streamed surface.
     Image* upload_texture(const uint32_t* t);
-    void resolve_draw_resources(Draw* const* draws, size_t count);
+    // lk: the renderer lock, which may be released on entry; taken only for what needs it
+    void resolve_draw_resources(Draw* const* draws, size_t count, std::unique_lock<std::mutex>* lk = nullptr);
     struct DiskPipeSpec {
         uint64_t vs_hash = 0, ps_hash = 0;
         uint64_t tex_sig[2] = {};
@@ -2957,6 +2962,7 @@ void Renderer::evict_textures() {
 // on the order in which command lists reach the renderer. Measured in Earth patrol: 99.7% of
 // sampled targets match exactly one image this way; depth is sampled through a colour format,
 // so it matches by size; a T# that matches no image of its size gets the address's current target.
+thread_local bool tf_fallback = false;  // (target_for: the last answer was the address's current target)
 Image* Renderer::target_for(const fmt::TSharp& ts) {
     auto rt = target_by_base.find(ts.base);
     if (rt == target_by_base.end()) return nullptr;  // (not a target now: see target_current)
@@ -2970,6 +2976,7 @@ Image* Renderer::target_for(const fmt::TSharp& ts) {
         if (c->depth) depth = c;
         else if (c->format == f) exact = c;
     }
+    tf_fallback = !exact && !depth && !sized;
     return exact ? exact : depth ? depth : sized ? sized : rt->second;
 }
 
@@ -3052,8 +3059,13 @@ uint16_t Renderer::sampler_id(const uint32_t* s, bool nearest) {
         (uint64_t(uint32_t(sci.maxLod*256))<<21)|(uint64_t(s[2]&0x3fff)<<33)|
         (uint64_t(sci.magFilter)<<47)|(uint64_t(sci.minFilter)<<48)|
         (uint64_t(sci.mipmapMode)<<49)|(uint64_t(sci.borderColor)<<50);
-    auto it=samplers.find(key);
-    if(it!=samplers.end())return it->second.id;
+    {
+        std::shared_lock rd(samplers_mu);
+        auto it=samplers.find(key);
+        if(it!=samplers.end())return it->second.id;
+    }
+    std::unique_lock wr(samplers_mu);
+    if(auto it=samplers.find(key);it!=samplers.end())return it->second.id;
     if(!bindless_set||next_sampler_id>=gcn::kMaxBindlessSamplers){
         if(++sampler_exhausted<=8)log("native renderer: sampler descriptors exhausted");
         return 0;
@@ -4132,8 +4144,24 @@ static bool same_sampler_stage(const Draw& a,const Draw& b,unsigned stage){
     }
     return true;
 }
-void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
-    struct TvEntry { uint64_t key = 0, gen = 0, target_gen = 0; ViewHandle vh{}; Image* tex = nullptr; uint64_t res=0; uint32_t words[8]{}; };
+// Runs on the recording thread without the renderer lock for everything that does not need it:
+// native texture views (their own table), the thread's caches and samplers (their own table). The
+// lock is taken, and kept to the end, only when a draw samples a render target or a CPU-written
+// texture (texture_view, target_for and the target tables are the renderer's).
+void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, std::unique_lock<std::mutex>* lk) {
+    auto locked = [&](int why) {
+        if (lk && !lk->owns_lock()) {
+            ++lr_lock_why[why];
+            const uint64_t t = now_ns();
+            lk->lock();
+            lr_wait_ns += now_ns() - t;
+            ++lr_resolve_locked;
+        }
+    };
+    // target: resolved to a render target or a depth target's stencil, which only the target tables
+    // (target_views_gen) decide; CPU-written textures also depend on the texture table (views_gen).
+    // order: also depends on which target is current at the address (fallback, stencil): target_rebind_gen.
+    struct TvEntry { uint64_t key = 0, gen = 0, target_gen = 0, rebind_gen = 0; ViewHandle vh{}; Image* tex = nullptr; uint64_t res=0; uint32_t words[8]{}; bool target=false, order=false; };
     static thread_local std::unique_ptr<TvEntry[]> tvc_ptr;
     if (!tvc_ptr) tvc_ptr = std::make_unique<TvEntry[]>(4096);
     TvEntry* const tvc = tvc_ptr.get();
@@ -4144,6 +4172,7 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
 
     const uint64_t gen = views_gen.load(std::memory_order_acquire);
     const uint64_t tg = target_views_gen.load(std::memory_order_acquire);
+    const uint64_t rg = target_rebind_gen.load(std::memory_order_acquire);
     const uint64_t sub_no = rc().submit_no;
     const Draw* prior=nullptr;
     for (size_t di = 0; di < count; ++di) {
@@ -4200,21 +4229,26 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count) {
                 TvEntry& e = tvc[key & 4095];
                 ViewHandle vh;
                 const uint64_t dependency = tres ? 0 : tg;
-                if (e.key == key && e.gen == gen && e.target_gen == dependency && e.vh.id &&
+                if (e.key == key && (e.target || e.gen == gen) && e.target_gen == dependency && (!e.order || e.rebind_gen == rg) && e.vh.id &&
                     e.res==tres&&std::memcmp(e.words,T,32)==0) {
                     vh = e.vh;
-                    if (e.tex) e.tex->last_used = sub_no, e.tex->last_frame = st.frames;
+                    if (e.tex) locked(0), e.tex->last_used = sub_no, e.tex->last_frame = st.frames;
                 } else {
+                    locked(1);
                     vh = texture_view(T, dim);
                     Image* tex = tv_texture;
-                    if (Image* ri = target_for(fmt::decode_tsharp(T)))
-                        vh = texture_view(T, ri->is3d ? gcn::TexDim::Tex3D : gcn::TexDim::Tex2D), tex = nullptr;
-                    e = {key, gen, dependency, vh, tex,tres,{}};
+                    const auto ts = fmt::decode_tsharp(T);
+                    bool target = false, order = false;
+                    if (auto sit = stencil_by_base.find(ts.base); sit != stencil_by_base.end() && sit->second->stencil) target = order = true;
+                    if (Image* ri = target_for(ts))
+                        vh = texture_view(T, ri->is3d ? gcn::TexDim::Tex3D : gcn::TexDim::Tex2D), tex = nullptr, target = true, order |= tf_fallback;
+                    e = {key, gen, dependency, rg, vh, tex,tres,{},target,order};
                     std::memcpy(e.words,T,32);
                 }
                 // Snapshots are pass-local, not part of the persistent cache.
                 // Resolve by the actual target object, including stencil/read aliases.
                 if (!tres && !rc().snaps.empty()) {
+                    locked(2);
                     const auto ts = fmt::decode_tsharp(T);
                     auto sit = stencil_by_base.find(ts.base);
                     const bool stencil = sit != stencil_by_base.end() && sit->second->stencil;
@@ -5609,7 +5643,10 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
             }
             feedback_snapshots(items.data() + i, j - i, colors, depth);
             lr_phase[2] += now_ns() - lap, lap = now_ns();
-            resolve_draw_resources(items.data() + i, j - i);
+            lk.unlock();
+            ++lr_runs;
+            resolve_draw_resources(items.data() + i, j - i, &lk);
+            if (!lk.owns_lock()) relock();
             lr_phase[3] += now_ns() - lap, lap = now_ns();
             begin_pass(colors, depth);
             lr_phase[4] += now_ns() - lap;
@@ -6908,9 +6945,12 @@ void print_stats() {
     if (const double f = double(s.frames - s.t_frames); f > 0 && g->list_rec) {
         double p[7];
         for (int k = 0; k < 7; ++k) p[k] = double(g->lr_phase[k].exchange(0)) / f / 1e6;
+        const double runs = double(g->lr_runs.exchange(0)), locked_runs = double(g->lr_resolve_locked.exchange(0));
         log("native renderer: engine-thread recording ms/frame: under the lock: pre-pass %.2f, targets %.2f, feedback %.2f, "
-            "resolve %.2f, pass begin %.2f, end %.2f | without it: draws %.2f",
-            p[0], p[1], p[2], p[3], p[4], p[6], p[5]);
+            "pass begin %.2f, end %.2f | resolve %.2f (%.0f%% of runs needed the lock: CPU textures %llu, new lookups %llu, feedback copies %llu) | without the lock: draws %.2f",
+            p[0], p[1], p[2], p[4], p[6], p[3], runs > 0 ? 100.0 * locked_runs / runs : 0.0,
+            (unsigned long long)g->lr_lock_why[0].exchange(0), (unsigned long long)g->lr_lock_why[1].exchange(0),
+            (unsigned long long)g->lr_lock_why[2].exchange(0), p[5]);
     }
     if (const double f = double(s.frames - s.t_frames); f > 0)
         log("native renderer: pre-pass per frame: targets %.2f ms, texture checks %.2f ms (%.0f, %.0f unwatched), texture loads %.2f ms "

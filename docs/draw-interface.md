@@ -153,9 +153,19 @@ submits one, instead of handing the list to the queue thread). Deleted: the queu
 queue thread applies memory writes, fills inherited constants, submits and writes completion
 labels.
 
-Still to do in this stage: less work under the renderer lock (pre-pass, feedback copies and
-resource resolution, about 2 ms per frame on the Arc); two recording stalls of 130-145 ms without
-new shaders or pipelines, not yet explained;.
+Resource resolution runs without the renderer lock. Each engine thread keeps its own texture
+lookup cache and takes the lock only for a lookup it has not seen (a new texture or target view),
+a CPU-written texture, or a feedback snapshot. The per-thread caches were being emptied several
+times a frame: every time an aliased render target became the current one at its address, the
+renderer bumped the generation every cache entry checks. Since a sampled target is picked by its
+surface (size and format), not by which target was bound last, that rebind now only invalidates the
+entries whose answer did depend on it: stencil reads and a T# with no same-size target at its
+address. Measured on lavapipe, Earth patrol: runs that needed the lock went from 70% (about 1,780
+new lookups per statistics interval) to 15-18% (350-520), and resolution under the lock from 5-8 ms
+to 0.3-1.6 ms per frame. Rendered frames are unchanged.
+
+Still to do in this stage: the pre-pass and feedback copies under the lock; two recording stalls of
+130-145 ms without new shaders or pipelines, not yet explained.
 
 ## Target
 
