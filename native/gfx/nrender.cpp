@@ -756,13 +756,13 @@ struct Renderer {
             // A new address changes what T#s resolve to; switching the current target at an address
             // only changes the order-dependent answers (target_for's fallback, stencil reads).
             if (added) ++target_views_gen;
-            it->second = img, ++target_rebind_gen;
+            it->second = img, bump_rebind(base);
         } else if (auto ib = images_by_base.find(base); ib != images_by_base.end() && ib->second.size() > 1) {
             // (target_for picks among same-size images at one address by format)
             bool same_size = false, other_attrs = false;
             for (Image* c : ib->second)
                 if (c != img && c->w == img->w && c->h == img->h) same_size = true, other_attrs |= target_attrs(c) != target_attrs(img);
-            if (same_size) ++target_rebind_gen;
+            if (same_size) bump_rebind(base);
             // an address whose sampled image alternates between kinds: pipeline() keys draws
             // that sample it by what it resolves to (instead of invalidating every pipeline)
             if (other_attrs && !std::binary_search(ambiguous_bases.begin(), ambiguous_bases.end(), base)) {
@@ -775,7 +775,13 @@ struct Renderer {
     // Asset residency and attachment aliases are separate namespaces. Only
     // unregistered descriptors can depend on attachment-address mappings.
     std::atomic<uint64_t> views_gen{1};
-    std::atomic<uint64_t> target_views_gen{1}, target_rebind_gen{1};
+    std::atomic<uint64_t> target_views_gen{1};
+    // Which target is current at an address (target_for's fallback, a stencil read) changes on many
+    // binds; per address (hashed), so a rebind elsewhere keeps other addresses' cached answers.
+    std::atomic<uint32_t> rebind_slots[4096]{};
+    static size_t rebind_slot(uint64_t base) { return size_t((base >> 8) ^ (base >> 20)) & 4095; }
+    uint32_t rebind_of(uint64_t base) const { return rebind_slots[rebind_slot(base)].load(std::memory_order_acquire); }
+    void bump_rebind(uint64_t base) { rebind_slots[rebind_slot(base)].fetch_add(1, std::memory_order_release); }
     // what draw() last set in the current command buffer (invalid: set everything)
     struct DrawState {
         bool valid = false;
@@ -3814,15 +3820,16 @@ VkCommandBuffer Renderer::secondary(uint32_t w) {
 // Which render target a non-engine T# samples, and the stencil target at its address, from this
 // thread's cache: valid while the target tables have not changed (target_views_gen) and, when the
 // answer depended on which aliased target is current (target_for's fallback, stencil), until a
-// rebind (target_rebind_gen). fill: look it up in the tables (renderer lock held); otherwise
+// rebind at that address (rebind_of). fill: look it up in the tables (renderer lock held); otherwise
 // false on a miss.
 bool Renderer::sampled_target(const uint32_t* t, bool fill, Image*& target, Image*& stencil) {
-    struct Entry { uint64_t key = 0, tg = 0, rg = 0; uint32_t words[8]{}; Image* target = nullptr; Image* stencil = nullptr; bool order = false; const Renderer* owner = nullptr; };
+    struct Entry { uint64_t key = 0, tg = 0; uint32_t rg = 0; uint32_t words[8]{}; Image* target = nullptr; Image* stencil = nullptr; bool order = false; const Renderer* owner = nullptr; };
     static thread_local std::unique_ptr<Entry[]> cache_ptr;
     if (!cache_ptr) cache_ptr = std::make_unique<Entry[]>(1024);
     const uint64_t key = hash_bytes(t, 32) | 1;
     Entry& e = cache_ptr[key & 1023];
-    const uint64_t tg = target_views_gen.load(std::memory_order_acquire), rg = target_rebind_gen.load(std::memory_order_acquire);
+    const uint64_t tg = target_views_gen.load(std::memory_order_acquire);
+    const uint32_t rg = rebind_of((uint64_t(t[0]) | uint64_t(t[1] & 0xFF) << 32) << 8);
     if (e.owner == this && e.key == key && e.tg == tg && (!e.order || e.rg == rg) && std::memcmp(e.words, t, 32) == 0) {
         target = e.target, stencil = e.stencil;
         return true;
@@ -4276,8 +4283,8 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, std::uni
     };
     // target: resolved to a render target or a depth target's stencil, which only the target tables
     // (target_views_gen) decide; CPU-written textures also depend on the texture table (views_gen).
-    // order: also depends on which target is current at the address (fallback, stencil): target_rebind_gen.
-    struct TvEntry { uint64_t key = 0, gen = 0, target_gen = 0, rebind_gen = 0; ViewHandle vh{}; Image* tex = nullptr; uint64_t res=0; uint32_t words[8]{}; bool target=false, order=false; };
+    // order: also depends on which target is current at the address (fallback, stencil): rebind_of.
+    struct TvEntry { uint64_t key = 0, gen = 0, target_gen = 0; uint32_t rebind_gen = 0; ViewHandle vh{}; Image* tex = nullptr; uint64_t res=0; uint32_t words[8]{}; bool target=false, order=false; };
     static thread_local std::unique_ptr<TvEntry[]> tvc_ptr;
     if (!tvc_ptr) tvc_ptr = std::make_unique<TvEntry[]>(4096);
     TvEntry* const tvc = tvc_ptr.get();
@@ -4288,7 +4295,6 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, std::uni
 
     const uint64_t gen = views_gen.load(std::memory_order_acquire);
     const uint64_t tg = target_views_gen.load(std::memory_order_acquire);
-    const uint64_t rg = target_rebind_gen.load(std::memory_order_acquire);
     const uint64_t sub_no = rc().submit_no;
     const Draw* prior=nullptr;
     for (size_t di = 0; di < count; ++di) {
@@ -4345,7 +4351,8 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, std::uni
                 TvEntry& e = tvc[key & 4095];
                 ViewHandle vh;
                 const uint64_t dependency = tres ? 0 : tg;
-                if (e.key == key && (e.target || e.gen == gen) && e.target_gen == dependency && (!e.order || e.rebind_gen == rg) && e.vh.id &&
+                if (e.key == key && (e.target || e.gen == gen) && e.target_gen == dependency &&
+                    (!e.order || e.rebind_gen == rebind_of((uint64_t(T[0]) | uint64_t(T[1] & 0xFF) << 32) << 8)) && e.vh.id &&
                     e.res==tres&&std::memcmp(e.words,T,32)==0 && !(e.tex && e.tex->stale.load(std::memory_order_relaxed))) {
                     vh = e.vh;
                     if (e.tex) touch_image(e.tex, sub_no, __atomic_load_n(&st.frames, __ATOMIC_RELAXED));
@@ -4358,7 +4365,7 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, std::uni
                     if (auto sit = stencil_by_base.find(ts.base); sit != stencil_by_base.end() && sit->second->stencil) target = order = true;
                     if (Image* ri = target_for(ts))
                         vh = texture_view(T, ri->is3d ? gcn::TexDim::Tex3D : gcn::TexDim::Tex2D), tex = nullptr, target = true, order |= tf_fallback;
-                    e = {key, gen, dependency, rg, vh, tex,tres,{},target,order};
+                    e = {key, gen, dependency, rebind_of(ts.base), vh, tex,tres,{},target,order};
                     std::memcpy(e.words,T,32);
                 }
                 // Snapshots are pass-local, not part of the persistent cache.

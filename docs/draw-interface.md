@@ -199,6 +199,13 @@ again. An image's last use is raised atomically, so a cached CPU-written texture
 the lock either. Lavapipe, Earth patrol: cache invalidations 75 -> 0 per interval, new lookups
 230 -> 125, runs needing the lock 14% -> 10%.
 
+Which aliased target is current at an address changes on about 1,300 binds per statistics
+interval. That used to be one global generation, so every bind anywhere emptied every thread's
+cached stencil reads and fallback answers. It is now one generation per address (hashed into 4,096
+counters): a rebind only affects cached answers for its own address. Lavapipe, Earth patrol: new
+lookups 125 -> 60 per interval, runs needing the lock 10% -> 8%; the rest is mostly runs that read
+a feedback snapshot (about 170 per interval).
+
 Still to do in this stage: measure on the Arc (lavapipe on two cores cannot show lock wait
 reliably); two recording stalls of 130-145 ms without new shaders or pipelines, not yet explained.
 
