@@ -444,19 +444,19 @@ struct Image {
     VkImageAspectFlags att_aspect = 0;  // attachment view made when first rendered to (0: none)
     std::unordered_map<uint64_t, ViewHandle> views;
     std::unordered_map<uint64_t, VkImageView> slice_attachments;
-    uint64_t last_used = 0;
+    std::atomic<uint64_t> last_used{0};  // (latest submission that used it; recording threads raise it: touch_image)
     uint32_t bind_slice = 0;  // layered target: the slice the current pass renders
     uint64_t src_addr = 0, src_size = 0, version = ~0ull, checked = 0;
     uint32_t torn = 0;
     uint32_t tile_mode = 0, pitch = 0, bpp = 0;
     bool sampled = false;
     uint64_t tv_version = ~0ull, tv_size = 0, tv_frame = 0;
-    uint64_t last_frame = 0; // st.frames when last used (frame-based eviction horizon)
+    std::atomic<uint64_t> last_frame{0};  // st.frames when last used (frame-based eviction horizon)
     uint64_t content = 0;
     bool overlaps_source(uint64_t a, uint64_t e) const {
         return src_size && a < src_addr + src_size && e > src_addr;
     }
-    bool stale = false;
+    std::atomic<bool> stale{false};  // (contents rewritten since the copy; set under the lock, read by recording threads)
     std::atomic<uint64_t> last_write_submit{0};  // (the latest submission that wrote it; set by recording threads)
 };
 
@@ -613,6 +613,12 @@ struct Swapchain {
     std::unique_ptr<Image> raw;  // UNORM copy of an sRGB video-out image (blit without decoding)
     uint64_t presented = 0;
 };
+
+// Raise an image's last use (several recording threads may touch it; never lowered).
+inline void touch_image(Image* img, uint64_t submit, uint64_t frame) {
+    for (uint64_t v = img->last_used.load(std::memory_order_relaxed); v < submit && !img->last_used.compare_exchange_weak(v, submit, std::memory_order_relaxed);) {}
+    for (uint64_t v = img->last_frame.load(std::memory_order_relaxed); v < frame && !img->last_frame.compare_exchange_weak(v, frame, std::memory_order_relaxed);) {}
+}
 
 struct Renderer {
     Options opt;
@@ -1067,7 +1073,7 @@ struct Renderer {
                 changed = true;
             }
         }
-        if (changed) ++views_gen;
+        (void)changed;  // (stale textures are copied again in place by the next pre-pass: views stay valid)
     }
     // D1_NG_LOG_DMA_TEX: (diagnostics) copy-queue writes into memory a texture copy was made from
     void dma_texture_check(uint64_t dst, uint64_t n) {
@@ -1128,7 +1134,7 @@ struct Renderer {
                     (unsigned long long)img->src_addr, img->w, img->h, int(img->format),
                     "dynamic");
         }
-        if (changed) ++views_gen;
+        (void)changed;  // (copied again in place by the next pre-pass: views stay valid)
     }
     // write tracking, or (dynamic_copy) the generation of the range
     uint64_t mem_watch(uint64_t base, uint64_t size) {
@@ -2601,7 +2607,7 @@ Image* Renderer::upload_texture(const uint32_t* t) {
     if (found && it->second->stale) {
         prev = std::move(it->second);
         prev->stale = false;
-        textures.erase(it), found = false; ++views_gen;
+        textures.erase(it), found = false;
         ++st.tex_reloads;
     }
     if (found) {
@@ -2621,7 +2627,7 @@ Image* Renderer::upload_texture(const uint32_t* t) {
         }
         if (v == ~0ull) ++st.tex_unwatched;
         prev = std::move(it->second);
-        textures.erase(it); ++views_gen;
+        textures.erase(it);
         ++st.tex_reloads;
     }
 
@@ -2637,11 +2643,13 @@ Image* Renderer::upload_texture(const uint32_t* t) {
     if (!guest_copy_current_spans(ts.base, cur_bytes, spans, source.data())) { ++texture_range_rejects; return nullptr; }
 
     std::unique_ptr<Image> img;
+    bool in_place = false;  // (the same image and views: per-thread view caches stay valid)
     if (prev && prev->format == f && prev->w == full_w && prev->h == full_h && prev->d == full_d &&
         prev->layers == layers && prev->levels == full_levels && prev->cube == cube && prev->is3d == is3d) {
         img = std::move(prev);
         img->lifetime.retire(); // reused storage no longer proves prior contents
         img->torn = 0;
+        in_place = true;
         ++st.tex_inplace;
     } else {
         const uint64_t tm = now_ns();
@@ -2718,7 +2726,7 @@ Image* Renderer::upload_texture(const uint32_t* t) {
     out->last_frame = st.frames;
     ++st.textures;
     textures[key] = std::move(img);
-    ++views_gen;
+    if (!in_place) ++views_gen;
     return out;
 }
 
@@ -4338,9 +4346,9 @@ void Renderer::resolve_draw_resources(Draw* const* draws, size_t count, std::uni
                 ViewHandle vh;
                 const uint64_t dependency = tres ? 0 : tg;
                 if (e.key == key && (e.target || e.gen == gen) && e.target_gen == dependency && (!e.order || e.rebind_gen == rg) && e.vh.id &&
-                    e.res==tres&&std::memcmp(e.words,T,32)==0) {
+                    e.res==tres&&std::memcmp(e.words,T,32)==0 && !(e.tex && e.tex->stale.load(std::memory_order_relaxed))) {
                     vh = e.vh;
-                    if (e.tex) locked(0), e.tex->last_used = sub_no, e.tex->last_frame = st.frames;
+                    if (e.tex) touch_image(e.tex, sub_no, __atomic_load_n(&st.frames, __ATOMIC_RELAXED));
                 } else {
                     locked(1);
                     vh = texture_view(T, dim);
@@ -7033,9 +7041,9 @@ void print_stats() {
         p[0] -= pre_free;
         const double runs = double(g->lr_runs.exchange(0)), locked_runs = double(g->lr_resolve_locked.exchange(0));
         log("native renderer: engine-thread recording ms/frame: under the lock: pre-pass %.2f, targets %.2f, feedback %.2f (%.0f%% of runs), "
-            "pass begin %.2f, end %.2f | resolve %.2f (%.0f%% of runs needed the lock: CPU textures %llu, new lookups %llu, feedback copies %llu) | without the lock: texture views %.2f, draws %.2f",
+            "pass begin %.2f, end %.2f | resolve %.2f (%.0f%% of runs needed the lock: new lookups %llu, feedback copies %llu) | without the lock: texture views %.2f, draws %.2f",
             p[0], p[1], p[2], runs > 0 ? 100.0 * double(g->lr_fb_locked.exchange(0)) / runs : 0.0, p[4], p[6], p[3], runs > 0 ? 100.0 * locked_runs / runs : 0.0,
-            (unsigned long long)g->lr_lock_why[0].exchange(0), (unsigned long long)g->lr_lock_why[1].exchange(0),
+            (unsigned long long)g->lr_lock_why[1].exchange(0),
             (unsigned long long)g->lr_lock_why[2].exchange(0), pre_free, p[5]);
     }
     if (const double f = double(s.frames - s.t_frames); f > 0)

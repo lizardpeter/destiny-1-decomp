@@ -189,6 +189,16 @@ runs whose feedback check took the lock went from 84% to 13%. The cross-submissi
 (`target_revision`) only applied to the deleted queue-thread path and was removed with it; a target's
 last writing submission is an atomic, as recording threads set it.
 
+CPU-written textures keep their image when the CPU rewrites them: the next pre-pass copies the
+new contents into the same image (same size and format, so the same views), and nothing
+invalidates the recording threads' view caches. Before, every CPU write marked the texture stale,
+and its reload replaced it, bumping the shared view generation three times per rewrite (about 75
+times per statistics interval in Earth patrol), which emptied every thread's cache of CPU-written
+textures each time. A cache entry whose texture is marked stale is not used until it is copied
+again. An image's last use is raised atomically, so a cached CPU-written texture no longer needs
+the lock either. Lavapipe, Earth patrol: cache invalidations 75 -> 0 per interval, new lookups
+230 -> 125, runs needing the lock 14% -> 10%.
+
 Still to do in this stage: measure on the Arc (lavapipe on two cores cannot show lock wait
 reliably); two recording stalls of 130-145 ms without new shaders or pipelines, not yet explained.
 
