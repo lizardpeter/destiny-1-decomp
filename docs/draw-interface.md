@@ -107,6 +107,22 @@ rest, a T# whose size matches no target at its address (34x34 over an 80x45 targ
 dynamic-texture slots, likely drawn by one of the dropped helper draws above), still gets the
 address's current target.
 
+Where the engine keeps its targets (traced for native ownership, Earth patrol): the table at
+`026f2398` has two arrays of `0xe0`-byte records, 96 at `+0x18` (ids `0x16`-`0x5f` on a free list,
+lower ids fixed) and 256 at `+0x75d0`. `0081be00` creates a record from a descriptor (name, format,
+size) and places it in a memory pool (`+0x40` offset, `+0x50` pool), `0081b830` / `0081bba0` release
+it, `0081a0e0` / `0081a330` fill the colour target (record `+0x88`, the Gnm render target) or the
+depth target (record `+0x54`; its base word at `+0x5c`). `0081c5a0` binds records by id, keeping the
+bound ids at table `+4`..`+0x14`. Every colour and depth base bound for a draw in Earth patrol is one
+of these records' surfaces, including the main G-buffer (colour `0x5634900`, depth `0x5672500`), but
+most of the time the record is already released by the time a worker thread's draw is captured:
+the records are transient, created and released around each use, and the pool hands the same memory
+to different targets within a frame. So a record id is not a lasting identity; the surface (pool
+address, size, format) is the stable one, which is what `target_for` already keys on. Native
+ownership therefore means owning images per surface at record creation (`0081be00`), with the
+engine's own create/release calls deciding lifetime and aliasing, instead of discovering targets
+from bound register words at draw time.
+
 Still order-dependent, to be replaced before lists are recorded on engine threads: targets the CPU
 rewrites (`target_current`), feedback copies of attachments a pass samples, occlusion queries and
 predication, and GPU results read back into guest memory.
