@@ -134,8 +134,19 @@ Measured on the owner's Intel Arc, Earth patrol, `fps = 120`, 2560x1440 (test-42
 | Draws dropped | 0 | 0 |
 | Slow frames in the world | 83 | 15 |
 
-Still to do in this stage: one submission per frame for the recorded lists (each is still its own
-submission, about 30 per frame); less work under the renderer lock (pre-pass, feedback copies and
+Lists with GPU memory copies are recorded too. They are not separate copy lists: the engine's copy
+queue writes into ordinary draw lists (measured: 390 of 400 lists that still ran at submission had
+both, about 190 copies and 73 draws each). Their copies are applied on the CPU when the queue thread
+reaches the list in submission order (`apply_memory_writes`), before the GPU runs it, as the
+console's GPU does them; no draw reads guest memory a copy writes (native textures and buffers own
+their data, and no constant or index range overlapped a copy destination). With that the queue
+thread translates nothing: 0.00 ms per frame in Earth patrol on lavapipe.
+
+Recorded lists already go to the GPU in one `vkQueueSubmit2` per engine submission call (grouped by
+`submit_recorded_group`); merging across calls would let a label the engine waits on between calls
+wait for later work, so it is not done.
+
+Still to do in this stage: less work under the renderer lock (pre-pass, feedback copies and
 resource resolution, about 2 ms per frame on the Arc); two recording stalls of 130-145 ms without
 new shaders or pipelines, not yet explained; and deleting the submission-time translation path
 once the GPU copy lists no longer need it.

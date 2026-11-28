@@ -1932,8 +1932,11 @@ D1_SYSV bool h_drain(uint64_t dev) {
 // not need a fake nonzero DCB extent. Preserve any genuine segment metadata.
 void record(List* l) {
     if (!ng::list_recording() || l->items.empty()) return;
+    // Lists that write guest memory with inline data run at submission; none are seen in play.
+    // GPU memory copies (Dma) do not stop a list from being recorded: they are applied at
+    // submission (apply_memory_writes), and no draw reads guest memory they write.
     for (const Item& it : l->items)
-        if (it.d && (it.d->kind == ng::Draw::Dma || (it.d->kind == ng::Draw::WriteData && it.d->prim != ng::kEopLabel)))
+        if (it.d && it.d->kind == ng::Draw::WriteData && it.d->prim != ng::kEopLabel)
             return;
     struct SavedCb { ng::Draw* draw; ng::Draw::Cb cb[ng::kStages][16]; };
     std::vector<SavedCb> saved;
@@ -2713,6 +2716,15 @@ void native_device_execute_submit(NativeSubmission* batch) {
     for (nd::List* l : lists) {
         if (l->recorded) {
             flush_draws();
+            // The list's GPU memory copies, in its order, before the GPU runs it (as the console's
+            // GPU does them when it reaches them).
+            {
+                static thread_local std::vector<ng::Draw*> copies;
+                copies.clear();
+                for (nd::Item& it : l->items)
+                    if (it.d && it.d->kind == ng::Draw::Dma) copies.push_back(it.d);
+                if (!copies.empty()) ng::apply_memory_writes(copies.data(), copies.size());
+            }
             for (const ng::LateCb& lc : l->late) {
                 const ng::Draw::Cb& c = nr::g_ce_known[lc.stage][lc.slot] ? nr::g_ce[lc.stage][lc.slot] : l->dflt[lc.stage][lc.slot];
                 ng::fill_late(lc, c.addr, c.size);

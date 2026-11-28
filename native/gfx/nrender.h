@@ -118,6 +118,8 @@ struct LateCb { uint8_t stage, slot; uint32_t size; uint64_t off; };
 bool list_recording();
 bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late);
 void fill_late(const LateCb& l, uint64_t src, uint32_t size);
+// GPU memory copies and data writes of a recorded list, applied at its submission, in its order.
+void apply_memory_writes(Draw* const* items, size_t count);
 void submit_recorded(const std::vector<uint32_t>& handles);
 // The engine bound a texture (resource types 1-3), moved its memory, or changed its resident
 // mips; its descriptor at `obj` is current. The renderer owns one image per texture object.

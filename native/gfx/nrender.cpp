@@ -5849,7 +5849,7 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
     up_rec.submit_no = R.submit_no;
     begin_record();
     uint64_t lap0 = now_ns();
-    run_copies(items.data(), items.size());
+    // (the list's GPU memory copies are applied at its submission: apply_memory_writes)
     pre_for = &R;
     if(up_rec.cur!=UINT32_MAX)pre_pass(items.data(),items.size());
     else{
@@ -5889,7 +5889,7 @@ bool Renderer::record_list(const std::vector<Draw*>& items, uint32_t& handle, st
         case Draw::ZPass: zpass(d->index_addr); break;
         case Draw::PredOn: predicate(d->index_addr, d->count & 1); break;
         case Draw::PredOff: R.pred_cur = -1; break;
-        case Draw::Dma: break;  // (done before the list's textures: run_copies; repeated at submission)
+        case Draw::Dma: break;  // (applied at the list's submission: apply_memory_writes)
         case Draw::Eop:
         case Draw::WriteData: break;  // (CPU-visible: done at submission)
         default: {
@@ -6902,6 +6902,11 @@ void execute(const std::vector<Draw*>& draws) {
 bool list_recording() { return g && g->list_rec; }
 bool record_list(const std::vector<Draw*>& items, uint32_t& handle, std::vector<LateCb>& late) {
     return g && g->list_rec && g->record_list(items, handle, late);
+}
+void apply_memory_writes(Draw* const* items, size_t count) {
+    if (!g || !count) return;
+    auto lk = queue_lock();
+    g->run_copies(items, count, true);
 }
 void fill_late(const LateCb& l, uint64_t src, uint32_t size) {
     if (!g) return;
